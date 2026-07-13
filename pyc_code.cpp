@@ -166,6 +166,74 @@ std::vector<PycExceptionTableEntry> PycCode::exceptionTableEntries() const
         
         entries.push_back(PycExceptionTableEntry(start, end, target, depth, lasti));
     }
-    
+
     return entries;
+}
+
+static unsigned int _parse_locvarint(PycBuffer& data)
+{
+    int read = data.getByte();
+    unsigned int val = read & 0x3f;
+    int shift = 0;
+    while (read & 0x40) {
+        read = data.getByte();
+        shift += 6;
+        val |= (unsigned int)(read & 0x3f) << shift;
+    }
+    return val;
+}
+
+static int _parse_locsvarint(PycBuffer& data)
+{
+    unsigned int uval = _parse_locvarint(data);
+    return (uval & 1) ? -(int)(uval >> 1) : (int)(uval >> 1);
+}
+
+int PycCode::lineForOffset(int off) const
+{
+    if (m_lnTable == nullptr || m_lnTable->length() == 0)
+        return -1;
+    PycBuffer data(m_lnTable->value(), m_lnTable->length());
+    int line = m_firstLine;
+    int cu = 0;
+    while (!data.atEof()) {
+        int first = data.getByte();
+        if (!(first & 0x80))
+            return -1;
+        int code = (first >> 3) & 0x0f;
+        int length = (first & 0x07) + 1;
+        int spanLine;
+        switch (code) {
+        case 15:
+            spanLine = -1;
+            break;
+        case 14:
+            line += _parse_locsvarint(data);
+            spanLine = line;
+            _parse_locvarint(data);
+            _parse_locvarint(data);
+            _parse_locvarint(data);
+            break;
+        case 13:
+            line += _parse_locsvarint(data);
+            spanLine = line;
+            break;
+        case 12: case 11: case 10:
+            line += code - 10;
+            spanLine = line;
+            data.getByte();
+            data.getByte();
+            break;
+        default:
+            data.getByte();
+            spanLine = line;
+            break;
+        }
+        int start = cu * 2;
+        int end = (cu + length) * 2;
+        if (off >= start && off < end)
+            return spanLine;
+        cu += length;
+    }
+    return -1;
 }

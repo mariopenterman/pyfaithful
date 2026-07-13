@@ -3,6 +3,9 @@
 #include <stdexcept>
 #include <cstdint>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 
 #ifdef _MSC_VER
 #define snprintf _snprintf
@@ -259,7 +262,20 @@ void print_const(std::ostream& pyc_output, PycRef<PycObject> obj, PycModule* mod
                     pyc_output << "float('inf')";
                 }
             } else {
-                formatted_print(pyc_output, "%g", value);
+                // Render like CPython's repr(): the shortest decimal string that
+                // round-trips to the same double, and ALWAYS a float literal.
+                // (The old "%g" dropped precision to 6 sig-digits AND printed
+                // whole numbers without a ".0", so e.g. 1.0 recompiled as int 1.)
+                char buf[40];
+                for (int prec = 1; ; ++prec) {
+                    snprintf(buf, sizeof(buf), "%.*g", prec, value);
+                    if (prec >= 17 || std::strtod(buf, nullptr) == value)
+                        break;
+                }
+                // Ensure it reads back as a float, not an int (e.g. "1" -> "1.0").
+                if (!std::strpbrk(buf, ".eE"))
+                    std::strncat(buf, ".0", sizeof(buf) - std::strlen(buf) - 1);
+                pyc_output << buf;
             }
         }
         break;
@@ -282,7 +298,7 @@ void bc_next(PycBuffer& source, PycModule* mod, int& opcode, int& operand, int& 
     if (mod->verCompare(3, 6) >= 0) {
         operand = source.getByte();
         pos += 2;
-        if (opcode == Pyc::EXTENDED_ARG_A) {
+        while (opcode == Pyc::EXTENDED_ARG_A) {
             opcode = Pyc::ByteToOpcode(mod->majorVer(), mod->minorVer(), source.getByte());
             operand = (operand << 8) | source.getByte();
             pos += 2;

@@ -1,0 +1,7 @@
+def ordered ( a , b , c , d ) : <EOL>
+<INDENT>
+if a < b <= c < d : <EOL>
+<INDENT>
+return True <EOL>
+<OUTDENT>
+return a == b == c <EOL>

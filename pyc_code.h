@@ -8,6 +8,15 @@
 class PycData;
 class PycModule;
 
+class PycLineSpan {
+public:
+    int start_offset;
+    int end_offset;
+    int line;
+
+    PycLineSpan(int s, int e, int l) : start_offset(s), end_offset(e), line(l) {}
+};
+
 class PycExceptionTableEntry {
 public:
     int start_offset; // inclusive
@@ -100,6 +109,8 @@ public:
     }
 
     std::vector<PycExceptionTableEntry> exceptionTableEntries() const;
+
+    int lineForOffset(int off) const;
 
 private:
     int m_argCount, m_posOnlyArgCount, m_kwOnlyArgCount, m_numLocals;

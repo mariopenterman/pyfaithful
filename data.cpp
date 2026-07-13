@@ -2,6 +2,7 @@
 #include <cstring>
 #include <cstdarg>
 #include <vector>
+#include <stdexcept>
 
 /* PycData */
 int PycData::get16()
@@ -73,8 +74,7 @@ void PycFile::getBuffer(int bytes, void* buffer)
 int PycBuffer::getByte()
 {
     if (atEof()) {
-        fputs("PycBuffer::getByte(): Unexpected end of stream\n", stderr);
-        std::exit(1);
+        throw std::runtime_error("PycBuffer::getByte(): Unexpected end of stream");
     }
     int ch = (int)(*(m_buffer + m_pos));
     ++m_pos;
@@ -84,8 +84,7 @@ int PycBuffer::getByte()
 void PycBuffer::getBuffer(int bytes, void* buffer)
 {
     if (m_pos + bytes > m_size) {
-        fputs("PycBuffer::getBuffer(): Unexpected end of stream\n", stderr);
-        std::exit(1);
+        throw std::runtime_error("PycBuffer::getBuffer(): Unexpected end of stream");
     }
     if (bytes != 0)
         memcpy(buffer, (m_buffer + m_pos), bytes);

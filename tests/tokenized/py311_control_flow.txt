@@ -1,0 +1,26 @@
+def classify ( n , items ) : <EOL>
+<INDENT>
+result = [ ] <EOL>
+for x in items : <EOL>
+<INDENT>
+if x < 0 : <EOL>
+<INDENT>
+continue <EOL>
+<OUTDENT>
+if x == 0 or x == n : <EOL>
+<INDENT>
+result . append ( 'edge' ) <EOL>
+continue <EOL>
+<OUTDENT>
+result . append ( 'mid' ) <EOL>
+<OUTDENT>
+result . append ( 'done' ) <EOL>
+while n > 0 : <EOL>
+<INDENT>
+n -= 1 <EOL>
+if n == 3 : <EOL>
+<INDENT>
+break <EOL>
+<OUTDENT>
+<OUTDENT>
+return result and n >= 0 <EOL>

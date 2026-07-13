@@ -1,0 +1,26 @@
+def safe ( fn , cleanup ) : <EOL>
+<INDENT>
+try : <EOL>
+<INDENT>
+try : <EOL>
+<INDENT>
+value = fn ( ) <EOL>
+<OUTDENT>
+except KeyError as exc : <EOL>
+<INDENT>
+value = exc . args <EOL>
+<OUTDENT>
+except ( ValueError , TypeError ) : <EOL>
+<INDENT>
+value = None <EOL>
+<OUTDENT>
+else : <EOL>
+<INDENT>
+value = value + 1 <EOL>
+<OUTDENT>
+<OUTDENT>
+finally : <EOL>
+<INDENT>
+cleanup ( ) <EOL>
+<OUTDENT>
+return value <EOL>
