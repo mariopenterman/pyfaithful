@@ -1,19 +1,16 @@
-# Decompyle++ 
-***A Python Byte-code Disassembler/Decompiler***
+# pyfaithful
+***A byte- and line-faithful Python decompiler***
 
-Decompyle++ aims to translate compiled Python byte-code back into valid
-and human-readable Python source code. While other projects have achieved
-this with varied success, Decompyle++ is unique in that it seeks to
-support byte-code from any version of Python.
+pyfaithful translates compiled Python byte-code back into valid, human-readable
+Python source, and supports byte-code from any version of Python. Its focus is
+**faithful reconstruction**: for Python 3.11 in particular it aims for decompiled
+source that recompiles to the *same* byte-code (`co_code`) and, as far as the
+`.pyc` allows, the *same* source positions (`co_positions`) as the original.
 
-Decompyle++ includes both a byte-code disassembler (pycdas) and a 
-decompiler (pycdc).
+pyfaithful includes both a byte-code disassembler (`pycdas`) and a
+decompiler (`pycdc`), and is written in C++.
 
-As the name implies, Decompyle++ is written in C++.
-If you wish to contribute, please fork us on github at 
-https://github.com/zrax/pycdc
-
-## Building Decompyle++
+## Building pyfaithful
 * Generate a project or makefile with [CMake](http://www.cmake.org) (See CMake's documentation for details)
   * The following options can be passed to CMake to control debug features:
 
@@ -34,7 +31,7 @@ https://github.com/zrax/pycdc
 `./pycdas [PATH TO PYC FILE]`
 The byte-code disassembly is printed to stdout.
 
-**To run pycdc**, the PYC Decompiler: 
+**To run pycdc**, the PYC Decompiler:
 `./pycdc [PATH TO PYC FILE]`
 The decompiled Python source is printed to stdout.
 Any errors are printed to stderr.
@@ -44,14 +41,15 @@ Both tools support Python marshalled code objects, as output from `marshal.dumps
 
 To use this feature, specify `-c -v <version>` on the command line - the version must be specified as the objects themselves do not contain version metadata.
 
-## Authors, Licence, Credits
-Decompyle++ is the work of Michael Hansen and Darryl Pogue.
+## Authors, License, Credits
+pyfaithful is an independent fork of **Decompyle++**, which is the work of
+**Michael Hansen and Darryl Pogue**, with additional upstream contributions from
+charlietang98, Kunal Parmar, Olivier Iffrig, and Zlodiy. The original project
+lives at https://github.com/zrax/pycdc.
 
-Additional contributions from:
-* charlietang98
-* Kunal Parmar
-* Olivier Iffrig
-* Zlodiy
+Fork modifications (2026) are Copyright (C) Mario Penterman.
 
-It is released under the terms of the GNU General Public License, version 3;
-See LICENSE file for details.
+pyfaithful is released under the terms of the **GNU General Public License,
+version 3** — the same license as the original — and it remains GPLv3. See the
+`LICENSE` file for the full text. This fork is not endorsed by or affiliated with the original
+authors.
