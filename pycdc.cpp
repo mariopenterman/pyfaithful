@@ -1,13 +1,49 @@
 #include <cstring>
 #include <fstream>
 #include <iostream>
+#include <streambuf>
 #include "ASTree.h"
+#include "ASTNode.h"
 
 #ifdef WIN32
 #  define PATHSEP '\\'
 #else
 #  define PATHSEP '/'
 #endif
+
+/* Forwarding stream buffer that counts emitted newlines into g_curLine, so the
+   layout engine always knows the current output line. Every byte written to the
+   decompiler output (header comment included) passes through here. */
+class LineCountStreambuf : public std::streambuf {
+public:
+    explicit LineCountStreambuf(std::streambuf* dst) : m_dst(dst) {}
+protected:
+    int overflow(int ch) override {
+        if (ch == EOF)
+            return ch;
+        if (ch == '\n') {
+            ++g_curLine;
+            g_curCol = 0;
+        } else {
+            ++g_curCol;
+        }
+        return m_dst->sputc(static_cast<char>(ch));
+    }
+    std::streamsize xsputn(const char* s, std::streamsize n) override {
+        for (std::streamsize i = 0; i < n; ++i) {
+            if (s[i] == '\n') {
+                ++g_curLine;
+                g_curCol = 0;
+            } else {
+                ++g_curCol;
+            }
+        }
+        return m_dst->sputn(s, n);
+    }
+    int sync() override { return m_dst->pubsync(); }
+private:
+    std::streambuf* m_dst;
+};
 
 int main(int argc, char* argv[])
 {
@@ -87,14 +123,17 @@ int main(int argc, char* argv[])
         fprintf(stderr, "Could not load file %s\n", infile);
         return 1;
     }
-    const char* dispname = strrchr(infile, PATHSEP);
-    dispname = (dispname == NULL) ? infile : dispname + 1;
-    *pyc_output << "# Source Generated with Decompyle++\n";
-    formatted_print(*pyc_output, "# File: %s (Python %d.%d%s)\n\n", dispname,
-                    mod.majorVer(), mod.minorVer(),
-                    (mod.majorVer() < 3 && mod.isUnicode()) ? " Unicode" : "");
+    /* Route all output through the newline counter so g_curLine tracks the
+       true output line. No header comment is emitted: the layout engine places
+       every statement on its original source line, and a 2-line header would
+       occupy output lines 1-2, making any construct on source lines 1-2
+       impossible to align (module docstring, early imports). Dropping it lets
+       the module body start at line 1 and match the original line table. */
+    LineCountStreambuf lcbuf(pyc_output->rdbuf());
+    std::ostream counted(&lcbuf);
+    g_curLine = 1;
     try {
-        decompyle(mod.code(), &mod, *pyc_output);
+        decompyle(mod.code(), &mod, counted);
     } catch (std::exception& ex) {
         fprintf(stderr, "Error decompyling %s: %s\n", infile, ex.what());
         return 1;

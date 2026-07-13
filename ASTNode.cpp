@@ -1,6 +1,27 @@
 #include "ASTNode.h"
 #include "bytecode.h"
 
+/* See ASTNode.h: byte offset of the instruction currently being decoded, so
+   each ASTNode records its source position at construction. -1 outside the
+   decode loop. */
+int g_stmtOff = -1;
+int g_stmtLine = -1;
+
+/* Current OUTPUT line number (1-based) while rendering, maintained by the
+   newline-counting stream buffer installed in main(). The layout engine pads
+   blank lines to align each construct's output line with its original source
+   line (from the .pyc line table), so a decompile->recompile round-trip
+   reproduces the original co_positions line attribution. */
+int g_curLine = 1;
+
+/* Source START column of the instruction currently being decoded (or -1). Each
+   ASTNode records it (m_srcCol) so the column-layout engine can pad intra-line
+   whitespace to place each token at its original co_positions column. */
+int g_stmtCol = -1;
+/* Current OUTPUT column (0-based): chars emitted since the last newline,
+   maintained by the same newline/char-counting stream buffer as g_curLine. */
+int g_curCol = 0;
+
 /* ASTNodeList */
 void ASTNodeList::removeLast()
 {

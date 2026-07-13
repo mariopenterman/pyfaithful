@@ -189,31 +189,37 @@ static int _parse_locsvarint(PycBuffer& data)
     return (uval & 1) ? -(int)(uval >> 1) : (int)(uval >> 1);
 }
 
-int PycCode::lineForOffset(int off) const
+void PycCode::buildLineCache() const
 {
+    m_lineCacheBuilt = true;
     if (m_lnTable == nullptr || m_lnTable->length() == 0)
-        return -1;
+        return;
     PycBuffer data(m_lnTable->value(), m_lnTable->length());
     int line = m_firstLine;
     int cu = 0;
     while (!data.atEof()) {
         int first = data.getByte();
         if (!(first & 0x80))
-            return -1;
+            break;   // malformed: stop, matching the original early return
         int code = (first >> 3) & 0x0f;
         int length = (first & 0x07) + 1;
         int spanLine;
+        int spanEndLine = -1;
+        int scol = -1, ecol = -1;   // source columns (PEP 657 location table)
         switch (code) {
         case 15:
             spanLine = -1;
             break;
-        case 14:
+        case 14: {
             line += _parse_locsvarint(data);
             spanLine = line;
-            _parse_locvarint(data);
-            _parse_locvarint(data);
-            _parse_locvarint(data);
+            spanEndLine = line + (int)_parse_locvarint(data);   // end-line delta
+            int c1 = _parse_locvarint(data);        // start col + 1 (0 => unknown)
+            int c2 = _parse_locvarint(data);        // end col + 1
+            scol = c1 - 1;
+            ecol = c2 - 1;
             break;
+        }
         case 13:
             line += _parse_locsvarint(data);
             spanLine = line;
@@ -221,19 +227,96 @@ int PycCode::lineForOffset(int off) const
         case 12: case 11: case 10:
             line += code - 10;
             spanLine = line;
-            data.getByte();
-            data.getByte();
+            scol = data.getByte();                  // start col
+            ecol = data.getByte();                  // end col
             break;
-        default:
-            data.getByte();
+        default: {
+            // short form (code 0-9): one byte carries the low column bits and
+            // the (end-start) column delta; the code is the column >> 3 group.
+            int b = data.getByte();
             spanLine = line;
+            scol = code * 8 + ((b >> 4) & 7);
+            ecol = scol + (b & 0x0f);
             break;
         }
-        int start = cu * 2;
-        int end = (cu + length) * 2;
-        if (off >= start && off < end)
-            return spanLine;
+        }
+        if (spanEndLine < 0)
+            spanEndLine = spanLine;   // only long-form entries span lines
+        m_lineCache.push_back({cu * 2, (cu + length) * 2, spanLine, spanEndLine, scol, ecol});
         cu += length;
+    }
+}
+
+int PycCode::lineForOffset(int off) const
+{
+    if (!m_lineCacheBuilt)
+        buildLineCache();
+    // spans are non-overlapping and offset-ordered; binary search for the span
+    // containing off (returns its line, which may be -1); -1 if in no span.
+    int lo = 0, hi = (int)m_lineCache.size() - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        const LineSpan& s = m_lineCache[mid];
+        if (off < s.start)
+            hi = mid - 1;
+        else if (off >= s.end)
+            lo = mid + 1;
+        else
+            return s.line;
+    }
+    return -1;
+}
+
+int PycCode::colForOffset(int off) const
+{
+    if (!m_lineCacheBuilt)
+        buildLineCache();
+    int lo = 0, hi = (int)m_lineCache.size() - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        const LineSpan& s = m_lineCache[mid];
+        if (off < s.start)
+            hi = mid - 1;
+        else if (off >= s.end)
+            lo = mid + 1;
+        else
+            return s.scol;
+    }
+    return -1;
+}
+
+int PycCode::elineForOffset(int off) const
+{
+    if (!m_lineCacheBuilt)
+        buildLineCache();
+    int lo = 0, hi = (int)m_lineCache.size() - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        const LineSpan& s = m_lineCache[mid];
+        if (off < s.start)
+            hi = mid - 1;
+        else if (off >= s.end)
+            lo = mid + 1;
+        else
+            return s.eline;
+    }
+    return -1;
+}
+
+int PycCode::ecolForOffset(int off) const
+{
+    if (!m_lineCacheBuilt)
+        buildLineCache();
+    int lo = 0, hi = (int)m_lineCache.size() - 1;
+    while (lo <= hi) {
+        int mid = (lo + hi) / 2;
+        const LineSpan& s = m_lineCache[mid];
+        if (off < s.start)
+            hi = mid - 1;
+        else if (off >= s.end)
+            lo = mid + 1;
+        else
+            return s.ecol;
     }
     return -1;
 }

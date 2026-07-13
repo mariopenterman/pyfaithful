@@ -7,6 +7,27 @@
 #include <string>
 #include <utility>
 
+/* Source byte-offset of the instruction currently being decoded in the main
+   BuildFromCode loop (or -1 outside it). Every ASTNode records this at
+   construction into m_srcOff, so a STATEMENT node (one appended to a block)
+   carries the byte offset of the instruction that built it -- used by the
+   line-faithful placeholder pass to position `...` between statements. */
+extern int g_stmtOff;
+/* Source LINE of the instruction currently being decoded (or -1 outside the
+   loop). Recorded per node so the renderer can pad blank lines to match the
+   original inter-statement line gaps (line-faithful output). */
+extern int g_stmtLine;
+/* Current OUTPUT line while rendering (1-based); maintained by the
+   newline-counting stream buffer in main(). The layout engine reads it to pad
+   blank lines so each construct lands on its original source line. */
+extern int g_curLine;
+/* Source START column of the instruction currently being decoded (or -1); each
+   node records it (srcCol()). And the current OUTPUT column (0-based) while
+   rendering. The column-layout engine pads intra-line whitespace so a token
+   lands at its original source column. */
+extern int g_stmtCol;
+extern int g_curCol;
+
 /* Similar interface to PycObject, so PycRef can work on it... *
  * However, this does *NOT* mean the two are interchangeable!  */
 class ASTNode {
@@ -26,7 +47,9 @@ public:
         NODE_LOCALS,
     };
 
-    ASTNode(int type = NODE_INVALID) : m_refs(), m_type(type), m_processed() { }
+    ASTNode(int type = NODE_INVALID)
+        : m_refs(), m_type(type), m_processed(), m_srcOff(g_stmtOff),
+          m_srcLine(g_stmtLine), m_srcCol(g_stmtCol), m_layoutWidth(0) { }
     virtual ~ASTNode() { }
 
     int type() const { return internalGetType(this); }
@@ -34,10 +57,56 @@ public:
     bool processed() const { return m_processed; }
     void setProcessed() { m_processed = true; }
 
+    /* Byte offset of the instruction that built this node (see g_stmtOff), or
+       -1 if built outside the decode loop. Meaningful for statement nodes. */
+    int srcOff() const { return m_srcOff; }
+    void setSrcOff(int off) { m_srcOff = off; }
+
+    /* Source line that built this node (see g_stmtLine), or -1. */
+    int srcLine() const { return m_srcLine; }
+    void setSrcLine(int line) { m_srcLine = line; }
+
+    /* Source START column that built this node (see g_stmtCol), or -1. */
+    int srcCol() const { return m_srcCol; }
+    void setSrcCol(int col) { m_srcCol = col; }
+
+    /* Column-layout engine: for a stripped-statement placeholder (an injected
+       Ellipsis standing in for an -OO-stripped docstring/assert), the original
+       rendered WIDTH (ecol - scol) of the stripped text. 0 = no override; the
+       placeholder renders as the default `...`. When > 3 it renders as a bare
+       string literal of exactly this width, which under -OO recompiles to the
+       SAME (discarded) code as `...` but reproduces the original column span. */
+    int layoutWidth() const { return m_layoutWidth; }
+    void setLayoutWidth(int w) { m_layoutWidth = w; }
+
+    /* For a stripped-statement placeholder whose original text spanned multiple
+       source lines (a multi-line docstring's NOP), the span's END line and END
+       column, so the placeholder can be rendered across the same lines and
+       close at the same column. -1 = single-line (use layoutWidth). */
+    int layoutEndLine() const { return m_layoutEndLine; }
+    void setLayoutEndLine(int l) { m_layoutEndLine = l; }
+    int layoutEndCol() const { return m_layoutEndCol; }
+    void setLayoutEndCol(int c) { m_layoutEndCol = c; }
+
+    /* Layout-only suppression: a statement whose rendering is omitted entirely (no
+       text, no source line consumed). Used to drop an implicit trailing `return
+       None` epilogue / its synthesized `else:` that the compiler re-creates on
+       recompile, so co_code is unchanged but the over-rendered lines no longer push
+       later constructs down. Set only where a recompile provably re-adds the node. */
+    bool suppressed() const { return m_suppressed; }
+    void setSuppressed(bool s) { m_suppressed = s; }
+
 private:
     int m_refs;
     int m_type;
     bool m_processed;
+    int m_srcOff;
+    int m_srcLine;
+    int m_srcCol;
+    int m_layoutWidth;
+    int m_layoutEndLine = -1;
+    int m_layoutEndCol = -1;
+    bool m_suppressed = false;
 
     // Hack to make clang happy :(
     static int internalGetType(const ASTNode *node)
@@ -309,12 +378,21 @@ public:
     const annot_t& annotations() const { return m_annotations; }
     void setAnnotations(annot_t a) { m_annotations = std::move(a); }
 
+    /* Number of line-anchor NOPs the compiler emitted immediately before the
+       positional-defaults tuple: one per source line that carried a constant
+       default in a multi-line signature. -1 when unknown / not a const-default
+       tuple. Used to render such a signature one parameter per line so the
+       recompile regenerates the same anchor NOPs. */
+    int sigNopAnchors() const { return m_sigNopAnchors; }
+    void setSigNopAnchors(int n) { m_sigNopAnchors = n; }
+
 private:
     PycRef<ASTNode> m_code;
     defarg_t m_defargs;
     defarg_t m_kwdefargs;
     decorator_t m_decorators;
     annot_t m_annotations;
+    int m_sigNopAnchors = -1;
 };
 
 
@@ -607,8 +685,10 @@ public:
         : ASTNode(NODE_BLOCK), m_blktype(blktype), m_end(end), m_inited(inited) { }
 
     BlkType blktype() const { return m_blktype; }
+    void setBlktype(BlkType t) { m_blktype = t; }
     int end() const { return m_end; }
     const list_t& nodes() const { return m_nodes; }
+    list_t& mutableNodes() { return m_nodes; }
     list_t::size_type size() const { return m_nodes.size(); }
     void removeFirst();
     void removeLast();
@@ -639,7 +719,8 @@ public:
 
     ASTCondBlock(ASTBlock::BlkType blktype, int end, PycRef<ASTNode> cond,
                  bool negative = false)
-        : ASTBlock(blktype, end), m_cond(std::move(cond)), m_negative(negative) { }
+        : ASTBlock(blktype, end), m_cond(std::move(cond)), m_negative(negative),
+          m_condRenderAsOne(false) { }
 
     PycRef<ASTNode> cond() const { return m_cond; }
     bool negative() const { return m_negative; }
@@ -648,10 +729,17 @@ public:
     PycRef<ASTNode> exceptVar() const { return m_exceptVar; }
     void setExceptVar(PycRef<ASTNode> var) { m_exceptVar = std::move(var); }
 
+    /* A `while True:` whose source spelled the always-true test as `1` (no bool
+       `True` const survives): keep the Pyc_True condition for structural handling
+       but render it as `1`. */
+    bool condRenderAsOne() const { return m_condRenderAsOne; }
+    void setCondRenderAsOne(bool v) { m_condRenderAsOne = v; }
+
 private:
     PycRef<ASTNode> m_cond;
     bool m_negative;
     PycRef<ASTNode> m_exceptVar;
+    bool m_condRenderAsOne;
 };
 
 

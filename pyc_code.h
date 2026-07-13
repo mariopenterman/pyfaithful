@@ -111,6 +111,26 @@ public:
     std::vector<PycExceptionTableEntry> exceptionTableEntries() const;
 
     int lineForOffset(int off) const;
+    /* Source START column of the instruction at byte offset `off` (the 3.11
+       location table encodes columns alongside lines), or -1 if unknown.
+       Lets the column-layout engine place each token at its original column. */
+    int colForOffset(int off) const;
+    /* Source END column of the instruction at offset `off`, or -1 if unknown.
+       (ecol - scol gives the original source-text width, used to size a
+       stripped-statement placeholder to match co_positions.) */
+    int ecolForOffset(int off) const;
+    /* Source END line of the instruction at offset `off`, or -1 if unknown.
+       Differs from lineForOffset only for multi-line spans (long-form location
+       entries), e.g. the NOP left by a stripped multi-line docstring. */
+    int elineForOffset(int off) const;
+
+private:
+    /* Cache of the decoded line table so lineForOffset is O(log n) per call
+       instead of re-parsing the whole table each time. Built lazily. */
+    struct LineSpan { int start, end, line, eline, scol, ecol; };
+    mutable std::vector<LineSpan> m_lineCache;
+    mutable bool m_lineCacheBuilt = false;
+    void buildLineCache() const;
 
 private:
     int m_argCount, m_posOnlyArgCount, m_kwOnlyArgCount, m_numLocals;

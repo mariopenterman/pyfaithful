@@ -4,6 +4,7 @@
 #include <unordered_set>
 #include <unordered_map>
 #include <set>
+#include <sstream>
 #include "ASTree.h"
 #include "FastStack.h"
 #include "pyc_numeric.h"
@@ -138,9 +139,58 @@ static bool keepFinalRetNone = false;
 static bool inLambda = false;
 static bool inAsyncGen = false;
 
+/* When a generator expression is the SOLE positional argument of a call
+   (`sum(x for x in y)`), its own delimiting parentheses coincide with the
+   call's argument parentheses, so Python allows -- and canonically uses --
+   the un-parenthesised form. Set while rendering that argument so the
+   comprehension omits its own `(` / `)`. */
+static bool suppressGenExprParens = false;
+
+/* When a lambda is a call argument its enclosing parentheses are redundant
+   (`f(lambda x: x)` rather than `f((lambda x: x))`): the lambda body is a
+   `test`, so an argument-list comma terminates it and cannot be swallowed.
+   Set while rendering such an argument so the lambda omits its own `(` / `)`. */
+static bool suppressLambdaParens = false;
+
 static bool printDocstringAndGlobals = false;
 
 static bool printClassDocstring = true;
+
+/* Stack of the class names lexically enclosing the node currently being
+   rendered. Used to reverse CPython's private-name mangling: a name of the
+   form `_<ClassName>__rest` (where <ClassName> is an enclosing class and the
+   original spelling `__rest` does not end in `__`) was written `__rest` in the
+   source. Un-mangling is co_code-safe because recompiling `__rest` inside the
+   same class re-mangles to the identical `_<ClassName>__rest`. */
+static std::vector<std::string> g_classNameStack;
+
+/* If `name` is a mangled private identifier for one of the enclosing classes,
+   return its original (leading `__`) spelling; otherwise return it unchanged. */
+static std::string demangleName(const std::string& name)
+{
+    if (g_classNameStack.empty())
+        return name;
+    if (name.size() < 3 || name[0] != '_' || name[1] == '_')
+        return name;  // mangled names begin with a single leading underscore
+    for (auto it = g_classNameStack.rbegin(); it != g_classNameStack.rend(); ++it) {
+        /* CPython strips leading underscores from the class name before
+           mangling, and skips classes whose name is all underscores. */
+        std::string cls = *it;
+        size_t s = cls.find_first_not_of('_');
+        if (s == std::string::npos)
+            continue;
+        cls = cls.substr(s);
+        const std::string prefix = std::string("_") + cls + std::string("__");
+        if (name.compare(0, prefix.size(), prefix) == 0) {
+            std::string rest = name.substr(prefix.size() - 2);  // keep the `__`
+            /* Names ending in two underscores are not mangled. */
+            if (rest.size() >= 2 && rest.compare(rest.size() - 2, 2, "__") == 0)
+                return name;
+            return rest;
+        }
+    }
+    return name;
+}
 
 static PycRef<ASTNode> StackPopTop(FastStack& stack)
 {
@@ -203,12 +253,22 @@ static void CheckIfExpr(FastStack& stack, PycRef<ASTBlock> curblock)
     stack.push(new ASTTernary(std::move(if_block), std::move(if_expr), std::move(else_expr)));
 }
 
+/* Anchor-NOP offsets of the current code object's one-per-line const-default
+   signatures. Populated by BuildFromCode, consumed by decompyle immediately
+   after (before any child code object is decompiled). */
+static std::set<int> g_sigAnchorNopOffs;
+
 static PycRef<ASTNode> InlineComprehension(PycRef<PycCode> code, PycModule* mod,
                                            PycRef<ASTNode> iter)
 {
     bool savedClean = cleanBuild;
+    /* BuildFromCode clears g_sigAnchorNopOffs on entry; save/restore it so this
+       inline recursion does not wipe the enclosing code object's accumulated
+       signature anchors (consumed by decompyle after the outer build). */
+    std::set<int> savedSigAnchors = g_sigAnchorNopOffs;
     PycRef<ASTNode> body = BuildFromCode(code, mod);
     cleanBuild = savedClean;
+    g_sigAnchorNopOffs = savedSigAnchors;
     PycRef<ASTComprehension> comp;
     if (body != nullptr && body.type() == ASTNode::NODE_NODELIST) {
         for (const auto& n : body.cast<ASTNodeList>()->nodes()) {
@@ -411,6 +471,19 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
     std::unordered_set<int> raiseFinallyClose;
     std::unordered_set<int> loopTailFinClose;
     std::unordered_set<int> finallyEpilogueCut;
+    /* Offsets of the run of NOPs seen immediately before the current instruction
+       (see the LOAD_CONST tuple recording below): the compiler emits one such
+       line-anchor NOP per source line carrying a constant default in a multi-line
+       signature. sigTupleNopOffs maps a const-tuple LOAD_CONST's offset to those
+       NOP offsets so MAKE_FUNCTION can recover a signature's anchor NOPs. */
+    std::vector<int> pendingNopOffs;
+    std::unordered_map<int, std::vector<int> > sigTupleNopOffs;
+    /* Byte offsets of the anchor NOPs consumed by one-per-line const-default
+       signatures (see g_sigAnchorNopOffs): excluded from the stripped-statement
+       placeholder passes so the signature render (not a placeholder) reproduces
+       them, with no double-count. Cleared per code object; consumed by decompyle
+       right after this returns, before any child code object is decompiled. */
+    g_sigAnchorNopOffs.clear();
 
     if (mod->verCompare(3, 11) >= 0) {
         exception_entries = code->exceptionTableEntries();
@@ -700,6 +773,107 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 i = j;
             } else {
                 ++i;
+            }
+        }
+    }
+
+    /* Prescan: terminal `if/else` at module- or class-body scope. CPython threads
+       the shared exit of a terminal `if C: A else: B` (nothing follows the if/else
+       at the same level) by ending the if-true arm A with an inline
+       `LOAD_CONST None; RETURN_VALUE`, then begins the else arm B at the false-jump
+       target. At module or class scope a `return` statement is illegal, so an inline
+       return-None sitting right before a forward-jump target CANNOT be source code --
+       it is compiler-generated exit threading, which proves the target region is a
+       genuine `else:` and not unconditional post-`if` code. Without this the else is
+       dropped: B renders as always-executed (a semantic change) and the recompiled
+       co_code diverges (the shared exit re-threads differently). moduleElseAt maps
+       the false-jump target offset -> the else-block end (the epilogue return-None).
+       Restricted to module/class scope; at function scope the inline return-None is
+       indistinguishable from a real trailing `return`. */
+    std::unordered_map<int, int> moduleElseAt;
+    {
+        bool topScope = code->name() != nullptr && code->name()->isEqual("<module>");
+        if (!topScope) {
+            // class body: prologue is __name__ -> __module__, then __qualname__.
+            PycBuffer cs(code->code()->value(), code->code()->length());
+            int co, ca, cp = 0, real = 0;
+            while (!cs.atEof() && real < 4) {
+                bc_next(cs, mod, co, ca, cp);
+                if (co == Pyc::CACHE || co == Pyc::RESUME_A || co == Pyc::NOP
+                        || co == Pyc::EXTENDED_ARG_A)
+                    continue;
+                if (co == Pyc::STORE_NAME_A) {
+                    PycRef<PycString> nm = code->getName(ca);
+                    if (nm != nullptr && strcmp(nm->value(), "__module__") == 0) {
+                        topScope = true;
+                        break;
+                    }
+                }
+                ++real;
+            }
+        }
+        if (topScope) {
+            const int W = (int)sizeof(uint16_t);
+            struct MI { int op; int arg; int off; int end; };
+            std::vector<MI> ins;
+            PycBuffer ms(code->code()->value(), code->code()->length());
+            int mo, ma, mp = 0;
+            while (!ms.atEof()) {
+                int off = mp;
+                bc_next(ms, mod, mo, ma, mp);
+                if (mo == Pyc::CACHE)
+                    continue;
+                ins.push_back({mo, ma, off, mp});
+            }
+            int n = (int)ins.size();
+            auto isReal = [&](int i) {
+                return ins[i].op != Pyc::NOP && ins[i].op != Pyc::EXTENDED_ARG_A;
+            };
+            // Trailing epilogue must be `LOAD_CONST None; RETURN_VALUE` (the module or
+            // class body's implicit exit); its LOAD_CONST offset bounds every else.
+            int lastReal = n - 1;
+            while (lastReal >= 0 && !isReal(lastReal)) --lastReal;
+            int epilogueOff = -1;
+            if (lastReal >= 1 && ins[lastReal].op == Pyc::RETURN_VALUE) {
+                int p = lastReal - 1;
+                while (p >= 0 && !isReal(p)) --p;
+                if (p >= 0 && ins[p].op == Pyc::LOAD_CONST_A
+                        && code->getConst(ins[p].arg).type() == PycObject::TYPE_NONE)
+                    epilogueOff = ins[p].off;
+            }
+            std::unordered_map<int, int> offToIdx;
+            for (int i = 0; i < n; ++i)
+                offToIdx[ins[i].off] = i;
+            if (epilogueOff >= 0) {
+                for (int i = 0; i < n; ++i) {
+                    int op = ins[i].op;
+                    if (op != Pyc::POP_JUMP_FORWARD_IF_FALSE_A
+                            && op != Pyc::POP_JUMP_FORWARD_IF_TRUE_A
+                            && op != Pyc::POP_JUMP_FORWARD_IF_NONE_A
+                            && op != Pyc::POP_JUMP_FORWARD_IF_NOT_NONE_A)
+                        continue;
+                    int tgt = ins[i].end + ins[i].arg * W;
+                    /* tgt must leave a non-empty else body before the epilogue:
+                       tgt == epilogueOff is a plain `if C: A` (no else) whose false
+                       path falls straight to the shared exit. */
+                    if (tgt <= ins[i].off || tgt >= epilogueOff)
+                        continue;
+                    auto it = offToIdx.find(tgt);
+                    if (it == offToIdx.end())
+                        continue;
+                    int j = it->second;
+                    // The instruction physically preceding the target must be an
+                    // inline `LOAD_CONST None; RETURN_VALUE` (the if-true arm's
+                    // threaded exit), so nothing falls through into the target.
+                    int r = j - 1;
+                    while (r >= 0 && !isReal(r)) --r;
+                    int l = r - 1;
+                    while (l >= 0 && !isReal(l)) --l;
+                    if (r >= 1 && ins[r].op == Pyc::RETURN_VALUE
+                            && l >= 0 && ins[l].op == Pyc::LOAD_CONST_A
+                            && code->getConst(ins[l].arg).type() == PycObject::TYPE_NONE)
+                        moduleElseAt[tgt] = epilogueOff;
+                }
             }
         }
     }
@@ -9941,7 +10115,18 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
         }
 
         curpos = pos;
+        g_stmtOff = curpos;   // tag nodes built for this instruction (see ASTNode)
+        g_stmtLine = code->lineForOffset(curpos);
+        g_stmtCol = code->colForOffset(curpos);
         bc_next(source, mod, opcode, operand, pos);
+
+        /* Track the run of NOP offsets ending just before this instruction (used to
+           recover multi-line const-default signature anchors at MAKE_FUNCTION). */
+        std::vector<int> nopsBeforeCur = pendingNopOffs;
+        if (opcode == Pyc::NOP)
+            pendingNopOffs.push_back(curpos);
+        else
+            pendingNopOffs.clear();
 
         /* Shared-tail return absorb (see teoElseAbsorbRet): this offset is a
            `LOAD_x; RETURN_VALUE` already emitted into the BLK_ELSE. Skip both ops so
@@ -10136,6 +10321,29 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
             PycRef<ASTCondBlock> whb = new ASTCondBlock(
                     ASTBlock::BLK_WHILE, whileTrueHdr[curpos],
                     new ASTObject(Pyc_True), false);
+            /* An unconditional loop the source wrote as `while <truthy const>:` has
+               its test optimized away, so the literal survives only as a dangling
+               entry in co_consts. `while True:` leaves a bool `True` there; the
+               common `while 1:` idiom leaves none. The condition object stays
+               Pyc_True (the whole while-True machinery keys off that), but when no
+               bool `True` const is present the source was `while 1:`, so flag the
+               block to RENDER its condition as `1`. A genuine `while True:` always
+               retains the const (even under -OO), so a matching loop is never
+               reflagged. */
+            {
+                bool hasTrueConst = false;
+                if (code->consts() != nullptr) {
+                    for (int ci = 0; ci < code->consts()->size(); ci++) {
+                        PycRef<PycObject> cc = code->consts()->get(ci);
+                        if (cc != nullptr && cc->type() == PycObject::TYPE_TRUE) {
+                            hasTrueConst = true;
+                            break;
+                        }
+                    }
+                }
+                if (!hasTrueConst && !whileTrueTopTest.count(curpos))
+                    whb->setCondRenderAsOne(true);
+            }
             whb->init();
             blocks.push(whb.cast<ASTBlock>());
             curblock = blocks.top();
@@ -12274,6 +12482,41 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                                 new ASTBinary(cond1, cond, ASTBinary::BIN_LOG_AND),
                                 ASTUnary::UN_NOT);
                     }
+                    else if (isAnd && firstNeg && neg
+                             && (cond1->type() == ASTNode::NODE_COMPARE
+                                 || cond->type() == ASTNode::NODE_COMPARE)) {
+                        /* de Morgan (dual of the OR case above): an AND whose BOTH
+                           operands are negated comes from a source `not (cond1 or
+                           cond)`. The compiler emits the operands un-negated (each a
+                           `==`/`is`/… with an IF_TRUE-to-skip jump — any one true skips
+                           the guarded body); distributing the negation to `not cond1
+                           and not cond` re-inverts a COMPARISON operand (`==`->`!=`) and
+                           recompiles to the opposite jump sense. Fold to `not (cond1 or
+                           cond)` so the comparison keeps its original operator. Gated on
+                           a comparison operand, like the OR case: a genuine `A != B and
+                           C != D` has POSITIVE operands (firstNeg/neg false) and never
+                           reaches here. */
+                        newcond = new ASTUnary(
+                                new ASTBinary(cond1, cond, ASTBinary::BIN_LOG_OR),
+                                ASTUnary::UN_NOT);
+                    }
+                    else if (isAnd && neg
+                             && cond->type() == ASTNode::NODE_COMPARE
+                             && cond1->type() == ASTNode::NODE_UNARY
+                             && cond1.cast<ASTUnary>()->op() == ASTUnary::UN_NOT
+                             && cond1.cast<ASTUnary>()->operand()->type() == ASTNode::NODE_BINARY
+                             && cond1.cast<ASTUnary>()->operand().cast<ASTBinary>()->op()
+                                    == ASTBinary::BIN_LOG_OR) {
+                        /* Extend an already-folded `not (… or …)` chain (see the dual
+                           case) with a further negated comparison, so `not(A or B or C)`
+                           builds up left-to-right rather than degrading to `not(A or B)
+                           and not C` at the third operand (where the folded left operand
+                           is no longer flagged negative). */
+                        PycRef<ASTNode> innerOr = cond1.cast<ASTUnary>()->operand();
+                        newcond = new ASTUnary(
+                                new ASTBinary(innerOr, cond, ASTBinary::BIN_LOG_OR),
+                                ASTUnary::UN_NOT);
+                    }
                     else
                         newcond = new ASTBinary(left, right,
                                 isAnd ? ASTBinary::BIN_LOG_AND : ASTBinary::BIN_LOG_OR);
@@ -13852,6 +14095,15 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 PycRef<ASTObject> t_ob = new ASTObject(code->getConst(operand));
 
                 if ((t_ob->object().type() == PycObject::TYPE_TUPLE ||
+                        t_ob->object().type() == PycObject::TYPE_SMALL_TUPLE)
+                        && t_ob->object().cast<PycTuple>()->values().size()
+                        && !nopsBeforeCur.empty()) {
+                    /* A non-empty const tuple preceded by anchor NOPs: remember their
+                       offsets in case this is a multi-line signature's defaults tuple. */
+                    sigTupleNopOffs[curpos] = nopsBeforeCur;
+                }
+
+                if ((t_ob->object().type() == PycObject::TYPE_TUPLE ||
                         t_ob->object().type() == PycObject::TYPE_SMALL_TUPLE) &&
                         !t_ob->object().cast<PycTuple>()->values().size()) {
                     ASTTuple::value_t values;
@@ -13926,6 +14178,7 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
 
                 ASTFunction::defarg_t defArgs, kwDefArgs;
                 ASTFunction::annot_t funcAnnots;
+                int constDefTupleOff = -1;
                 if (mod->verCompare(3, 6) >= 0) {
                     if (operand & 0x08)
                         stack.pop();
@@ -14006,6 +14259,7 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                             for (const auto& v : defs.cast<ASTObject>()->object()
                                                      .cast<PycTuple>()->values())
                                 defArgs.push_back(new ASTObject(v));
+                            constDefTupleOff = defs->srcOff();
                         } else if (defs != nullptr) {
                             defArgs.push_back(defs);
                         }
@@ -14025,6 +14279,40 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 PycRef<ASTNode> fn = new ASTFunction(fun_code, defArgs, kwDefArgs);
                 if (!funcAnnots.empty())
                     fn.cast<ASTFunction>()->setAnnotations(std::move(funcAnnots));
+                /* If the positional defaults came from a const tuple preceded by a
+                   run of K anchor NOPs (with no keyword-only defaults), the
+                   signature wrapped across K source lines each carrying a constant
+                   default: record K so it renders over K lines and the recompile
+                   regenerates those K NOPs. Annotations are fine -- they emit real
+                   code carrying their own positions and add no anchor NOPs, so the
+                   count still depends only on the constant-default lines. */
+                if (constDefTupleOff >= 0 && kwDefArgs.empty()
+                        && fun_code.type() == ASTNode::NODE_OBJECT) {
+                    auto it = sigTupleNopOffs.find(constDefTupleOff);
+                    int K = (it != sigTupleNopOffs.end()) ? (int)it->second.size() : 0;
+                    /* Accept the run of NOPs immediately before the defaults tuple as
+                       multi-line signature anchors (one per source line carrying a
+                       constant default) when there are at most as many as there are
+                       defaults and EVERY NOP lies on the signature (line >= the
+                       function's first line): a stripped statement before the `def`
+                       also leaves a preceding NOP, but on an earlier line, and must
+                       not trigger multi-line rendering. K == #defaults is the
+                       one-per-line case; K < #defaults is a soft-wrapped signature
+                       (some lines carry several defaults) reproduced by distributing
+                       the defaults across K lines. */
+                    if (K > 0 && K <= (int)defArgs.size()) {
+                        int dl = fun_code.cast<ASTObject>()->object()
+                                     .cast<PycCode>()->firstLine();
+                        bool allInSig = true;
+                        for (int noff : it->second)
+                            if (code->lineForOffset(noff) < dl) { allInSig = false; break; }
+                        if (allInSig) {
+                            fn.cast<ASTFunction>()->setSigNopAnchors(K);
+                            for (int noff : it->second)
+                                g_sigAnchorNopOffs.insert(noff);
+                        }
+                    }
+                }
                 stack.push(fn);
             }
             break;
@@ -14485,6 +14773,36 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                     stack_hist.push(stack);
                     PycRef<ASTBlock> elseb =
                             new ASTBlock(ASTBlock::BLK_ELSE, classCellMerge);
+                    blocks.push(elseb);
+                    curblock = elseb;
+                    break;
+                }
+
+                /* Terminal `if C: A else: B` at module/class scope: the if-true arm A
+                   just reached its threaded inline return-None (illegal as source at
+                   this scope, so it is the compiler's shared-exit thread — see the
+                   moduleElseAt pre-scan). Rather than close the BLK_IF into
+                   fall-through (which would drop the else and mis-render B as always
+                   executed), drop the synthetic return-None and open a real BLK_ELSE
+                   for the false-target region. */
+                if (moduleElseAt.count(curblock->end())
+                        && curblock->blktype() == ASTBlock::BLK_IF
+                        && (value == nullptr
+                            || (value.type() == ASTNode::NODE_OBJECT
+                                && value.cast<ASTObject>()->object() == Pyc_None))
+                        && stack_hist.size()
+                        && blocks.size() > 1) {
+                    int elseEnd = moduleElseAt[curblock->end()];
+                    curblock->removeLast();      // drop the threaded return-None
+                    stack = stack_hist.top();
+                    stack_hist.pop();
+                    PycRef<ASTBlock> ifb = curblock;
+                    blocks.pop();
+                    curblock = blocks.top();
+                    curblock->append(ifb.cast<ASTNode>());
+                    stack_hist.push(stack);
+                    PycRef<ASTBlock> elseb = new ASTBlock(ASTBlock::BLK_ELSE, elseEnd);
+                    elseb->init();
                     blocks.push(elseb);
                     curblock = elseb;
                     break;
@@ -15234,7 +15552,13 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 } else {
                     PycRef<ASTNode> value = stack.top();
                     stack.pop();
-                    if (value.type() == ASTNode::NODE_CHAINSTORE) {
+                    if (!stack.empty() && stack.top() != nullptr
+                            && stack.top().type() == ASTNode::NODE_IMPORT) {
+                        /* `from mod import name` where `name` is declared `global`:
+                           the IMPORT_FROM value binds to the import (mirrors the
+                           STORE_NAME/STORE_FAST path) rather than a bare `name = name`. */
+                        stack.top().cast<ASTImport>()->add_store(new ASTStore(value, name));
+                    } else if (value.type() == ASTNode::NODE_CHAINSTORE) {
                         append_to_chain_store(value, name, stack, curblock);
                     } else if (!tryAttachDecorators(curblock, value, name)) {
                         curblock->append(new ASTStore(value, name));
@@ -15858,14 +16182,25 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
         case Pyc::COPY_A:
             {
                 if (operand == 1 && chainCopyOffsets.count(curpos)) {
-                    if (stack.top().type() == PycObject::TYPE_NULL) {
-                        stack.push(stack.top());
-                    } else if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
+                    if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
                         auto chainstore = stack.top();
                         stack.pop();
                         stack.push(stack.top());
                         stack.push(chainstore);
                     } else {
+                        /* Open a new chained-assignment target list. The
+                           duplicated value doubles as the completion sentinel:
+                           append_to_chain_store stops when the stack top is
+                           TYPE_NULL. A `None` value is pushed as a NULL ref (see
+                           LOAD_CONST), which would trip that sentinel and split
+                           `a = b = None` into separate statements. Since
+                           chainCopyOffsets has confirmed this is a chained
+                           assign, replace the NULL with an explicit None node
+                           (renders as `None`, sentinel-safe). */
+                        if (stack.top() == nullptr) {
+                            stack.pop();
+                            stack.push(new ASTObject(Pyc_None));
+                        }
                         stack.push(stack.top());
                         ASTNodeList::list_t targets;
                         stack.push(new ASTChainStore(targets, stack.top()));
@@ -15891,6 +16226,9 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
         if (opcode != Pyc::PRECALL_A && opcode != Pyc::CACHE)
             lastSubstantialOp = opcode;
     }
+    g_stmtOff = -1;   // decode loop done; nodes built past here are not statements
+    g_stmtLine = -1;
+    g_stmtCol = -1;
 
     if (stack_hist.size()) {
         fputs("Warning: Stack history is not empty!\n", stderr);
@@ -15967,8 +16305,19 @@ static int cmp_prec(PycRef<ASTNode> parent, PycRef<ASTNode> child)
        Else we'd have expressions like (((a + b) + c) + d) when therefore
        equivalent, a + b + c + d would suffice. */
 
-    if (parent.type() == ASTNode::NODE_UNARY && parent.cast<ASTUnary>()->op() == ASTUnary::UN_NOT)
-        return 1;   // Always parenthesize not(x)
+    if (parent.type() == ASTNode::NODE_UNARY && parent.cast<ASTUnary>()->op() == ASTUnary::UN_NOT) {
+        /* `not` binds looser than comparison/arithmetic/bitwise/attr/subscript
+           (all tighter -> no parens) but tighter than boolean and/or. Only
+           parenthesize the operand when it is itself an `and`/`or` expression;
+           anything else the original source wrote without parens (`not x`,
+           `not a.b`, `not a == b`). Ternary operands are still parenthesized by
+           print_ordered. Parens here are co_code-inert. */
+        if (child.type() == ASTNode::NODE_BINARY) {
+            int cop = child.cast<ASTBinary>()->op();
+            return (cop == ASTBinary::BIN_LOG_AND || cop == ASTBinary::BIN_LOG_OR) ? 1 : -1;
+        }
+        return -1;
+    }
     if (child.type() == ASTNode::NODE_BINARY) {
         PycRef<ASTBinary> binChild = child.cast<ASTBinary>();
         if (parent.type() == ASTNode::NODE_BINARY) {
@@ -16005,7 +16354,10 @@ static int cmp_prec(PycRef<ASTNode> parent, PycRef<ASTNode> child)
             return (binChild->op() == ASTBinary::BIN_LOG_AND ||
                     binChild->op() == ASTBinary::BIN_LOG_OR) ? 1 : -1;
         else if (parent.type() == ASTNode::NODE_UNARY)
-            return (binChild->op() == ASTBinary::BIN_POWER) ? -1 : 1;
+            /* `**` and attribute access bind tighter than a unary -/~/+, so
+               `-a ** b` and `-a.b` need no parens; everything looser does. */
+            return (binChild->op() == ASTBinary::BIN_POWER ||
+                    binChild->op() == ASTBinary::BIN_ATTR) ? -1 : 1;
     } else if (child.type() == ASTNode::NODE_UNARY) {
         PycRef<ASTUnary> unChild = child.cast<ASTUnary>();
         if (parent.type() == ASTNode::NODE_BINARY) {
@@ -16016,7 +16368,10 @@ static int cmp_prec(PycRef<ASTNode> parent, PycRef<ASTNode> child)
             else if (unChild->op() == ASTUnary::UN_NOT)
                 return 1;
             else if (binParent->op() == ASTBinary::BIN_POWER)
-                return 1;
+                /* The exponent (right operand of **) is a u_expr in the grammar,
+                   so a unary exponent needs no parens: `a ** -b`. Only a unary
+                   LEFT operand came from explicit source parens: `(-a) ** b`. */
+                return (binParent->right() == child) ? -1 : 1;
             else
                 return -1;
         } else if (parent.type() == ASTNode::NODE_COMPARE) {
@@ -16083,6 +16438,175 @@ static void end_line(std::ostream& pyc_output)
     pyc_output << "\n";
 }
 
+/* Column-layout engine: pad SPACES (forward only) so the next token lands at
+   its original source start column (node->srcCol(), decoded from co_positions).
+   Pure intra-line whitespace: co_code is unaffected. Guards:
+   - never inside a lambda (blank/space injection there is unsafe) or while
+     rendering a signature (g_noCompact) where spacing must stay canonical;
+   - only pad forward (c > g_curCol); never remove;
+   - a sanity cap prevents a stray huge column (e.g. a mis-decoded span) from
+     blowing the line out. A leading space before any leaf token is always
+     syntactically inert in Python. */
+/* Layout engine: when > 0, collection displays do NOT compact to one line, and
+   column padding is suppressed (signature spacing must stay canonical). */
+static int g_noCompact = 0;
+/* Line-faithful expression rendering: a comma-separated element list (call args,
+   tuple/list/set/dict) breaks before any element whose source line exceeds the
+   previous element's, padding to its source column, reproducing the original
+   multi-line layout. The newline inside the brackets/parens is a pure
+   continuation, so co_code is byte-identical -- PROVIDED the wrapped expression
+   contains NO nested code object: shifting a lambda/comprehension/genexpr onto a
+   different source line changes its line-anchor NOP (the old Fix B wall). This
+   master switch is on during a clean-build render; each wrap site additionally
+   checks subtreeHasNestedCode on the specific expression (per-expression gate),
+   so a flat literal is wrapped even when a lambda sits elsewhere in the same
+   function. */
+static bool g_lineFaithful = false;
+/* >0 while rendering inside a try/except/finally-protected body. Compound
+   statement joining is disabled there: an inlined finally copy / exception
+   cleanup emits line-marker NOPs sensitive to the exact line layout, so
+   removing a line by joining `a; b` can drop a NOP and change co_code
+   (asyncio/locks.wait: `await fut; return True` inside try/finally). */
+static int g_protectedDepth = 0;
+/* True if the subtree contains a nested code object (lambda/comprehension/def/
+   class or a raw code const), whose source line would shift if the enclosing
+   expression is re-wrapped. Conservative: an unrecognised node type returns true
+   (assume unsafe) so wrapping is only ever suppressed, never wrongly applied. */
+static bool subtreeHasNestedCode(const PycRef<ASTNode>& n, int depth = 0)
+{
+    if (n == nullptr)
+        return false;
+    if (depth > 60)
+        return true;
+    switch (n->type()) {
+    case ASTNode::NODE_FUNCTION:
+    case ASTNode::NODE_CLASS:
+    case ASTNode::NODE_COMPREHENSION:
+        return true;
+    case ASTNode::NODE_OBJECT:
+        return n.cast<ASTObject>()->object() != nullptr
+                && n.cast<ASTObject>()->object().type() == PycObject::TYPE_CODE;
+    case ASTNode::NODE_NAME:
+    case ASTNode::NODE_KEYWORD:
+    case ASTNode::NODE_IMPORT:
+        return false;
+    case ASTNode::NODE_BINARY:
+    case ASTNode::NODE_COMPARE:
+    case ASTNode::NODE_SLICE: {
+        PycRef<ASTBinary> b = n.cast<ASTBinary>();
+        return subtreeHasNestedCode(b->left(), depth + 1)
+                || subtreeHasNestedCode(b->right(), depth + 1);
+    }
+    case ASTNode::NODE_UNARY:
+        return subtreeHasNestedCode(n.cast<ASTUnary>()->operand(), depth + 1);
+    case ASTNode::NODE_SUBSCR:
+        return subtreeHasNestedCode(n.cast<ASTSubscr>()->name(), depth + 1)
+                || subtreeHasNestedCode(n.cast<ASTSubscr>()->key(), depth + 1);
+    case ASTNode::NODE_TERNARY: {
+        PycRef<ASTTernary> t = n.cast<ASTTernary>();
+        return subtreeHasNestedCode(t->if_block(), depth + 1)
+                || subtreeHasNestedCode(t->if_expr(), depth + 1)
+                || subtreeHasNestedCode(t->else_expr(), depth + 1);
+    }
+    case ASTNode::NODE_TUPLE:
+        for (const auto& v : n.cast<ASTTuple>()->values())
+            if (subtreeHasNestedCode(v, depth + 1))
+                return true;
+        return false;
+    case ASTNode::NODE_LIST:
+        for (const auto& v : n.cast<ASTList>()->values())
+            if (subtreeHasNestedCode(v, depth + 1))
+                return true;
+        return false;
+    case ASTNode::NODE_SET:
+        for (const auto& v : n.cast<ASTSet>()->values())
+            if (subtreeHasNestedCode(v, depth + 1))
+                return true;
+        return false;
+    case ASTNode::NODE_MAP:
+        for (const auto& e : n.cast<ASTMap>()->values())
+            if (subtreeHasNestedCode(e.first, depth + 1)
+                    || subtreeHasNestedCode(e.second, depth + 1))
+                return true;
+        return false;
+    case ASTNode::NODE_CALL: {
+        PycRef<ASTCall> c = n.cast<ASTCall>();
+        if (subtreeHasNestedCode(c->func(), depth + 1))
+            return true;
+        for (const auto& p : c->pparams())
+            if (subtreeHasNestedCode(p, depth + 1))
+                return true;
+        for (const auto& p : c->kwparams())
+            if (subtreeHasNestedCode(p.second, depth + 1))
+                return true;
+        if (c->hasVar() && subtreeHasNestedCode(c->var(), depth + 1))
+            return true;
+        if (c->hasKW() && subtreeHasNestedCode(c->kw(), depth + 1))
+            return true;
+        return false;
+    }
+    default:
+        return true;   // unrecognised: assume unsafe
+    }
+}
+/* True when the code object being rendered contains a nested code const; only
+   then does a wrap site pay for the per-expression subtreeHasNestedCode scan
+   (a fully flat function needs no per-expression check). */
+static bool g_funcHasNestedCode = false;
+/* Effective line-faithful decision for wrapping expression `node`. */
+static inline bool lfSafe(const PycRef<ASTNode>& node)
+{
+    if (!g_lineFaithful)
+        return false;
+    return !g_funcHasNestedCode || !subtreeHasNestedCode(node);
+}
+extern int cur_indent;   // defined below; current output indentation level
+/* Break before a comma-separated element at its original line/column when the
+   element starts a new source line (line-faithful mode). Returns true if it
+   emitted a break (so the caller skips the plain ", "). */
+static bool breakBeforeElem(int& prevLine, const PycRef<ASTNode>& elem,
+                            std::ostream& out, bool first = false)
+{
+    if (!g_lineFaithful || inLambda || g_noCompact || elem == nullptr)
+        return false;
+    int cl = elem->srcLine();
+    int cc = elem->srcCol();
+    if (cl <= 0 || prevLine <= 0 || cl <= prevLine)
+        return false;
+    if (cl - prevLine > 400)   // guard against bad line data
+        return false;
+    /* The first element has no preceding one, so break with a bare newline
+       (a leading comma `[, a]` would be a syntax error). */
+    out << (first ? "\n" : ",\n");
+    if (cc > 0 && cc <= 200)
+        for (int i = 0; i < cc; i++)
+            out << ' ';
+    prevLine = cl;
+    return true;
+}
+static inline void padToCol(const PycRef<ASTNode>& node, std::ostream& out)
+{
+    if (inLambda || g_noCompact)
+        return;
+    if (node == nullptr)
+        return;
+    int c = node->srcCol();
+    if (c < 0 || g_curCol < 0)
+        return;
+    if (c <= g_curCol)
+        return;
+    /* Never re-indent a statement: the leading token sits at the indentation
+       column (cur_indent*4). Padding it would push the whole statement right and
+       can change block nesting (→ co_code). Only pad tokens already past the
+       indent, i.e. interior-of-line whitespace, which is co_code-inert. */
+    if (g_curCol <= (cur_indent < 0 ? 0 : cur_indent * 4))
+        return;
+    if (c - g_curCol > 64)
+        return;
+    for (int i = g_curCol; i < c; i++)
+        out << ' ';
+}
+
 /* A const-string kwargs map key that is a valid Python identifier can render as a
    keyword argument (`k=v`) rather than a dict entry (`'k': v`). */
 static bool isKwargIdentifier(const std::string& s)
@@ -16098,6 +16622,59 @@ static bool isKwargIdentifier(const std::string& s)
 }
 
 int cur_indent = -1;
+/* A def/class assignment self-manages its own start_line (and previously a
+   leading blank line). Under absolute placement the enclosing renderer pads to
+   its source line but must NOT also emit start_line, or the leading indent would
+   land a blank line before it (over-run) / double-indent it. */
+/* For a decorated def/class statement, the placement line is the FIRST
+   decorator's line, not the store's line. CPython records that as the nested
+   code object's co_firstlineno (its first instruction position), so return it
+   when the store is a def/class carrying at least one decorator; otherwise -1
+   (use the store's own srcLine). This makes the `@decorator` lines land where
+   the original had them; the body re-aligns itself via absolute placement. */
+static int decoratedDefFirstLine(const PycRef<ASTNode>& n)
+{
+    if (n == nullptr || n.type() != ASTNode::NODE_STORE)
+        return -1;
+    PycRef<ASTNode> src = n.cast<ASTStore>()->src();
+    if (src == nullptr)
+        return -1;
+    PycRef<ASTNode> codeNode;
+    if (src.type() == ASTNode::NODE_FUNCTION) {
+        if (src.cast<ASTFunction>()->decorators().empty())
+            return -1;
+        codeNode = src.cast<ASTFunction>()->code();
+    } else if (src.type() == ASTNode::NODE_CLASS) {
+        if (src.cast<ASTClass>()->decorators().empty())
+            return -1;
+        codeNode = src.cast<ASTClass>()->code();
+    } else {
+        return -1;
+    }
+    if (codeNode == nullptr || codeNode.type() != ASTNode::NODE_OBJECT)
+        return -1;
+    PycRef<PycObject> obj = codeNode.cast<ASTObject>()->object();
+    if (obj == nullptr || obj.type() != PycObject::TYPE_CODE)
+        return -1;
+    int fl = obj.cast<PycCode>()->firstLine();
+    return fl > 0 ? fl : -1;
+}
+
+static bool selfPositions(const PycRef<ASTNode>& n)
+{
+    if (n == nullptr)
+        return false;
+    /* A try/except/finally wrapper (BLK_CONTAINER) renders its `try:` header via
+       print_block of its child blocks, not inline, so like a def/class it
+       positions itself and must not receive an outer start_line (which would
+       become an indented blank line before `try:`). */
+    if (n.type() == ASTNode::NODE_BLOCK)
+        return n.cast<ASTBlock>()->blktype() == ASTBlock::BLK_CONTAINER;
+    if (n.type() != ASTNode::NODE_STORE)
+        return false;
+    int st = n.cast<ASTStore>()->src().type();
+    return st == ASTNode::NODE_FUNCTION || st == ASTNode::NODE_CLASS;
+}
 static void print_block(PycRef<ASTBlock> blk, PycModule* mod,
                         std::ostream& pyc_output)
 {
@@ -16109,14 +16686,68 @@ static void print_block(PycRef<ASTBlock> blk, PycModule* mod,
         print_src(pass, mod, pyc_output);
     }
 
-    for (auto ln = lines.cbegin(); ln != lines.cend();) {
-        if ((*ln).cast<ASTNode>().type() != ASTNode::NODE_NODELIST) {
-            start_line(cur_indent, pyc_output);
+    /* Layout engine: ABSOLUTE line placement. Each statement carries its source
+       line (srcLine(), from the .pyc line table); g_curLine is the current
+       output line (maintained by the newline-counting stream buffer). Before a
+       statement, pad blank lines until the output line reaches its source line,
+       so the rendered construct lands on its original line and a recompile
+       reproduces the original co_positions. Purely blank lines -> co_code is
+       unchanged. Padding is forward-only: if a preceding construct already
+       over-ran past the target line, we cannot go back, so we just render where
+       we are (that misalignment is what later over-run-reduction phases close).
+       The gap is capped so bad/missing line data degrades gracefully. */
+    /* Count non-suppressed statements so we can drop an all-suppressed body to a
+       `pass` and emit separators correctly around suppressed nodes. */
+    int nVisible = 0;
+    for (const auto& n : lines)
+        if (n == nullptr || !n->suppressed())
+            nVisible++;
+    if (nVisible == 0 && !lines.empty()) {
+        PycRef<ASTNode> pass = new ASTKeyword(ASTKeyword::KW_PASS);
+        start_line(cur_indent, pyc_output);
+        print_src(pass, mod, pyc_output);
+        return;
+    }
+    bool anyEmitted = false;
+    /* Compound-statement joining: consecutive SIMPLE statements the compiler
+       attributed to the SAME source line were written `a; b` on one physical
+       line; render them `; `-joined instead of one-per-line so the line layout
+       (and every later def's position) matches. co_code is byte-identical
+       (verified). Only simple statements qualify -- a block header (if/for/
+       while/try/with/def/class/match/case) always needs its own line, and a
+       match/case body is co_code-load-bearing. */
+    int prevJoinLine = -1;
+    for (auto ln = lines.cbegin(); ln != lines.cend(); ++ln) {
+        if (*ln != nullptr && (*ln)->suppressed())
+            continue;   // layout-suppressed: no text, no line consumed
+        bool isNodeList = (*ln).cast<ASTNode>().type() == ASTNode::NODE_NODELIST;
+        bool joinable = !inLambda && !isNodeList && *ln != nullptr
+                && g_protectedDepth == 0
+                && (*ln).type() != ASTNode::NODE_BLOCK
+                && !selfPositions(*ln);
+        int myLine = (*ln != nullptr) ? (*ln)->srcLine() : -1;
+        bool doJoin = anyEmitted && joinable && prevJoinLine > 0
+                && myLine == prevJoinLine;
+        if (doJoin) {
+            pyc_output << "; ";
+        } else {
+            if (anyEmitted)
+                end_line(pyc_output);
+            if (!isNodeList) {
+                int decoLine = decoratedDefFirstLine(*ln);
+                int curLine = decoLine > 0 ? decoLine : (*ln)->srcLine();
+                if (!inLambda && curLine > 0 && g_curLine > 0 && curLine > g_curLine
+                        && curLine - g_curLine <= 2000) {
+                    while (g_curLine < curLine)
+                        pyc_output << "\n";
+                }
+                if (!selfPositions(*ln))
+                    start_line(cur_indent, pyc_output);
+            }
         }
         print_src(*ln, mod, pyc_output);
-        if (++ln != lines.end()) {
-            end_line(pyc_output);
-        }
+        prevJoinLine = joinable ? myLine : -1;
+        anyEmitted = true;
     }
 }
 
@@ -16321,6 +16952,51 @@ static bool starUnpackNeedsParens(const PycRef<ASTNode>& n)
     return false;
 }
 
+/* Layout engine: true when every element of a collection shares one source line
+   (or carries no line info), so a list/set/dict display can render compactly on
+   a single output line instead of one element per line -- eliminating the
+   over-run that a single-line source collection would otherwise incur. */
+template <typename Container>
+static bool seqOneSrcLine(const Container& c)
+{
+    int line = -1;
+    for (const auto& n : c) {
+        if (n == nullptr)
+            continue;
+        int l = n->srcLine();
+        if (l <= 0)
+            continue;
+        if (line < 0)
+            line = l;
+        else if (l != line)
+            return false;
+    }
+    return true;
+}
+
+/* Render an rvalue in a "bare tuple" statement context (return/yield value,
+   assignment RHS). A multi-element tuple there is canonically written without
+   surrounding parentheses (`return a, b`, not `return (a, b)`); the parens only
+   widen the line and push the elements right of their source columns. Suppress
+   them on the OUTERMOST tuple while rendering, restoring the flag afterwards so
+   nested tuples keep their own parens. Single-element tuples keep the parens
+   (the trailing-comma-only `(x,)` form would otherwise be ambiguous). Bytecode
+   is identical -- BUILD_TUPLE is emitted either way. */
+static void print_bare_tuple_value(PycRef<ASTNode> node, PycModule* mod,
+                                   std::ostream& pyc_output)
+{
+    PycRef<ASTTuple> tup =
+            (node != nullptr && node.type() == ASTNode::NODE_TUPLE)
+            ? node.cast<ASTTuple>() : nullptr;
+    if (tup != nullptr && tup->values().size() > 1 && tup->requireParens()) {
+        tup->setRequireParens(false);
+        print_src(node, mod, pyc_output);
+        tup->setRequireParens(true);
+    } else {
+        print_src(node, mod, pyc_output);
+    }
+}
+
 void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
 {
     if (node == NULL) {
@@ -16509,30 +17185,104 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
             if (fnParen) pyc_output << ")";
             pyc_output << "(";
             bool first = true;
+            /* A generator expression that is the SOLE argument of the call
+               (one positional param, no keyword/`*`/`**` args) may drop its own
+               parentheses: `sum(x for x in y)` rather than `sum((x for x in y))`.
+               The genexpr bytecode (MAKE_FUNCTION + CALL) is identical. */
+            bool soleGenArg = call->pparams().size() == 1
+                    && call->kwparams().empty()
+                    && !call->hasVar() && !call->hasKW()
+                    && call->pparams().front() != nullptr
+                    && call->pparams().front().type() == ASTNode::NODE_COMPREHENSION
+                    && call->pparams().front().cast<ASTComprehension>()->comptype()
+                           == ASTComprehension::COMP_GENERATOR;
+            int elemLine = -1;   // src line of last-rendered arg (line-faithful breaks)
+            bool callLF = lfSafe(node);   // per-expression gate
             for (const auto& param : call->pparams()) {
-                if (!first)
-                    pyc_output << ", ";
+                if (!first) {
+                    if (!(callLF && breakBeforeElem(elemLine, param, pyc_output)))
+                        pyc_output << ", ";
+                } else if (param != nullptr && param->srcLine() > 0) {
+                    elemLine = param->srcLine();
+                }
+                if (soleGenArg)
+                    suppressGenExprParens = true;
+                /* A lambda argument's own parens are redundant (its body is a
+                   `test`, so the next arg-list comma terminates it). */
+                if (param != nullptr && param.type() == ASTNode::NODE_FUNCTION)
+                    suppressLambdaParens = true;
                 print_src(param, mod, pyc_output);
+                suppressGenExprParens = false;
+                suppressLambdaParens = false;
                 first = false;
             }
             for (const auto& param : call->kwparams()) {
-                if (!first)
-                    pyc_output << ", ";
+                if (!first) {
+                    if (!(callLF && breakBeforeElem(elemLine, param.second, pyc_output)))
+                        pyc_output << ", ";
+                } else if (param.second != nullptr && param.second->srcLine() > 0) {
+                    elemLine = param.second->srcLine();
+                }
                 if (param.first.type() == ASTNode::NODE_NAME) {
-                    pyc_output << param.first.cast<ASTName>()->name()->value() << " = ";
+                    pyc_output << param.first.cast<ASTName>()->name()->value() << "=";
                 } else {
                     PycRef<PycString> str_name = param.first.cast<ASTObject>()->object().cast<PycString>();
-                    pyc_output << str_name->value() << " = ";
+                    pyc_output << str_name->value() << "=";
                 }
+                if (param.second != nullptr
+                        && param.second.type() == ASTNode::NODE_FUNCTION)
+                    suppressLambdaParens = true;
                 print_src(param.second, mod, pyc_output);
+                suppressLambdaParens = false;
                 first = false;
             }
-            if (call->hasVar()) {
-                if (!first)
-                    pyc_output << ", ";
-                pyc_output << "*";
-                print_src(call->var(), mod, pyc_output);
-                first = false;
+            /* CALL_FUNCTION_EX with only keyword args still carries an empty
+               positional tuple; `f(*(), **kw)` is equivalent to (and recompiles
+               identically to) the canonical `f(**kw)`, so drop the empty `*()`
+               when a `**` spread follows. */
+            bool emptyVarWithKW = false;
+            if (call->hasVar() && call->hasKW()
+                    && call->var() != nullptr
+                    && call->var().type() == ASTNode::NODE_TUPLE
+                    && call->var().cast<ASTTuple>()->values().empty())
+                emptyVarWithKW = true;
+            if (call->hasVar() && !emptyVarWithKW) {
+                /* CALL_FUNCTION_EX packs the positional side into one tuple.
+                   When that tuple ALREADY contains a `*` spread element it was
+                   built with a LIST/TUPLE spread, so the individual elements
+                   recompile to the SAME bytecode whether written as
+                   `f(*(a, *b))` or spread inline as `f(a, *b)`; the inline form
+                   is canonical. This equivalence holds ONLY when an inner spread
+                   is present -- a pure literal tuple (`f(*(a, b))`) compiles
+                   differently from `f(a, b)`, so it keeps the `*(...)` form. */
+                PycRef<ASTTuple> varTup =
+                        (call->var() != nullptr
+                         && call->var().type() == ASTNode::NODE_TUPLE)
+                        ? call->var().cast<ASTTuple>() : nullptr;
+                bool spreadInline = false;
+                if (varTup != nullptr && varTup->values().size() > 1) {
+                    for (const auto& el : varTup->values()) {
+                        if (el != nullptr && el.type() == ASTNode::NODE_UNARY
+                                && el.cast<ASTUnary>()->op() == ASTUnary::UN_STAR) {
+                            spreadInline = true;
+                            break;
+                        }
+                    }
+                }
+                if (spreadInline) {
+                    for (const auto& el : varTup->values()) {
+                        if (!first)
+                            pyc_output << ", ";
+                        print_src(el, mod, pyc_output);
+                        first = false;
+                    }
+                } else {
+                    if (!first)
+                        pyc_output << ", ";
+                    pyc_output << "*";
+                    print_src(call->var(), mod, pyc_output);
+                    first = false;
+                }
             }
             if (call->hasKW()) {
                 /* `f(*a, k=v, **rest)` bundles the explicit keyword args AND the
@@ -16567,12 +17317,47 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                                 if (par) pyc_output << ")";
                             } else {
                                 pyc_output << e.first.cast<ASTObject>()->object().cast<PycString>()->value()
-                                           << " = ";
+                                           << "=";
                                 print_src(e.second, mod, pyc_output);
                             }
                             first = false;
                         }
                         unrolled = true;
+                    }
+                }
+                /* `f(*a, k=v)` with NO `**rest` builds the kwargs as a const-key map
+                   (BUILD_CONST_KEY_MAP); rendering it as a dict display `**{k: v}`
+                   recompiles with a spurious BUILD_MAP+DICT_MERGE. Unroll to `k=v`
+                   when every key is a const identifier. Values are stored in reverse
+                   (the const-map render pairs keys[i] with values[n-1-i]). */
+                else if (kwnode->type() == ASTNode::NODE_CONST_MAP) {
+                    PycRef<ASTConstMap> cm = kwnode.cast<ASTConstMap>();
+                    PycRef<ASTNode> keysNode = cm->keys();
+                    if (keysNode != nullptr && keysNode.type() == ASTNode::NODE_OBJECT) {
+                        PycRef<PycObject> ko = keysNode.cast<ASTObject>()->object();
+                        if (ko != nullptr && (ko.type() == PycObject::TYPE_TUPLE
+                                || ko.type() == PycObject::TYPE_SMALL_TUPLE)) {
+                            PycTuple::value_t keys = ko.cast<PycTuple>()->values();
+                            ASTConstMap::values_t vals = cm->values();
+                            bool ok = !keys.empty() && keys.size() == vals.size();
+                            for (const auto& k : keys) {
+                                PycRef<PycString> ks = k.try_cast<PycString>();
+                                if (ks == nullptr || !isKwargIdentifier(ks->value())) {
+                                    ok = false;
+                                    break;
+                                }
+                            }
+                            if (ok) {
+                                for (size_t i = 0; i < keys.size(); i++) {
+                                    if (!first)
+                                        pyc_output << ", ";
+                                    pyc_output << keys[i].cast<PycString>()->value() << "=";
+                                    print_src(vals[vals.size() - 1 - i], mod, pyc_output);
+                                    first = false;
+                                }
+                                unrolled = true;
+                            }
+                        }
                     }
                 }
                 if (!unrolled) {
@@ -16649,37 +17434,73 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
         break;
     case ASTNode::NODE_LIST:
         {
+            const ASTList::value_t& vals = node.cast<ASTList>()->values();
             pyc_output << "[";
-            bool first = true;
-            cur_indent++;
-            for (const auto& val : node.cast<ASTList>()->values()) {
-                if (first)
-                    pyc_output << "\n";
-                else
-                    pyc_output << ",\n";
-                start_line(cur_indent, pyc_output);
-                print_src(val, mod, pyc_output);
-                first = false;
+            if (g_noCompact == 0 && seqOneSrcLine(vals)) {
+                bool first = true;
+                for (const auto& val : vals) {
+                    if (!first)
+                        pyc_output << ", ";
+                    print_src(val, mod, pyc_output);
+                    first = false;
+                }
+            } else if (lfSafe(node)) {
+                bool first = true;
+                int elemLine = g_curLine;   // output line of '[' ~ its source line
+                for (const auto& val : vals) {
+                    bool broke = breakBeforeElem(elemLine, val, pyc_output, first);
+                    if (!broke && !first)
+                        pyc_output << ", ";
+                    print_src(val, mod, pyc_output);
+                    first = false;
+                }
+            } else {
+                bool first = true;
+                cur_indent++;
+                for (const auto& val : vals) {
+                    pyc_output << (first ? "\n" : ",\n");
+                    start_line(cur_indent, pyc_output);
+                    print_src(val, mod, pyc_output);
+                    first = false;
+                }
+                cur_indent--;
             }
-            cur_indent--;
             pyc_output << "]";
         }
         break;
     case ASTNode::NODE_SET:
         {
+            const ASTSet::value_t& vals = node.cast<ASTSet>()->values();
             pyc_output << "{";
-            bool first = true;
-            cur_indent++;
-            for (const auto& val : node.cast<ASTSet>()->values()) {
-                if (first)
-                    pyc_output << "\n";
-                else
-                    pyc_output << ",\n";
-                start_line(cur_indent, pyc_output);
-                print_src(val, mod, pyc_output);
-                first = false;
+            if (g_noCompact == 0 && seqOneSrcLine(vals)) {
+                bool first = true;
+                for (const auto& val : vals) {
+                    if (!first)
+                        pyc_output << ", ";
+                    print_src(val, mod, pyc_output);
+                    first = false;
+                }
+            } else if (lfSafe(node)) {
+                bool first = true;
+                int elemLine = g_curLine;
+                for (const auto& val : vals) {
+                    bool broke = breakBeforeElem(elemLine, val, pyc_output, first);
+                    if (!broke && !first)
+                        pyc_output << ", ";
+                    print_src(val, mod, pyc_output);
+                    first = false;
+                }
+            } else {
+                bool first = true;
+                cur_indent++;
+                for (const auto& val : vals) {
+                    pyc_output << (first ? "\n" : ",\n");
+                    start_line(cur_indent, pyc_output);
+                    print_src(val, mod, pyc_output);
+                    first = false;
+                }
+                cur_indent--;
             }
-            cur_indent--;
             pyc_output << "}";
         }
         break;
@@ -16690,7 +17511,12 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
             bool is_dict = comp->comptype() == ASTComprehension::COMP_DICT;
             bool is_set = comp->comptype() == ASTComprehension::COMP_SET;
             bool is_gen = comp->comptype() == ASTComprehension::COMP_GENERATOR;
-            pyc_output << (is_gen ? "(" : (is_dict || is_set) ? "{ " : "[ ");
+            bool genNoParen = is_gen && suppressGenExprParens;
+            /* The flag only applies to THIS outermost genexpr; a nested
+               comprehension (in the result/iter/condition) keeps its parens. */
+            suppressGenExprParens = false;
+            if (!genNoParen)
+                pyc_output << (is_gen ? "(" : (is_dict || is_set) ? "{" : "[");
             if (is_dict) {
                 print_src(comp->key(), mod, pyc_output);
                 pyc_output << ": ";
@@ -16717,20 +17543,59 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                     if (parenFilter) pyc_output << ")";
                 }
             }
-            pyc_output << (is_gen ? ")" : (is_dict || is_set) ? " }" : " ]");
+            if (!genNoParen)
+                pyc_output << (is_gen ? ")" : (is_dict || is_set) ? "}" : "]");
         }
         break;
     case ASTNode::NODE_MAP:
         {
+            const ASTMap::map_t& entries = node.cast<ASTMap>()->values();
+            /* One output line iff every key and value share one source line. */
+            bool oneLine = (g_noCompact == 0);
+            if (oneLine) {
+                int line = -1;
+                for (const auto& e : entries) {
+                    for (const PycRef<ASTNode>& n : {e.first, e.second}) {
+                        if (n == nullptr)
+                            continue;
+                        int l = n->srcLine();
+                        if (l <= 0)
+                            continue;
+                        if (line < 0)
+                            line = l;
+                        else if (l != line) {
+                            oneLine = false;
+                            break;
+                        }
+                    }
+                    if (!oneLine)
+                        break;
+                }
+            }
             pyc_output << "{";
             bool first = true;
-            cur_indent++;
-            for (const auto& val : node.cast<ASTMap>()->values()) {
-                if (first)
-                    pyc_output << "\n";
-                else
-                    pyc_output << ",\n";
-                start_line(cur_indent, pyc_output);
+            bool lf = lfSafe(node) && !oneLine;
+            int elemLine = g_curLine;
+            if (!oneLine && !lf)
+                cur_indent++;
+            for (const auto& val : entries) {
+                /* Anchor the break on whichever of key/value carries a source
+                   line: a const dict key (BUILD_CONST_KEY_MAP) has none, so
+                   fall back to the value's line. */
+                PycRef<ASTNode> anchor =
+                        (val.first != nullptr && val.first->srcLine() > 0)
+                        ? val.first : val.second;
+                if (oneLine) {
+                    if (!first)
+                        pyc_output << ", ";
+                } else if (lf) {
+                    bool broke = breakBeforeElem(elemLine, anchor, pyc_output, first);
+                    if (!broke && !first)
+                        pyc_output << ", ";
+                } else {
+                    pyc_output << (first ? "\n" : ",\n");
+                    start_line(cur_indent, pyc_output);
+                }
                 if (val.first == nullptr) {
                     pyc_output << "**";
                     bool par = starUnpackNeedsParens(val.second);
@@ -16744,8 +17609,9 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 }
                 first = false;
             }
-            cur_indent--;
-            pyc_output << " }";
+            if (!oneLine && !lf)
+                cur_indent--;
+            pyc_output << (oneLine || lf ? "}" : " }");
         }
         break;
     case ASTNode::NODE_CONST_MAP:
@@ -16767,17 +17633,46 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
         }
         break;
     case ASTNode::NODE_NAME:
-        pyc_output << node.cast<ASTName>()->name()->value();
+        padToCol(node, pyc_output);
+        pyc_output << demangleName(node.cast<ASTName>()->name()->strValue());
         break;
     case ASTNode::NODE_NODELIST:
         {
             cur_indent++;
-            for (const auto& ln : node.cast<ASTNodeList>()->nodes()) {
-                if (ln.cast<ASTNode>().type() != ASTNode::NODE_NODELIST) {
-                    start_line(cur_indent, pyc_output);
+            const ASTNodeList::list_t& nl = node.cast<ASTNodeList>()->nodes();
+            /* Compound-statement joining (see print_block): consecutive simple
+               statements on one source line render `; `-joined. */
+            int prevJoinLine = -1;
+            bool anyEmitted = false;
+            for (auto ln = nl.cbegin(); ln != nl.cend(); ++ln) {
+                bool isNL = (*ln).cast<ASTNode>().type() == ASTNode::NODE_NODELIST;
+                bool joinable = !inLambda && !isNL && *ln != nullptr
+                        && g_protectedDepth == 0
+                        && (*ln).type() != ASTNode::NODE_BLOCK
+                        && !selfPositions(*ln);
+                int myLine = (*ln != nullptr) ? (*ln)->srcLine() : -1;
+                bool doJoin = anyEmitted && joinable && prevJoinLine > 0
+                        && myLine == prevJoinLine;
+                if (doJoin) {
+                    pyc_output << "; ";
+                } else {
+                    if (anyEmitted)
+                        end_line(pyc_output);
+                    if (!isNL) {
+                        int decoLine = decoratedDefFirstLine(*ln);
+                        int curLine = decoLine > 0 ? decoLine : (*ln)->srcLine();
+                        if (!inLambda && curLine > 0 && g_curLine > 0 && curLine > g_curLine
+                                && curLine - g_curLine <= 2000) {
+                            while (g_curLine < curLine)
+                                pyc_output << "\n";
+                        }
+                        if (!selfPositions(*ln))
+                            start_line(cur_indent, pyc_output);
+                    }
                 }
-                print_src(ln, mod, pyc_output);
-                end_line(pyc_output);
+                print_src(*ln, mod, pyc_output);
+                prevJoinLine = joinable ? myLine : -1;
+                anyEmitted = true;
             }
             cur_indent--;
         }
@@ -16811,7 +17706,9 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                     for (auto& n : b2) blk->append(n);
                     for (auto& n : b3) blk->append(n);
                 }
-                end_line(pyc_output);
+                /* No leading end_line: the container is self-positioning (the
+                   enclosing renderer padded to its source line and skipped
+                   start_line), so print_block places `try:` directly. */
                 print_block(blk, mod, pyc_output);
                 end_line(pyc_output);
                 break;
@@ -16834,6 +17731,9 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                     if (paren) pyc_output << "(";
                     print_src(c, mod, pyc_output);
                     if (paren) pyc_output << ")";
+                } else if (blk->blktype() == ASTBlock::BLK_WHILE
+                        && blk.cast<ASTCondBlock>()->condRenderAsOne()) {
+                    pyc_output << " 1";
                 } else {
                     pyc_output << " ";
                     print_src(blk.cast<ASTCondBlock>()->cond(), mod, pyc_output);
@@ -16867,16 +17767,102 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                     print_src(var, mod, pyc_output);
                 }
             }
-            pyc_output << ":\n";
-
-            cur_indent++;
-            print_block(blk, mod, pyc_output);
-            cur_indent--;
+            /* Inline single-statement body: `if c: stmt` / `for x in y: stmt`
+               when the sole body statement shares the header's source line (the
+               original wrote it as a one-line suite). co_code is byte-identical.
+               Only conditional/loop/with headers; never try/except/finally/match/
+               case (line-sensitive / load-bearing) or def/class. */
+            ASTBlock::BlkType bt = blk->blktype();
+            /* Conditionals only. A loop (for/while) body carries a loop-back
+               line-marker NOP that inlining can drop (co_code); `with`/`try`
+               likewise. `if`/`elif`/`else` single-statement suites inline
+               cleanly. */
+            bool inlineable = bt == ASTBlock::BLK_IF || bt == ASTBlock::BLK_ELIF
+                    || bt == ASTBlock::BLK_ELSE;
+            PycRef<ASTNode> soleBody;
+            int nvis = 0;
+            for (const auto& bn : blk->nodes()) {
+                if (bn == nullptr || bn->suppressed())
+                    continue;
+                nvis++;
+                soleBody = bn;
+            }
+            bool inlineBody = inlineable && !inLambda && g_protectedDepth == 0
+                    && nvis == 1 && soleBody != nullptr
+                    && soleBody.type() != ASTNode::NODE_BLOCK
+                    && soleBody.type() != ASTNode::NODE_NODELIST
+                    && !selfPositions(soleBody)
+                    && soleBody->srcLine() > 0 && blk->srcLine() > 0
+                    && soleBody->srcLine() == blk->srcLine();
+            if (inlineBody) {
+                pyc_output << ": ";
+                print_src(soleBody, mod, pyc_output);
+            } else {
+                pyc_output << ":\n";
+                cur_indent++;
+                bool prot = bt == ASTBlock::BLK_TRY
+                        || bt == ASTBlock::BLK_EXCEPT
+                        || bt == ASTBlock::BLK_FINALLY;
+                if (prot) g_protectedDepth++;
+                print_block(blk, mod, pyc_output);
+                if (prot) g_protectedDepth--;
+                cur_indent--;
+            }
         }
         break;
     case ASTNode::NODE_OBJECT:
         {
             PycRef<PycObject> obj = node.cast<ASTObject>()->object();
+            if (obj.type() != PycObject::TYPE_CODE)
+                padToCol(node, pyc_output);
+            /* Width-matched stripped-statement placeholder (floor b1): render an
+               empty parenthesised group `(   )` (an empty-tuple expression) of
+               exactly the stripped text's width instead of `...`, so the
+               co_positions column span matches. Under -OO a bare constant
+               expression is discarded to the SAME NOP as `...` (verified
+               byte-identical, and unlike a bare string it is NOT treated as a
+               docstring, so it is safe even in first-statement position). Only
+               when a valid width (>=2) was recorded and not inside a
+               lambda/f-string. */
+            /* Multi-line stripped-statement placeholder: the original (a wrapped
+               docstring) spanned layoutEndLine/EndCol; render the same open
+               `(...` then blank continuation lines, closing `)` at the original
+               end column, so the NOP's full (line, end-line, col, end-col) span
+               is reproduced. Newlines inside the parentheses are pure whitespace
+               to the compiler, so co_code is unchanged. */
+            if (obj == Pyc_Ellipsis && node->layoutEndLine() > node->srcLine()
+                    && node->srcLine() >= 0 && node->layoutEndCol() >= 1
+                    && !inLambda && f_string_depth == 0) {
+                pyc_output << "(...";
+                for (int l = node->srcLine(); l < node->layoutEndLine(); l++)
+                    pyc_output << '\n';
+                for (int i = 0; i < node->layoutEndCol() - 1; i++)
+                    pyc_output << ' ';
+                pyc_output << ')';
+                break;
+            }
+            if (obj == Pyc_Ellipsis && node->layoutWidth() >= 2
+                    && !inLambda && f_string_depth == 0) {
+                int w = node->layoutWidth();
+                /* Self-documenting: `(...      )` keeps the `...` marker so the
+                   stripped content is legible, while the trailing pad makes the
+                   token span the original column width. `(...)` is an Ellipsis
+                   constant expression, discarded to the SAME NOP as `...` under
+                   -OO, so co_code is unchanged. Widths too narrow for `(...)`
+                   fall back to an empty parenthesised pad. */
+                if (w >= 5) {
+                    pyc_output << "(...";
+                    for (int i = 0; i < w - 5; i++)
+                        pyc_output << ' ';
+                    pyc_output << ')';
+                } else {
+                    pyc_output << '(';
+                    for (int i = 0; i < w - 2; i++)
+                        pyc_output << ' ';
+                    pyc_output << ')';
+                }
+                break;
+            }
             if (obj.type() == PycObject::TYPE_CODE) {
                 PycRef<PycCode> code = obj.cast<PycCode>();
                 decompyle(code, mod, pyc_output);
@@ -16975,8 +17961,18 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                     break;
                 }
             }
-            if (!asyncGenBareReturn)
-                print_src(value, mod, pyc_output);
+            if (!asyncGenBareReturn) {
+                /* `return a, b` / `yield a, b` render the tuple without parens
+                   (statement-level value context). Other rettypes (yield from,
+                   the parenthesised yield-expr forms) are left untouched. */
+                bool bareTupleCtx = !inLambda
+                        && (ret->rettype() == ASTReturn::RETURN
+                            || ret->rettype() == ASTReturn::YIELD);
+                if (bareTupleCtx)
+                    print_bare_tuple_value(value, mod, pyc_output);
+                else
+                    print_src(value, mod, pyc_output);
+            }
         }
         break;
     case ASTNode::NODE_SLICE:
@@ -17053,9 +18049,19 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
     case ASTNode::NODE_FUNCTION:
         {
             /* Actual named functions are NODE_STORE with a name */
-            pyc_output << "(lambda ";
             PycRef<ASTNode> code = node.cast<ASTFunction>()->code();
             PycRef<PycCode> code_src = code.cast<ASTObject>()->object().cast<PycCode>();
+            /* A no-argument lambda is canonically `lambda:` (no space before the
+               colon); only emit the space after `lambda` when a parameter list
+               follows. */
+            const bool lambdaHasParams =
+                    code_src->argCount() != 0 || code_src->kwOnlyArgCount() != 0
+                    || (code_src->flags() & (PycCode::CO_VARARGS | PycCode::CO_VARKEYWORDS)) != 0;
+            bool lambdaNoParen = suppressLambdaParens;
+            suppressLambdaParens = false;
+            if (!lambdaNoParen)
+                pyc_output << "(";
+            pyc_output << (lambdaHasParams ? "lambda " : "lambda");
             ASTFunction::defarg_t defargs = node.cast<ASTFunction>()->defargs();
             ASTFunction::defarg_t kwdefargs = node.cast<ASTFunction>()->kwdefargs();
             auto da = defargs.cbegin();
@@ -17065,21 +18071,38 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                     pyc_output << ", ";
                 pyc_output << code_src->getLocal(narg++)->value();
                 if ((code_src->argCount() - i) <= (int)defargs.size()) {
-                    pyc_output << " = ";
+                    pyc_output << "=";   // lambda params are never annotated
                     print_src(*da++, mod, pyc_output);
                 }
             }
+            /* `*args` / keyword-only params / `**kwargs` -- mirrors the def-signature
+               path below (lambda params carry no annotations). Their names live in
+               co_varnames after the positional and keyword-only params. Without this
+               a `lambda *args:` / `lambda **kwargs:` lost the star params, dropping the
+               varnames and shifting every LOAD_DEREF index in the body. */
             da = kwdefargs.cbegin();
-            if (code_src->kwOnlyArgCount() != 0) {
-                pyc_output << (narg == 0 ? "*" : ", *");
-                for (int i = 0; i < code_src->argCount(); i++) {
+            const int lamKwOnly = code_src->kwOnlyArgCount();
+            const bool lamVararg = (code_src->flags() & PycCode::CO_VARARGS) != 0;
+            if (lamVararg) {
+                if (narg)
                     pyc_output << ", ";
-                    pyc_output << code_src->getLocal(narg++)->value();
-                    if ((code_src->kwOnlyArgCount() - i) <= (int)kwdefargs.size()) {
-                        pyc_output << " = ";
-                        print_src(*da++, mod, pyc_output);
-                    }
+                pyc_output << "*" << code_src->getLocal(code_src->argCount() + lamKwOnly)->value();
+            } else if (lamKwOnly != 0) {
+                pyc_output << (narg == 0 ? "*" : ", *");
+            }
+            for (int i = 0; i < lamKwOnly; ++i) {
+                pyc_output << ", ";
+                pyc_output << code_src->getLocal(code_src->argCount() + i)->value();
+                if ((lamKwOnly - i) <= (int)kwdefargs.size()) {
+                    pyc_output << "=";
+                    print_src(*da++, mod, pyc_output);
                 }
+            }
+            if (code_src->flags() & PycCode::CO_VARKEYWORDS) {
+                if (narg || lamVararg || lamKwOnly)
+                    pyc_output << ", ";
+                pyc_output << "**" << code_src->getLocal(
+                        code_src->argCount() + lamKwOnly + (lamVararg ? 1 : 0))->value();
             }
             pyc_output << ": ";
 
@@ -17087,7 +18110,8 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
             print_src(code, mod, pyc_output);
             inLambda = false;
 
-            pyc_output << ")";
+            if (!lambdaNoParen)
+                pyc_output << ")";
         }
         break;
     case ASTNode::NODE_STORE:
@@ -17100,13 +18124,17 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 bool isLambda = false;
 
                 if (strcmp(code_src->name()->value(), "<lambda>") == 0) {
-                    pyc_output << "\n";
                     start_line(cur_indent, pyc_output);
                     print_src(dest, mod, pyc_output);
-                    pyc_output << " = lambda ";
+                    /* `x = lambda: ...` (no space before the colon) when the
+                       lambda takes no parameters; keep the space otherwise. */
+                    const bool lambdaHasParams =
+                            code_src->argCount() != 0 || code_src->kwOnlyArgCount() != 0
+                            || (code_src->flags()
+                                & (PycCode::CO_VARARGS | PycCode::CO_VARKEYWORDS)) != 0;
+                    pyc_output << (lambdaHasParams ? " = lambda " : " = lambda");
                     isLambda = true;
                 } else {
-                    pyc_output << "\n";
                     for (const auto& d : src.cast<ASTFunction>()->decorators()) {
                         start_line(cur_indent, pyc_output);
                         pyc_output << "@";
@@ -17124,6 +18152,71 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 ASTFunction::defarg_t defargs = src.cast<ASTFunction>()->defargs();
                 ASTFunction::defarg_t kwdefargs = src.cast<ASTFunction>()->kwdefargs();
                 const ASTFunction::annot_t& annots = src.cast<ASTFunction>()->annotations();
+                /* A signature is LINE-FAITHFUL only when every annotation and
+                   default expression sits on the same source line as the `def`
+                   keyword: then the whole signature was single-line in the
+                   source and can render compactly (collections follow the
+                   ordinary seqOneSrcLine rule). When any annotation/default
+                   lives on a later line, the source signature spanned multiple
+                   lines and left one continuation-anchor NOP per extra line;
+                   keeping collection compaction disabled (g_noCompact) preserves
+                   the rendering that regenerates those anchors, so co_code stays
+                   identical. */
+                int sigDefLine = node->srcLine();
+                bool sigSourceMultiLine = false;
+                {
+                    auto spans = [&](const PycRef<ASTNode>& n) {
+                        if (n == nullptr)
+                            return;
+                        int l = n->srcLine();
+                        if (l > 0 && sigDefLine > 0 && l != sigDefLine)
+                            sigSourceMultiLine = true;
+                    };
+                    for (const auto& a : annots)
+                        spans(a.second);
+                    for (const auto& d : defargs)
+                        spans(d);
+                    for (const auto& d : kwdefargs)
+                        spans(d);
+                }
+                /* When every constant default sat on its own source line, the
+                   default lines were folded into a single tuple constant so each
+                   default reports the `def` line and sigSourceMultiLine above
+                   cannot see the wrap. sigNopAnchors() carries the anchor-NOP
+                   count (== number of defaults) recovered at MAKE_FUNCTION; render
+                   one parameter per line to regenerate those NOPs. */
+                bool sigOnePerLine = src.cast<ASTFunction>()->sigNopAnchors() >= 0;
+                /* Disable collection compaction for a genuinely multi-line
+                   signature (see above); a single-line one renders compactly. */
+                if (sigSourceMultiLine || sigOnePerLine)
+                    g_noCompact++;
+                /* A multi-line source signature emits one line-anchor NOP per
+                   parameter continuation line (the compiler bumps the line before
+                   building that parameter's annotation/default). Reproduce those
+                   NOPs byte-for-byte by rendering each parameter on its own source
+                   line -- pad blank continuation lines until g_curLine reaches the
+                   parameter's line (taken from its annotation, else its default).
+                   Returns true when it broke the line so the caller omits the inline
+                   space after the comma. Newlines inside the signature parens are
+                   pure whitespace, so co_code is unaffected EXCEPT for the intended
+                   regenerated anchor NOPs. */
+                auto padParamLine = [&](PycRef<ASTNode> annot,
+                                        PycRef<ASTNode> defv) -> bool {
+                    if (!sigSourceMultiLine || inLambda)
+                        return false;
+                    int tl = -1;
+                    if (annot != nullptr && annot->srcLine() > 0)
+                        tl = annot->srcLine();
+                    else if (defv != nullptr && defv->srcLine() > 0)
+                        tl = defv->srcLine();
+                    if (tl <= 0 || tl <= g_curLine || tl - g_curLine > 2000)
+                        return false;
+                    while (g_curLine < tl)
+                        pyc_output << "\n";
+                    for (int s = 0; s < (cur_indent + 2) * 4; s++)
+                        pyc_output << " ";
+                    return true;
+                };
                 auto annotFor = [&](const char* nm) -> PycRef<ASTNode> {
                     for (const auto& a : annots)
                         if (a.first == nm) return a.second;
@@ -17149,16 +18242,48 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 auto da = defargs.cbegin();
                 int narg = 0;
                 for (int i = 0; i < code_src->argCount(); ++i) {
+                    const char* pname = code_src->getLocal(narg)->value();
+                    PycRef<ASTNode> at = annotFor(pname);
+                    bool hasDef = (code_src->argCount() - i) <= (int)defargs.size();
                     if (narg)
-                        pyc_output << ", ";
-                    const char* pname = code_src->getLocal(narg++)->value();
+                        pyc_output << ",";
+                    bool broke;
+                    if (sigOnePerLine) {
+                        /* Reproduce K anchor NOPs (one per source line carrying a
+                           constant default) by laying the defaults out over K
+                           continuation lines. Break before the FIRST default (so no
+                           default sits on the `def` line -- a default there emits an
+                           anchor only in a multi-line signature, which this now is)
+                           and before enough later defaults to form K default lines:
+                           the first continuation gets (Ndef-K+1) defaults, each
+                           remaining line one. Blank/continuation whitespace is inert,
+                           so exactly the K intended anchors are regenerated. */
+                        int Kanch = src.cast<ASTFunction>()->sigNopAnchors();
+                        int Ndef = (int)defargs.size();
+                        int j = hasDef ? (i - (code_src->argCount() - Ndef)) : -1;
+                        broke = (j == 0) || (j >= Ndef - Kanch + 1);
+                        if (broke) {
+                            pyc_output << "\n";
+                            for (int s = 0; s < (cur_indent + 2) * 4; s++)
+                                pyc_output << " ";
+                        }
+                    } else {
+                        broke = padParamLine(at, hasDef ? *da : PycRef<ASTNode>());
+                    }
+                    if (narg && !broke)
+                        pyc_output << " ";
+                    ++narg;
                     pyc_output << pname;
-                    if (PycRef<ASTNode> at = annotFor(pname)) {
+                    bool annotated = false;
+                    if (at != nullptr) {
                         pyc_output << ": ";
                         printAnnot(at);
+                        annotated = true;
                     }
-                    if ((code_src->argCount() - i) <= (int)defargs.size()) {
-                        pyc_output << " = ";
+                    if (hasDef) {
+                        /* Canonical spacing: `x=1` when unannotated, `x: T = 1`
+                           when annotated. */
+                        pyc_output << (annotated ? " = " : "=");
                         print_src(*da++, mod, pyc_output);
                     }
                 }
@@ -17167,29 +18292,46 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 if (hasVararg) {
                     if (narg)
                         pyc_output << ", ";
-                    pyc_output << "*" << code_src->getLocal(code_src->argCount() + kwOnly)->value();
+                    const char* vname = code_src->getLocal(code_src->argCount() + kwOnly)->value();
+                    pyc_output << "*" << vname;
+                    if (PycRef<ASTNode> at = annotFor(vname)) {
+                        pyc_output << ": ";
+                        printAnnot(at);
+                    }
                 } else if (kwOnly != 0) {
                     pyc_output << (narg == 0 ? "*" : ", *");
                 }
                 da = kwdefargs.cbegin();
                 for (int i = 0; i < kwOnly; ++i) {
-                    pyc_output << ", ";
                     const char* kname = code_src->getLocal(code_src->argCount() + i)->value();
+                    PycRef<ASTNode> at = annotFor(kname);
+                    bool hasDef = (kwOnly - i) <= (int)kwdefargs.size();
+                    pyc_output << ",";
+                    bool broke = padParamLine(at, hasDef ? *da : PycRef<ASTNode>());
+                    if (!broke)
+                        pyc_output << " ";
                     pyc_output << kname;
-                    if (PycRef<ASTNode> at = annotFor(kname)) {
+                    bool kannotated = false;
+                    if (at != nullptr) {
                         pyc_output << ": ";
                         printAnnot(at);
+                        kannotated = true;
                     }
-                    if ((kwOnly - i) <= (int)kwdefargs.size()) {
-                        pyc_output << " = ";
+                    if (hasDef) {
+                        pyc_output << (kannotated ? " = " : "=");
                         print_src(*da++, mod, pyc_output);
                     }
                 }
                 if (code_src->flags() & PycCode::CO_VARKEYWORDS) {
                     if (narg || hasVararg || kwOnly)
                         pyc_output << ", ";
-                    pyc_output << "**" << code_src->getLocal(
+                    const char* kwname = code_src->getLocal(
                             code_src->argCount() + kwOnly + (hasVararg ? 1 : 0))->value();
+                    pyc_output << "**" << kwname;
+                    if (PycRef<ASTNode> at = annotFor(kwname)) {
+                        pyc_output << ": ";
+                        printAnnot(at);
+                    }
                 }
 
                 if (isLambda) {
@@ -17203,6 +18345,8 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                     pyc_output << ":\n";
                     printDocstringAndGlobals = true;
                 }
+                if (sigSourceMultiLine || sigOnePerLine)
+                    g_noCompact--;   // signature done; body compacts normally
 
                 bool preLambda = inLambda;
                 bool preAsyncGen = inAsyncGen;
@@ -17214,7 +18358,6 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 inLambda = preLambda;
                 inAsyncGen = preAsyncGen;
             } else if (src.type() == ASTNode::NODE_CLASS) {
-                pyc_output << "\n";
                 for (const auto& d : src.cast<ASTClass>()->decorators()) {
                     start_line(cur_indent, pyc_output);
                     pyc_output << "@";
@@ -17248,7 +18391,7 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                                 ? k.cast<ASTObject>()->object().try_cast<PycString>()
                                 : nullptr;
                             if (ks != nullptr)
-                                pyc_output << ks->value() << " = ";
+                                pyc_output << ks->value() << "=";
                             print_src(kv.second, mod, pyc_output);
                         }
                     }
@@ -17260,7 +18403,13 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 printClassDocstring = true;
                 PycRef<ASTNode> code = src.cast<ASTClass>()->code().cast<ASTCall>()
                                        ->func().cast<ASTFunction>()->code();
+                PycRef<PycCode> classCode =
+                        code.cast<ASTObject>()->object().try_cast<PycCode>();
+                if (classCode != nullptr && classCode->name() != nullptr)
+                    g_classNameStack.push_back(classCode->name()->strValue());
                 print_src(code, mod, pyc_output);
+                if (classCode != nullptr && classCode->name() != nullptr)
+                    g_classNameStack.pop_back();
             } else if (src.type() == ASTNode::NODE_IMPORT) {
                 PycRef<ASTImport> import = src.cast<ASTImport>();
                 if (import->fromlist() != NULL) {
@@ -17311,9 +18460,24 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 print_src(src, mod, pyc_output);
                 pyc_output << ")";
             } else {
+                /* A tuple assignment target is canonically written without
+                   surrounding parentheses (`a, b = c`, not `(a, b) = c`); the
+                   parens only widen the line. Suppress them on the OUTERMOST
+                   target tuple while rendering (inner nested targets keep their
+                   own parens). Bytecode is unaffected. */
+                PycRef<ASTTuple> destTup =
+                        (dest != nullptr && dest.type() == ASTNode::NODE_TUPLE)
+                        ? dest.cast<ASTTuple>() : nullptr;
+                bool savedParens = false;
+                if (destTup != nullptr && destTup->values().size() > 1) {
+                    savedParens = destTup->requireParens();
+                    destTup->setRequireParens(false);
+                }
                 print_src(dest, mod, pyc_output);
+                if (destTup != nullptr && destTup->values().size() > 1)
+                    destTup->setRequireParens(savedParens);
                 pyc_output << " = ";
-                print_src(src, mod, pyc_output);
+                print_bare_tuple_value(src, mod, pyc_output);
             }
         }
         break;
@@ -17323,7 +18487,7 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
                 print_src(dest, mod, pyc_output);
                 pyc_output << " = ";
             }
-            print_src(node.cast<ASTChainStore>()->src(), mod, pyc_output);
+            print_bare_tuple_value(node.cast<ASTChainStore>()->src(), mod, pyc_output);
         }
         break;
     case ASTNode::NODE_SUBSCR:
@@ -17348,9 +18512,19 @@ void print_src(PycRef<ASTNode> node, PycModule* mod, std::ostream& pyc_output)
             if (tuple->requireParens())
                 pyc_output << "(";
             bool first = true;
+            /* Line-faithful breaks only inside a parenthesised tuple: a newline
+               is a valid continuation only within the parens. A bare tuple
+               (`return a, b`) has no brackets, so it must stay on one line. */
+            bool tupBreak = lfSafe(node) && tuple->requireParens();
+            int elemLine = g_curLine;
             for (const auto& val : values) {
-                if (!first)
+                if (tupBreak) {
+                    bool broke = breakBeforeElem(elemLine, val, pyc_output, first);
+                    if (!broke && !first)
+                        pyc_output << ", ";
+                } else if (!first) {
                     pyc_output << ", ";
+                }
                 print_src(val, mod, pyc_output);
                 first = false;
             }
@@ -17530,7 +18704,709 @@ static bool stmtEmitsScopeCode(const PycRef<ASTNode>& n)
    docstring's NOP sits right after the `__qualname__` store -- pycdc strips those
    same stores from the rendered body, so in both cases the placeholder belongs at
    the front of the cleaned statement list. */
-static int leadingStrippedNops(PycRef<PycCode> code, PycModule* mod)
+/* The line-unique stripped-statement NOP offsets of a whole code object: a NOP
+   whose source line carries NO other (non-NOP) instruction is a docstring /
+   bare-constant / debug line the compiler removed under -OO, leaving only that
+   line-anchor. A NOP sharing its line with real code is a redundant anchor the
+   decompiler regenerates when it renders that code, so it is excluded. Returns
+   empty (cheaply) when the body has no NOPs, and bails on very large bodies
+   (lineForOffset is O(log n) cached, but giant generated tables have no NOPs
+   anyway). */
+static std::vector<int> collectStrippedNops(PycRef<PycCode> code, PycModule* mod,
+                                            const std::set<int>& exclude)
+{
+    std::vector<int> out;
+    if (code->code() == nullptr)
+        return out;
+    struct II { int op, off; };
+    std::vector<II> ins;
+    {
+        PycBuffer s(code->code()->value(), code->code()->length());
+        int op, arg, p = 0;
+        while (!s.atEof()) {
+            int prev = p;
+            bc_next(s, mod, op, arg, p);
+            if (p <= prev) break;
+            if (op == Pyc::CACHE) continue;
+            ins.push_back({op, prev});
+        }
+    }
+    bool anyNop = false;
+    for (const auto& i : ins)
+        if (i.op == Pyc::NOP) { anyNop = true; break; }
+    if (!anyNop || ins.size() > 8000)
+        return out;
+    std::set<int> codeLines;
+    for (const auto& i : ins)
+        if (i.op != Pyc::NOP)
+            codeLines.insert(code->lineForOffset(i.off));
+    /* NOPs inside a `with`/`try` protected range are structural cleanup/exit
+       line-anchors (e.g. a `return` inside `with:` triggers `__exit__` codegen)
+       that the decompiler regenerates when it renders the construct -- exclude
+       them; only NOPs in unprotected, straight-line regions are genuine stripped
+       statements. */
+    std::vector<PycExceptionTableEntry> ete = code->exceptionTableEntries();
+    std::set<int> excStarts;
+    for (const auto& e : ete)
+        excStarts.insert(e.start_offset);
+    for (size_t idx = 0; idx < ins.size(); ++idx) {
+        if (ins[idx].op != Pyc::NOP)
+            continue;
+        int off = ins[idx].off;
+        if (exclude.find(off) != exclude.end())
+            continue;   // signature-continuation anchor, regenerated by one-per-line render
+        if (codeLines.find(code->lineForOffset(off)) != codeLines.end())
+            continue;
+        bool protectedRange = false;
+        for (const auto& e : ete)
+            if (off >= e.start_offset && off < e.end_offset) { protectedRange = true; break; }
+        if (protectedRange)
+            continue;
+        /* A `try:` head emits a NOP right before the protected body; pycdc
+           regenerates it by rendering the `try`, so it is NOT a stripped statement.
+           Walking forward from the NOP, it is a try head iff an exception-table
+           protected range begins BEFORE any real (non-NOP) instruction: only the
+           stacked try heads (and the protected body which may itself open with a
+           NOP) lie between it and the range start. This handles nested `try: try:`
+           and a `try` whose body opens with a stripped statement, and merely
+           over-excludes a rare bare constant sitting immediately before a `try`
+           (safe -- leaves that one anchor unreproduced, never a false NOP). */
+        bool tryHead = false;
+        for (size_t j = idx + 1; j < ins.size(); ++j) {
+            if (excStarts.count(ins[j].off)) { tryHead = true; break; }
+            if (ins[j].op != Pyc::NOP) break;
+        }
+        if (tryHead)
+            continue;
+        out.push_back(off);
+    }
+    return out;
+}
+
+/* Minimum source byte-offset over a node's leaf descendants (or a huge sentinel
+   if it has none), giving a block an effective start without a stored one. */
+static int subtreeMinOff(const PycRef<ASTNode>& n, int depth = 0)
+{
+    if (n == nullptr || depth > 80)
+        return 0x7fffffff;
+    if (n.type() != ASTNode::NODE_BLOCK) {
+        int o = n->srcOff();
+        return o >= 0 ? o : 0x7fffffff;
+    }
+    int m = 0x7fffffff;
+    for (const auto& c : n.cast<ASTBlock>()->nodes()) {
+        int cm = subtreeMinOff(c, depth + 1);
+        if (cm < m) m = cm;
+    }
+    return m;
+}
+
+/* Earliest source byte-offset over an EXPRESSION's operands (not just the node's
+   own srcOff, which for a compound expression is the offset of its result-producing
+   op, AFTER its operands). Used to find a block's true header start (the first byte
+   of its condition/iterator eval). Sets *unknown when it meets a node shape it can't
+   descend, so the caller can bail rather than guess a start that is too late. */
+static int exprMinOff(const PycRef<ASTNode>& n, bool* unknown, int depth = 0)
+{
+    if (n == nullptr)
+        return 0x7fffffff;
+    if (depth > 40) { *unknown = true; return 0x7fffffff; }
+    int m = (n->srcOff() >= 0) ? n->srcOff() : 0x7fffffff;
+    auto rec = [&](const PycRef<ASTNode>& c) {
+        int cm = exprMinOff(c, unknown, depth + 1);
+        if (cm < m) m = cm;
+    };
+    switch (n->type()) {
+    case ASTNode::NODE_NAME:
+    case ASTNode::NODE_OBJECT:
+        break;                                  // leaf
+    case ASTNode::NODE_BINARY:
+    case ASTNode::NODE_COMPARE:
+        rec(n.cast<ASTBinary>()->left());
+        rec(n.cast<ASTBinary>()->right());
+        break;
+    case ASTNode::NODE_UNARY:
+        rec(n.cast<ASTUnary>()->operand());
+        break;
+    case ASTNode::NODE_SUBSCR:
+        rec(n.cast<ASTSubscr>()->name());
+        rec(n.cast<ASTSubscr>()->key());
+        break;
+    case ASTNode::NODE_CALL:
+        rec(n.cast<ASTCall>()->func());
+        for (const auto& p : n.cast<ASTCall>()->pparams())
+            rec(p);
+        break;
+    case ASTNode::NODE_TUPLE:
+        for (const auto& v : n.cast<ASTTuple>()->values())
+            rec(v);
+        break;
+    default:
+        *unknown = true;                        // unrecognised: don't trust the start
+        break;
+    }
+    return m;
+}
+
+/* Source offset of a node's LAST leaf descendant (follow last children down). */
+static int lastLeafSrcOff(const PycRef<ASTNode>& n, int depth = 0)
+{
+    if (n == nullptr || depth > 80)
+        return -1;
+    if (n.type() != ASTNode::NODE_BLOCK)
+        return n->srcOff();
+    const auto& kids = n.cast<ASTBlock>()->nodes();
+    if (kids.empty())
+        return -1;
+    return lastLeafSrcOff(kids.back(), depth + 1);
+}
+
+/* Insert a `...` placeholder AFTER the `if` block whose last statement is at
+   prevOff (built by the branch-exit instruction preceding a dropped merge NOP): a
+   statement stripped under -OO right after an `if` whose body exits leaves its NOP
+   at the branch merge, as a sibling of the `if`. A plain `if` merge regenerates no
+   anchor, so a `...` sibling there reproduces exactly that NOP. Restricted to
+   BLK_IF (loops/try/with own their merge/exit anchors). Depth-first. */
+static bool insertPlaceholderAfterIfEndingAt(ASTBlock::list_t& nodes, int prevOff,
+                                             int phOff, int depth = 0)
+{
+    if (depth > 80)
+        return false;
+    for (auto it = nodes.begin(); it != nodes.end(); ++it) {
+        PycRef<ASTNode> n = *it;
+        if (n == nullptr || n.type() != ASTNode::NODE_BLOCK)
+            continue;
+        if (insertPlaceholderAfterIfEndingAt(n.cast<ASTBlock>()->mutableNodes(),
+                                             prevOff, phOff, depth + 1))
+            return true;
+        if (n.cast<ASTBlock>()->blktype() == ASTBlock::BLK_IF
+                && lastLeafSrcOff(n) == prevOff) {
+            PycRef<ASTNode> ph = new ASTObject(Pyc_Ellipsis);
+            ph->setSrcOff(phOff);
+            nodes.insert(std::next(it), ph);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Insert a `...` placeholder as a sibling right AFTER the `if` block whose byte
+   range ENDS at endOff: a statement stripped under -OO right after an `if` whose
+   body falls through (its last statement is an expression/discard, so the branch
+   merge -- and thus the block end -- is exactly the dropped NOP offset). Unlike
+   insertPlaceholderAfterIfEndingAt (which keys on a RETURNing body's last-leaf
+   offset), this keys on the block END so it covers a fall-through if. A plain `if`
+   merge regenerates no anchor of its own, so a `...` sibling there reproduces the
+   NOP. Restricted to BLK_IF; depth-first so the deepest/innermost match wins. */
+static bool insertPlaceholderAfterBlockEndingAt(ASTBlock::list_t& nodes, int endOff,
+                                                int phOff, int depth = 0)
+{
+    if (depth > 80)
+        return false;
+    for (auto it = nodes.begin(); it != nodes.end(); ++it) {
+        PycRef<ASTNode> n = *it;
+        if (n == nullptr || n.type() != ASTNode::NODE_BLOCK)
+            continue;
+        if (insertPlaceholderAfterBlockEndingAt(n.cast<ASTBlock>()->mutableNodes(),
+                                                endOff, phOff, depth + 1))
+            return true;
+        ASTBlock::BlkType bt = n.cast<ASTBlock>()->blktype();
+        /* A plain `if` (fall-through merge) or a `match` (its cases all exit, so a
+           statement after the match sits at its merge) regenerate no trailing anchor
+           of their own -- a `...` sibling at the block end reproduces the dropped NOP.
+           Loops / try own their exit anchors, so they are excluded. */
+        if ((bt == ASTBlock::BLK_IF || bt == ASTBlock::BLK_MATCH)
+                && n.cast<ASTBlock>()->end() == endOff) {
+            PycRef<ASTNode> ph = new ASTObject(Pyc_Ellipsis);
+            ph->setSrcOff(phOff);
+            nodes.insert(std::next(it), ph);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Insert a `...` placeholder at the START of the `if` body whose header branch
+   (POP_JUMP) is at headerOff: a statement stripped under -OO as the FIRST statement
+   of an `if:` suite leaves its NOP right after the branch test, before the body. A
+   plain `if` header is real condition code with no anchor of its own, so prepending
+   a `...` reproduces the NOP. Skip if the body already opens with a `try`/infinite
+   `while` (that block regenerates the anchor). Depth-first. */
+static bool insertPlaceholderAtIfBodyStart(ASTBlock::list_t& nodes, int headerOff,
+                                           int phOff, int depth = 0)
+{
+    if (depth > 80)
+        return false;
+    for (auto it = nodes.begin(); it != nodes.end(); ++it) {
+        PycRef<ASTNode> n = *it;
+        if (n == nullptr || n.type() != ASTNode::NODE_BLOCK)
+            continue;
+        PycRef<ASTBlock> blk = n.cast<ASTBlock>();
+        if (insertPlaceholderAtIfBodyStart(blk->mutableNodes(), headerOff, phOff, depth + 1))
+            return true;
+        if (blk->blktype() == ASTBlock::BLK_IF && blk->srcOff() == headerOff
+                && !blk->nodes().empty()) {
+            PycRef<ASTNode> first = blk->nodes().front();
+            if (first != nullptr && first.type() == ASTNode::NODE_BLOCK) {
+                ASTBlock::BlkType bt = first.cast<ASTBlock>()->blktype();
+                if (bt == ASTBlock::BLK_CONTAINER
+                        || (bt == ASTBlock::BLK_WHILE
+                            && is_infinite_while(first.cast<ASTBlock>())))
+                    return true;
+            }
+            PycRef<ASTNode> ph = new ASTObject(Pyc_Ellipsis);
+            ph->setSrcOff(phOff);
+            blk->mutableNodes().push_front(ph);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Insert a `...` placeholder at the START of the `for` body containing the dropped
+   NOP at phOff: a statement stripped under -OO as the FIRST statement of a `for:`
+   suite leaves its NOP right after the loop-variable STORE(s) (which unpack the
+   FOR_ITER value), before the body. The `for` header (iterator eval + FOR_ITER)
+   carries real instructions and regenerates no anchor of its own, so prepending a
+   `...` reproduces the NOP. Matched by containment: the deepest BLK_FOR/BLK_ASYNCFOR
+   whose byte range holds phOff with phOff BEFORE its first body statement (the gap
+   between the loop-variable store and the first real statement). Skip if the body
+   opens with a `try`/infinite `while` (that block regenerates the anchor). */
+static bool insertPlaceholderAtForBodyStart(ASTBlock::list_t& nodes, int phOff, int depth = 0)
+{
+    if (depth > 80)
+        return false;
+    for (auto it = nodes.begin(); it != nodes.end(); ++it) {
+        PycRef<ASTNode> n = *it;
+        if (n == nullptr || n.type() != ASTNode::NODE_BLOCK)
+            continue;
+        PycRef<ASTBlock> blk = n.cast<ASTBlock>();
+        if (insertPlaceholderAtForBodyStart(blk->mutableNodes(), phOff, depth + 1))
+            return true;
+        ASTBlock::BlkType bt = blk->blktype();
+        if ((bt == ASTBlock::BLK_FOR || bt == ASTBlock::BLK_ASYNCFOR)
+                && !blk->nodes().empty()
+                && blk->srcOff() >= 0 && blk->srcOff() <= phOff && phOff < blk->end()
+                && subtreeMinOff(blk->nodes().front()) > phOff) {
+            PycRef<ASTNode> first = blk->nodes().front();
+            if (first != nullptr && first.type() == ASTNode::NODE_BLOCK) {
+                ASTBlock::BlkType fbt = first.cast<ASTBlock>()->blktype();
+                if (fbt == ASTBlock::BLK_CONTAINER
+                        || (fbt == ASTBlock::BLK_WHILE
+                            && is_infinite_while(first.cast<ASTBlock>())))
+                    return true;
+            }
+            PycRef<ASTNode> ph = new ASTObject(Pyc_Ellipsis);
+            ph->setSrcOff(phOff);
+            blk->mutableNodes().push_front(ph);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Insert a `...` placeholder (offset phOff) immediately AFTER the deepest AST node
+   whose srcOff == targetOff -- the statement built by the instruction that directly
+   precedes a dropped stripped NOP. Since the NOP follows that instruction in the
+   bytecode, it belongs in the same suite right after that statement, however nested.
+   Depth-first so the deepest match wins. */
+static bool insertPlaceholderAfterOff(ASTBlock::list_t& nodes, int targetOff,
+                                      int phOff, int depth = 0)
+{
+    if (depth > 80)
+        return false;
+    for (auto it = nodes.begin(); it != nodes.end(); ++it) {
+        PycRef<ASTNode> n = *it;
+        if (n == nullptr)
+            continue;
+        if (n.type() == ASTNode::NODE_BLOCK
+                && insertPlaceholderAfterOff(n.cast<ASTBlock>()->mutableNodes(),
+                                             targetOff, phOff, depth + 1))
+            return true;
+        if (n->srcOff() == targetOff && n.type() != ASTNode::NODE_BLOCK) {
+            /* If the statement is immediately followed by a `try` or an infinite
+               `while` block, the dropped NOP is that block's head anchor, which the
+               block regenerates on its own -- skip (report handled, place nothing).
+               A `try:` head is normally already excluded upstream, but a `try`
+               whose body opens with a stripped statement can slip through. */
+            auto nx = std::next(it);
+            if (nx != nodes.end() && *nx != nullptr && (*nx).type() == ASTNode::NODE_BLOCK) {
+                ASTBlock::BlkType bt = (*nx).cast<ASTBlock>()->blktype();
+                if (bt == ASTBlock::BLK_CONTAINER
+                        || (bt == ASTBlock::BLK_WHILE
+                            && is_infinite_while((*nx).cast<ASTBlock>())))
+                    return true;
+            }
+            PycRef<ASTNode> ph = new ASTObject(Pyc_Ellipsis);
+            ph->setSrcOff(phOff);
+            nodes.insert(nx, ph);
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Recursively insert `...` placeholders for the still-unplaced stripped NOPs in
+   `remaining` into their correct suite (depth-first: inner blocks claim theirs
+   first). A NOP is placed in a suite only when it falls in a gap BETWEEN two of
+   that suite's children (a preceding sibling exists and a following sibling
+   keeps the placeholder non-final), and NOT inside a child block's byte range.
+   Leading NOPs (no preceding sibling) are left to the leading pass. */
+static void insertGeneralPlaceholders(ASTBlock::list_t& nodes, std::set<int>& remaining,
+                                      int depth = 0)
+{
+    if (depth > 80)   // guard against a cyclic/shared block reference (coalescing)
+        return;
+    for (auto& n : nodes)
+        if (n != nullptr && n.type() == ASTNode::NODE_BLOCK)
+            insertGeneralPlaceholders(n.cast<ASTBlock>()->mutableNodes(), remaining, depth + 1);
+    if (remaining.empty())
+        return;
+    /* Trailing stripped statement inside an `if` body: a statement stripped under
+       -OO at the END of an `if:` suite (a tail `assert` / `if __debug__:` block)
+       leaves its line-anchor NOP just before the branch's merge target -- inside
+       the if's byte range, after its last real statement. It has no following
+       sibling, so it is neither placed here nor by the recursion. A plain `if`
+       (no else) falls through with no trailing anchor of its own, so appending a
+       `...` as the suite's last statement reproduces exactly that NOP. Restricted
+       to BLK_IF whose last child is a leaf (a trailing compound block owns its own
+       anchors) and to NOPs strictly between that child and the block end. */
+    for (auto& n : nodes) {
+        if (n == nullptr || n.type() != ASTNode::NODE_BLOCK)
+            continue;
+        PycRef<ASTBlock> blk = n.cast<ASTBlock>();
+        if (blk->blktype() != ASTBlock::BLK_IF || blk->nodes().empty())
+            continue;
+        int blkEnd = blk->end();
+        PycRef<ASTNode> last = blk->nodes().back();
+        if (last == nullptr || last.type() == ASTNode::NODE_BLOCK)
+            continue;   // compound tail owns its own anchors
+        int lastHi = last->srcOff();
+        if (lastHi < 0 || blkEnd <= lastHi)
+            continue;
+        std::vector<int> here;
+        for (int o : remaining)
+            if (o > lastHi && o < blkEnd)
+                here.push_back(o);
+        for (int o : here) {
+            PycRef<ASTNode> ph = new ASTObject(Pyc_Ellipsis);
+            ph->setSrcOff(o);
+            blk->append(ph);
+            remaining.erase(o);
+        }
+    }
+    if (remaining.empty())
+        return;
+    struct Child { ASTBlock::list_t::iterator it; int lo, hi; };
+    std::vector<Child> ch;
+    for (auto it = nodes.begin(); it != nodes.end(); ++it) {
+        PycRef<ASTNode> n = *it;
+        int lo, hi;
+        if (n != nullptr && n.type() == ASTNode::NODE_BLOCK) {
+            lo = subtreeMinOff(n);
+            hi = n.cast<ASTBlock>()->end();
+            if (lo == 0x7fffffff) lo = hi;
+        } else {
+            lo = hi = (n != nullptr ? n->srcOff() : -1);
+        }
+        ch.push_back({it, lo, hi});
+    }
+    std::vector<std::pair<ASTBlock::list_t::iterator, int> > toInsert;
+    std::vector<int> placed;
+    for (int o : remaining) {
+        bool inside = false;
+        int followIdx = -1;
+        for (size_t i = 0; i < ch.size(); i++) {
+            if (ch[i].lo < 0) continue;
+            if (o >= ch[i].lo && o < ch[i].hi) { inside = true; break; }
+            if (ch[i].lo > o) { followIdx = (int)i; break; }
+        }
+        if (inside || followIdx < 1)
+            continue;
+        /* Conservative: only fill a gap BETWEEN two plain leaf statements whose
+           offsets strictly bracket the NOP (prev.srcOff < o < follow.srcOff).
+           A compound-block neighbour carries its own header line-anchor that the
+           decompiler regenerates (double-count), and a block-adjacent or
+           edge slot is where mis-positioning / invalid placements arise. */
+        Child& follow = ch[followIdx];
+        Child& prev = ch[followIdx - 1];
+        PycRef<ASTNode> fn = *(follow.it), pn = *(prev.it);
+        bool followLeaf = fn != nullptr && fn.type() != ASTNode::NODE_BLOCK && follow.lo >= 0;
+        /* The follow may also be a compound block that does NOT regenerate its own
+           head line-anchor NOP -- an `if`/`for`/`with`/`async for`/`match` (a `try`
+           or `while` DOES emit a head NOP, so a placeholder before it would double
+           it). To place the NOP strictly BEFORE such a block, bracket it against the
+           block's true HEADER start (the first byte of its condition/iterator eval),
+           not subtreeMinOff (which is the block BODY start and would wrongly admit a
+           NOP sitting inside a multi-line header). Bail if the header start can't be
+           computed exactly. */
+        int followHeader = follow.lo;
+        bool followSafeBlock = false;
+        if (fn != nullptr && fn.type() == ASTNode::NODE_BLOCK && follow.lo >= 0) {
+            ASTBlock::BlkType bt = fn.cast<ASTBlock>()->blktype();
+            if (bt == ASTBlock::BLK_IF || bt == ASTBlock::BLK_FOR
+                    || bt == ASTBlock::BLK_WITH || bt == ASTBlock::BLK_ASYNCFOR) {
+                bool unknown = false;
+                int hs = 0x7fffffff;
+                if (bt == ASTBlock::BLK_IF) {
+                    hs = exprMinOff(fn.cast<ASTCondBlock>()->cond(), &unknown);
+                } else if (bt == ASTBlock::BLK_FOR || bt == ASTBlock::BLK_ASYNCFOR) {
+                    hs = exprMinOff(fn.cast<ASTIterBlock>()->iter(), &unknown);
+                } else {
+                    unknown = true;             // with: source-start not modelled here
+                }
+                if (!unknown && hs != 0x7fffffff && hs > 0) {
+                    followHeader = hs;
+                    followSafeBlock = true;
+                }
+            }
+        }
+        bool prevLeaf = pn != nullptr && pn.type() != ASTNode::NODE_BLOCK && prev.hi >= 0;
+        if ((!followLeaf && !followSafeBlock) || !prevLeaf)
+            continue;
+        /* A NOP right before a control-flow exit (`return`/`raise`/`break`/
+           `continue`) is that exit's own line-anchor / unwind-cleanup NOP, which
+           the decompiler regenerates when it renders the exit in a nested block --
+           not a stripped statement. */
+        if (fn.type() == ASTNode::NODE_RETURN || fn.type() == ASTNode::NODE_RAISE
+                || fn.type() == ASTNode::NODE_KEYWORD)
+            continue;
+        if (!(prev.hi < o && o < followHeader))
+            continue;
+        toInsert.push_back({follow.it, o});
+        placed.push_back(o);
+    }
+    for (auto& pr : toInsert) {
+        PycRef<ASTNode> ph = new ASTObject(Pyc_Ellipsis);
+        ph->setSrcOff(pr.second);
+        nodes.insert(pr.first, ph);
+    }
+    for (int o : placed)
+        remaining.erase(o);
+}
+
+/* Count `...` (Ellipsis) stripped-statement placeholders anywhere in a suite. */
+static int countEllipsisPlaceholders(const ASTBlock::list_t& nodes, int depth = 0)
+{
+    if (depth > 80)
+        return 0;
+    int c = 0;
+    for (const auto& n : nodes) {
+        if (n == nullptr)
+            continue;
+        if (n.type() == ASTNode::NODE_OBJECT
+                && n.cast<ASTObject>()->object() == Pyc_Ellipsis)
+            c++;
+        else if (n.type() == ASTNode::NODE_BLOCK)
+            c += countEllipsisPlaceholders(n.cast<ASTBlock>()->nodes(), depth + 1);
+    }
+    return c;
+}
+
+/* Source byte-offset of the first `...` placeholder (depth-first), or -1. */
+static int firstEllipsisOff(const ASTBlock::list_t& nodes, int depth = 0)
+{
+    if (depth > 80)
+        return -1;
+    for (const auto& n : nodes) {
+        if (n == nullptr)
+            continue;
+        if (n.type() == ASTNode::NODE_OBJECT
+                && n.cast<ASTObject>()->object() == Pyc_Ellipsis)
+            return n->srcOff();
+        if (n.type() == ASTNode::NODE_BLOCK) {
+            int o = firstEllipsisOff(n.cast<ASTBlock>()->nodes(), depth + 1);
+            if (o != -1)
+                return o;
+        }
+    }
+    return -1;
+}
+
+/* Replace the first `...` placeholder found (depth-first) with `repl`, carrying
+   over its source position. Returns true once one is replaced. */
+static bool replaceFirstEllipsis(ASTBlock::list_t& nodes, PycRef<ASTNode> repl, int depth = 0)
+{
+    if (depth > 80)
+        return false;
+    for (auto it = nodes.begin(); it != nodes.end(); ++it) {
+        PycRef<ASTNode> n = *it;
+        if (n == nullptr)
+            continue;
+        if (n.type() == ASTNode::NODE_OBJECT
+                && n.cast<ASTObject>()->object() == Pyc_Ellipsis) {
+            repl->setSrcOff(n->srcOff());
+            *it = repl;
+            return true;
+        }
+        if (n.type() == ASTNode::NODE_BLOCK
+                && replaceFirstEllipsis(n.cast<ASTBlock>()->mutableNodes(), repl, depth + 1))
+            return true;
+    }
+    return false;
+}
+
+/* A const value simple enough to reconstruct verbatim as a literal in a fabricated
+   (dead, -OO-stripped) expression -- excludes containers/code whose recompiled
+   representation might not round-trip. */
+static bool isSimpleOrphanConst(int t)
+{
+    switch (t) {
+    case PycObject::TYPE_NONE:
+    case PycObject::TYPE_FALSE:
+    case PycObject::TYPE_TRUE:
+    case PycObject::TYPE_INT:
+    case PycObject::TYPE_INT64:
+    case PycObject::TYPE_LONG:
+    case PycObject::TYPE_FLOAT:
+    case PycObject::TYPE_BINARY_FLOAT:
+    case PycObject::TYPE_STRING:
+    case PycObject::TYPE_INTERNED:
+    case PycObject::TYPE_UNICODE:
+    case PycObject::TYPE_ASCII:
+    case PycObject::TYPE_ASCII_INTERNED:
+    case PycObject::TYPE_SHORT_ASCII:
+    case PycObject::TYPE_SHORT_ASCII_INTERNED:
+        return true;
+    default:
+        return false;
+    }
+}
+
+/* Under -OO a stripped `if __debug__:` debug-logging block is dead-code-eliminated
+   AFTER codegen registered its consts/names, leaving those entries ORPHANED in the
+   const/name tables (present but never referenced by any instruction). pycdc renders
+   the stripped block as a bare `...` placeholder, which registers nothing, so the
+   orphans vanish and every later const/name index shifts down -- the recompiled
+   co_code then diverges only in its operand indices. Recover them: when the function
+   has orphaned table entries and EXACTLY ONE `...` placeholder (the stripped block),
+   replace it with a reconstructed `if __debug__:` block whose single statement is a
+   call referencing the orphaned names (as an attribute chain) and the orphaned consts
+   (as arguments), in table order. Recompiled under -OO the block is dead, so only its
+   table registration survives -- re-creating the orphans at their original indices,
+   with no effect on the instruction stream beyond the same head NOP the `...` gave.
+   A matching function cannot have orphaned consts (pycdc could not otherwise have
+   reproduced them), so this only ever affects already-diverging functions. */
+static void recoverOrphanTableEntries(PycRef<ASTNodeList> clean, PycRef<PycCode> code,
+                                      PycModule* mod)
+{
+    if (clean == nullptr || code->code() == nullptr || mod->verCompare(3, 11) < 0)
+        return;
+    if (countEllipsisPlaceholders(clean->nodes()) != 1)
+        return;
+    int phOff = firstEllipsisOff(clean->nodes());
+    if (phOff < 0)
+        return;
+    /* Referenced const/name indices, and the FIRST-reference byte offset per name
+       index (its registration order proxy). */
+    std::set<int> constRefs, nameRefs;
+    std::unordered_map<int, int> nameFirstRef;
+    {
+        PycBuffer s(code->code()->value(), code->code()->length());
+        int op, arg, p = 0;
+        while (!s.atEof()) {
+            int pv = p;
+            bc_next(s, mod, op, arg, p);
+            if (p <= pv) break;
+            int nameIdx = -1;
+            switch (op) {
+            case Pyc::LOAD_CONST_A:
+            case Pyc::KW_NAMES_A:
+            case Pyc::RETURN_CONST_A:
+                constRefs.insert(arg);
+                break;
+            case Pyc::LOAD_GLOBAL_A:
+                nameIdx = arg >> 1;   // 3.11: name index is arg >> 1
+                break;
+            case Pyc::LOAD_NAME_A:
+            case Pyc::STORE_NAME_A:
+            case Pyc::LOAD_ATTR_A:
+            case Pyc::STORE_ATTR_A:
+            case Pyc::DELETE_ATTR_A:
+            case Pyc::LOAD_METHOD_A:
+            case Pyc::IMPORT_NAME_A:
+            case Pyc::IMPORT_FROM_A:
+            case Pyc::STORE_GLOBAL_A:
+            case Pyc::DELETE_NAME_A:
+            case Pyc::DELETE_GLOBAL_A:
+                nameIdx = arg;
+                break;
+            default:
+                break;
+            }
+            if (nameIdx >= 0) {
+                nameRefs.insert(nameIdx);
+                auto it = nameFirstRef.find(nameIdx);
+                if (it == nameFirstRef.end() || pv < it->second)
+                    nameFirstRef[nameIdx] = pv;
+            }
+        }
+    }
+    std::vector<PycRef<PycObject> > orphConsts;
+    int nc = code->consts() != nullptr ? code->consts()->size() : 0;
+    for (int i = 0; i < nc; i++) {
+        if (constRefs.count(i))
+            continue;
+        PycRef<PycObject> c = code->getConst(i);
+        if (c == nullptr)
+            continue;
+        if (!isSimpleOrphanConst(c.type()))
+            return;   // a container/code orphan: don't fabricate, leave the function as-is
+        orphConsts.push_back(c);
+    }
+    std::vector<PycRef<PycString> > orphNames;
+    std::vector<int> orphNameIdx;
+    int nn = code->names() != nullptr ? code->names()->size() : 0;
+    for (int i = 0; i < nn; i++) {
+        if (nameRefs.count(i))
+            continue;
+        PycRef<PycString> nm = code->getName(i);
+        if (nm == nullptr)
+            return;
+        orphNames.push_back(nm);
+        orphNameIdx.push_back(i);
+    }
+    if (orphNames.empty())
+        return;   // need a name to anchor the reconstructed call; skip pure-const orphans
+    /* The orphaned names must come from a SINGLE stripped block: contiguous indices
+       with no used name interleaved. */
+    for (size_t i = 1; i < orphNameIdx.size(); i++)
+        if (orphNameIdx[i] != orphNameIdx[i - 1] + 1)
+            return;
+    /* POSITION check: the block registers its names starting at index
+       orphNameIdx[0], so exactly that many used names must be registered BEFORE the
+       placeholder. Using each used name's first-reference offset as its registration
+       order, require the count of used names first-referenced before the placeholder
+       to equal the orphan block's start index. This rejects the case where the sole
+       placeholder is a DIFFERENT stripped statement (e.g. a leading docstring) and
+       the orphans belong to a trailing block -- placing them there would shift every
+       real index. */
+    int usedBefore = 0;
+    for (const auto& kv : nameFirstRef)
+        if (kv.second < phOff)
+            usedBefore++;
+    if (usedBefore != orphNameIdx[0])
+        return;
+    /* attribute chain n0.n1.n2... registers the names in table order */
+    PycRef<ASTNode> func = new ASTName(orphNames[0]);
+    for (size_t i = 1; i < orphNames.size(); i++)
+        func = new ASTBinary(func, new ASTName(orphNames[i]), ASTBinary::BIN_ATTR);
+    /* call args = orphaned consts (their exact PycObjects), in table order */
+    ASTCall::pparam_t pparams;
+    for (const auto& c : orphConsts)
+        pparams.push_back(new ASTObject(c));
+    PycRef<ASTNode> call = new ASTCall(func, pparams, ASTCall::kwparam_t());
+    PycRef<PycString> dbg = new PycString(PycObject::TYPE_STRING);
+    dbg->setValue("__debug__");
+    PycRef<ASTCondBlock> ifblk = new ASTCondBlock(ASTBlock::BLK_IF, 0,
+            new ASTName(dbg), false);
+    ifblk->append(call);
+    replaceFirstEllipsis(clean->mutableNodes(), ifblk.cast<ASTNode>());
+}
+
+static int leadingStrippedNops(PycRef<PycCode> code, PycModule* mod,
+                               std::vector<int>* offsets = nullptr,
+                               const std::set<int>* exclude = nullptr)
 {
     if (mod->verCompare(3, 11) < 0 || code->code() == nullptr)
         return 0;
@@ -17582,28 +19458,32 @@ static int leadingStrippedNops(PycRef<PycCode> code, PycModule* mod)
             && ins[i + 3].op == Pyc::STORE_NAME_A && nameIs(ins[i + 3].arg, "__qualname__"))
         i += 4;
 
+    /* A class/module body carrying annotations emits SETUP_ANNOTATIONS right
+       after the (class) qualname prologue and before the first source statement,
+       so a stripped leading statement (docstring / bare const) anchors its NOP
+       just past it. Skip it so that NOP is counted (else e.g. an annotated
+       dataclass with a stripped docstring loses its head line-anchor). */
+    if (i < ins.size() && ins[i].op == Pyc::SETUP_ANNOTATIONS)
+        i++;
+
     int count = 0;
     while (i < ins.size() && ins[i].op == Pyc::NOP) {
-        count++;
+        /* Skip anchor NOPs a one-per-line signature reproduces itself; they are
+           not leading stripped statements. */
+        if (exclude == nullptr || !exclude->count(ins[i].off)) {
+            if (offsets != nullptr)
+                offsets->push_back(ins[i].off);
+            count++;
+        }
         i++;
     }
-    /* Confine the transform to the one signature that is empirically ~100% a
-       single stripped simple statement: EXACTLY one NOP whose following statement
-       is not a `try`. A leading `try` regenerates a head NOP on its own (CPython
-       emits a line-anchor NOP at the try header, which pycdc reproduces when it
-       renders `try:`) -- its first protected instruction is the start of an
-       exception-table entry. Two or more NOPs are ambiguous (a try may account
-       for some of them) and are left alone. */
-    if (count != 1)
-        return 0;
-    int firstRealOff = (i < ins.size()) ? ins[i].off : -1;
-    if (firstRealOff >= 0) {
-        for (const auto& e : code->exceptionTableEntries()) {
-            if (e.start_offset == firstRealOff)
-                return 0;
-        }
-    }
-    return 1;
+    /* `count` = the number of leading line-anchor NOPs. Each stripped simple
+       statement (docstring / bare const) contributes one, but a leading `try`
+       (or `while`) regenerates one head anchor NOP on its own when pycdc renders
+       it. The caller subtracts those self-regenerated anchors (it has the AST and
+       can count the leading try/while nesting) before injecting placeholders, so
+       here we return the raw count regardless of what follows the run. */
+    return count;
 }
 
 /* True if pycdc's own reconstruction already emits a leading statement that
@@ -17616,14 +19496,13 @@ static bool leadingNopAlreadyHandled(const PycRef<ASTNode>& front)
         return true;
     if (front.type() == ASTNode::NODE_OBJECT)
         return true;   // bare constant expression statement -> already a NOP
-    /* `while` is the only non-`try` compound statement that carries its own head
-       line-anchor NOP (empirically `while True:`), which pycdc regenerates when
-       it renders the loop header -- a placeholder would double it. A leading
-       `try` is already excluded upstream via its exception-table entry;
-       if/for/with/match heads regenerate no head NOP, so they are left injectable. */
-    if (front.type() == ASTNode::NODE_BLOCK
-            && front.cast<ASTBlock>()->blktype() == ASTBlock::BLK_WHILE)
-        return true;
+    /* A leading `while` (empirically `while True:`) carries its own head
+       line-anchor NOP, as does a `try`; both are now accounted for at the
+       injection site, which descends the leading try/while nesting and subtracts
+       those self-regenerated anchors from the stripped-statement count. So a
+       `while`/`try` front is NOT treated as already-handled here -- a docstring
+       before it still needs its own placeholder (if/for/with/match heads
+       regenerate no head NOP and were already injectable). */
     /* NOTE: a leading `pass` is NOT treated as already-handled. `pass` emits no
        bytecode, so it never carries a stripped statement's line-anchor NOP; when
        the body is a stripped docstring/bare-const FOLLOWED by a `pass` (e.g. a
@@ -17641,6 +19520,332 @@ static bool leadingNopAlreadyHandled(const PycRef<ASTNode>& front)
     return false;
 }
 
+/* Column-layout engine (floor b1): give each stripped-statement `...` placeholder
+   the original source-text width so it renders as a width-matched literal and
+   reproduces the co_positions column span of the stripped docstring/assert.
+   The placeholder was injected with setSrcOff() = the stripped NOP's byte
+   offset; look up its (scol, ecol) span in this code's location table. A bare
+   string statement of that width recompiles (under -OO) to the same discarded
+   code as `...`, so co_code is unaffected. */
+static void setPlaceholderWidths(const PycRef<ASTNode>& node, PycRef<PycCode> code,
+                                 bool isFirst, int depth = 0)
+{
+    if (node == nullptr || depth > 200)
+        return;
+    if (node.type() == ASTNode::NODE_NODELIST) {
+        bool first = true;
+        for (const auto& n : node.cast<ASTNodeList>()->nodes()) {
+            setPlaceholderWidths(n, code, first, depth + 1);
+            first = false;
+        }
+        return;
+    }
+    if (node.type() == ASTNode::NODE_BLOCK) {
+        bool first = true;
+        for (const auto& n : node.cast<ASTBlock>()->nodes()) {
+            setPlaceholderWidths(n, code, first, depth + 1);
+            first = false;
+        }
+        return;
+    }
+    (void)isFirst;
+    if (node.type() == ASTNode::NODE_OBJECT
+            && node.cast<ASTObject>()->object() == Pyc_Ellipsis
+            && node->srcOff() >= 0) {
+        int ln = code->lineForOffset(node->srcOff());
+        int el = code->elineForOffset(node->srcOff());
+        int sc = code->colForOffset(node->srcOff());
+        int ec = code->ecolForOffset(node->srcOff());
+        /* Anchor the placeholder on the stripped statement's own source line so
+           the absolute line-placement pass positions it (an injected node
+           otherwise carries a stale construction-time line). */
+        if (ln >= 0)
+            node->setSrcLine(ln);
+        if (sc >= 0 && ec > sc) {
+            node->setSrcCol(sc);
+            node->setLayoutWidth(ec - sc);
+        }
+        /* A multi-line original (a wrapped docstring): record the span's end so
+           the placeholder can close on the same line and column. */
+        if (el > ln && ec >= 1) {
+            if (sc >= 0)
+                node->setSrcCol(sc);
+            node->setLayoutEndLine(el);
+            node->setLayoutEndCol(ec);
+        }
+    }
+}
+
+/* True for a `return None` / bare `return` statement node. */
+static bool isReturnNoneNode(const PycRef<ASTNode>& n)
+{
+    if (n == nullptr || n.type() != ASTNode::NODE_RETURN)
+        return false;
+    if (n.cast<ASTReturn>()->rettype() != ASTReturn::RETURN)
+        return false;
+    PycRef<ASTNode> v = n.cast<ASTReturn>()->value();
+    if (v == nullptr)
+        return true;
+    if (v.type() != ASTNode::NODE_OBJECT)
+        return false;
+    PycRef<PycObject> o = v.cast<ASTObject>()->object();
+    return o != nullptr && o.type() == PycObject::TYPE_NONE;
+}
+
+/* Last visible (non-suppressed) statement of a block body, or null. */
+static PycRef<ASTNode> lastVisibleStmt(const ASTBlock::list_t& body)
+{
+    PycRef<ASTNode> last;
+    for (const auto& n : body)
+        if (n != nullptr && !n->suppressed())
+            last = n;
+    return last;
+}
+
+/* A statement whose normal control flow does not fall through to the next
+   sibling (so an if-chain terminated by it maps to an `else`). */
+static bool isTerminalNode(const PycRef<ASTNode>& n)
+{
+    if (n == nullptr)
+        return false;
+    return n.type() == ASTNode::NODE_RETURN || n.type() == ASTNode::NODE_RAISE;
+}
+
+/* Layout-only: re-fold a terminal if-return chain into if/elif/.../else.
+   pycdc reconstructs `if C1: A elif C2: B ... else: T` as SEPARATE
+   `if C1: A; return None` sibling blocks ending in a terminal statement T,
+   because both forms compile to byte-identical bytecode. The expanded form
+   emits an extra explicit `return None` LINE per branch, pushing every later
+   def down (the co_positions over-run cascade). When a maximal run of >=1
+   consecutive BLK_IF, each whose body's last visible statement is an implicit
+   `return None`, is immediately followed by a terminal statement (raise/return)
+   that is the LAST visible node in the list, fold it back: suppress each
+   branch's trailing return-None, convert the 2nd..Nth if to elif, and wrap the
+   terminal in an else. co_code is unchanged (the forms are byte-identical);
+   only the rendered line layout shrinks toward the original source.
+
+   SAFETY: the fold is co_code-safe ONLY in TAIL position. A branch's implicit
+   `return None` exits the FUNCTION; the elif form falls through the chain to
+   whatever follows it. These coincide (both reach the function-end return None)
+   only when the chain is in tail position — inside a loop the fall-through
+   continues the loop instead, which is NOT equivalent. So `listTail` is
+   propagated exactly as in markEpilogueSuppress and the fold runs only when
+   the (terminal-ended) chain is the tail of a tail list. */
+static void coalesceElifChains(ASTBlock::list_t& nodes, bool listTail, int depth)
+{
+    if (depth > 80)
+        return;
+    /* Flatten to a vector of iterators for index-style back-walking. */
+    std::vector<ASTBlock::list_t::iterator> it;
+    for (auto i = nodes.begin(); i != nodes.end(); ++i)
+        it.push_back(i);
+    int N = (int)it.size();
+    int lastVis = -1;
+    for (int i = 0; i < N; i++)
+        if (*it[i] != nullptr && !(*it[i])->suppressed())
+            lastVis = i;
+    /* Recurse into child block bodies first, propagating tail position. */
+    for (int i = 0; i < N; i++) {
+        PycRef<ASTNode> n = *it[i];
+        if (n == nullptr || n.type() != ASTNode::NODE_BLOCK)
+            continue;
+        PycRef<ASTBlock> blk = n.cast<ASTBlock>();
+        ASTBlock::BlkType bt = blk->blktype();
+        /* Propagate tail ONLY through pure conditional nesting (if/elif/else).
+           A try/except/finally body's fall-through carries exception-unwind
+           cleanup (POP_EXCEPT etc.), so the if/elif/else vs if-return-chain
+           equivalence does NOT hold there (proven: folding in an except body
+           changes co_code). Loops/with never preserve tail either. */
+        bool childTail = listTail && (i == lastVis)
+                && (bt == ASTBlock::BLK_IF || bt == ASTBlock::BLK_ELSE
+                    || bt == ASTBlock::BLK_ELIF);
+        if (bt == ASTBlock::BLK_CONTAINER) {
+            for (auto& c : blk->mutableNodes())
+                if (c != nullptr && c.type() == ASTNode::NODE_BLOCK)
+                    coalesceElifChains(c.cast<ASTBlock>()->mutableNodes(),
+                                       false, depth + 1);
+        } else {
+            coalesceElifChains(blk->mutableNodes(), childTail, depth + 1);
+        }
+    }
+    if (!listTail)
+        return;
+    int lastIdx = lastVis;
+    if (lastIdx < 1 || !isTerminalNode(*it[lastIdx]))
+        return;
+    /* Walk back over the contiguous run of qualifying BLK_IF siblings. */
+    std::vector<int> ifIdx;
+    for (int j = lastIdx - 1; j >= 0; j--) {
+        PycRef<ASTNode> n = *it[j];
+        if (n == nullptr || n->suppressed() || n.type() != ASTNode::NODE_BLOCK)
+            break;
+        PycRef<ASTBlock> b = n.cast<ASTBlock>();
+        if (b->blktype() != ASTBlock::BLK_IF)
+            break;
+        if (!isReturnNoneNode(lastVisibleStmt(b->nodes())))
+            break;
+        /* The trailing return-None must follow a SIMPLE (non-block) statement,
+           and there must be one (body >=2 visible). If the preceding statement
+           is itself a block (a nested if/for/try), the return-None is a shared
+           control-flow merge target and the if-return vs if/elif/else forms
+           compile to DIFFERENT bytecode (proven). Also, >=2 visible guarantees
+           suppressing the return leaves a non-empty body (an empty branch
+           renders `pass`, which is not fall-through-equivalent). Mirrors the
+           `!prevWasBlock` guard in markEpilogueSuppress. A branch failing this
+           stops the run (folding only the safe suffix closer to the terminal). */
+        int vis = 0;
+        PycRef<ASTNode> beforeRet, last;
+        for (const auto& s : b->nodes()) {
+            if (s == nullptr || s->suppressed())
+                continue;
+            beforeRet = last;
+            last = s;
+            vis++;
+        }
+        if (vis < 2 || beforeRet == nullptr
+                || beforeRet.type() == ASTNode::NODE_BLOCK)
+            break;
+        ifIdx.push_back(j);
+    }
+    if (ifIdx.empty())
+        return;
+    int firstIf = ifIdx.back();
+    for (int idx : ifIdx) {
+        PycRef<ASTBlock> b = (*it[idx]).cast<ASTBlock>();
+        PycRef<ASTNode> lastB = lastVisibleStmt(b->nodes());
+        if (lastB != nullptr)
+            lastB->setSuppressed(true);
+        if (idx != firstIf)
+            b->setBlktype(ASTBlock::BLK_ELIF);
+    }
+    PycRef<ASTBlock> elseb = new ASTBlock(ASTBlock::BLK_ELSE, 0);
+    elseb->append(*it[lastIdx]);
+    elseb->setSrcLine(-1);   // no own line-pad; the terminal inside pads to its line
+    *it[lastIdx] = elseb;
+}
+
+/* Layout-only: drop the implicit trailing `return None` epilogue that pycdc
+   over-renders for a terminal try/except (see setSuppressed). CPython re-creates
+   the implicit epilogue when the plain try/except recompiles, so co_code is
+   unchanged, but the over-rendered `else: return None` / `except …: …; return None`
+   lines no longer push every later def down (the co_positions over-run cascade).
+   Only the SPECIFIC shape is touched: a container try/except whose synthesized
+   `else` is exactly one `return None` sharing the try body's last line (an inherited
+   implicit-epilogue line, not an explicit own-line return), and whose every except
+   clause ends in a `return None` that likewise inherits its preceding statement's
+   line. All-or-nothing per container, so a partially-explicit shape is left intact. */
+static void markEpilogueSuppress(ASTBlock::list_t& nodes, bool listTail,
+                                 bool inExcept, int depth = 0)
+{
+    if (depth > 80)
+        return;
+    int lastVis = -1, i = 0;
+    for (const auto& n : nodes) {
+        if (n != nullptr && !n->suppressed())
+            lastVis = i;
+        i++;
+    }
+    i = -1;
+    bool prevWasBlock = false;
+    bool prevExists = false;
+    for (auto& n : nodes) {
+        i++;
+        /* A statement is in TAIL position (its normal exit reaches the function end,
+           so an implicit `return None` there IS the fall-off epilogue) only when its
+           enclosing list is tail AND it is the last visible statement in it. */
+        bool isTail = listTail && (i == lastVis);
+        /* A plain trailing `return None` in tail position is the implicit fall-off
+           epilogue rendered explicitly: dropping it recompiles identically (the
+           compiler re-adds the epilogue) and removes the over-rendered line. Require
+           a plain (non-block) preceding statement: after a loop / if / try the
+           control flow MERGES several predecessors on the return, and the compiler
+           may duplicate vs share the epilogue -- dropping it would then change the
+           block count (co_code). A simple fall-through from a leaf statement is safe. */
+        if (!inExcept && isTail && n != nullptr && !n->suppressed()
+                && isReturnNoneNode(n) && prevExists && !prevWasBlock) {
+            n->setSuppressed(true);
+            continue;
+        }
+        if (n != nullptr && !n->suppressed()) {
+            prevExists = true;
+            prevWasBlock = (n.type() == ASTNode::NODE_BLOCK);
+        }
+        if (n == nullptr || n.type() != ASTNode::NODE_BLOCK)
+            continue;
+        PycRef<ASTBlock> blk = n.cast<ASTBlock>();
+        ASTBlock::BlkType bt = blk->blktype();
+        if (bt == ASTBlock::BLK_CONTAINER) {
+            /* Each try/else/except path independently reaches the function end when
+               the container is tail. An except body carries exception-unwind cleanup,
+               so a plain return-None there cannot be dropped to a fall-off (the
+               container pass handles the all-fall-off case itself) -- mark inExcept. */
+            for (auto& c : blk->mutableNodes()) {
+                if (c == nullptr || c.type() != ASTNode::NODE_BLOCK) continue;
+                bool ce = (c.cast<ASTBlock>()->blktype() == ASTBlock::BLK_EXCEPT);
+                markEpilogueSuppress(c.cast<ASTBlock>()->mutableNodes(),
+                                     isTail, inExcept || ce, depth + 1);
+            }
+        } else if (bt == ASTBlock::BLK_IF || bt == ASTBlock::BLK_ELSE
+                   || bt == ASTBlock::BLK_ELIF || bt == ASTBlock::BLK_TRY
+                   || bt == ASTBlock::BLK_EXCEPT) {
+            markEpilogueSuppress(blk->mutableNodes(), isTail, inExcept, depth + 1);
+        } else {
+            markEpilogueSuppress(blk->mutableNodes(), false, inExcept, depth + 1);
+        }
+        if (!isTail || bt != ASTBlock::BLK_CONTAINER
+                || !blk.cast<ASTContainerBlock>()->hasExcept())
+            continue;
+        PycRef<ASTBlock> tryb, elseb;
+        std::vector<PycRef<ASTBlock> > excepts;
+        bool hasFinally = false;
+        for (const auto& c : blk->nodes()) {
+            if (c == nullptr || c.type() != ASTNode::NODE_BLOCK)
+                continue;
+            ASTBlock::BlkType bt = c.cast<ASTBlock>()->blktype();
+            if (bt == ASTBlock::BLK_TRY) tryb = c.cast<ASTBlock>();
+            else if (bt == ASTBlock::BLK_ELSE) elseb = c.cast<ASTBlock>();
+            else if (bt == ASTBlock::BLK_EXCEPT) excepts.push_back(c.cast<ASTBlock>());
+            else if (bt == ASTBlock::BLK_FINALLY) hasFinally = true;
+        }
+        if (hasFinally || tryb == nullptr || elseb == nullptr || excepts.empty())
+            continue;
+        /* the try body's last statement line (the implicit epilogue inherits it) */
+        PycRef<ASTNode> tryLast;
+        for (auto it = tryb->nodes().rbegin(); it != tryb->nodes().rend(); ++it)
+            if (*it != nullptr && !(*it)->suppressed()) { tryLast = *it; break; }
+        if (tryLast == nullptr)
+            continue;
+        /* else must be a single `return None` sharing the try body's last line */
+        PycRef<ASTNode> elseRet;
+        int elseVisible = 0;
+        for (const auto& c : elseb->nodes())
+            if (c != nullptr && !c->suppressed()) { elseVisible++; elseRet = c; }
+        if (elseVisible != 1 || !isReturnNoneNode(elseRet)
+                || elseRet->srcLine() < 0 || elseRet->srcLine() != tryLast->srcLine())
+            continue;
+        /* every except clause must END in an inherited-line `return None` */
+        bool ok = true;
+        std::vector<PycRef<ASTNode> > exRets;
+        for (const auto& ex : excepts) {
+            PycRef<ASTNode> l1, l2;
+            for (auto it = ex->nodes().rbegin(); it != ex->nodes().rend(); ++it) {
+                if (*it == nullptr || (*it)->suppressed()) continue;
+                if (l1 == nullptr) l1 = *it;
+                else { l2 = *it; break; }
+            }
+            int prevLine = (l2 != nullptr) ? l2->srcLine() : ex->srcLine();
+            if (l1 == nullptr || !isReturnNoneNode(l1) || l1->srcLine() < 0
+                    || prevLine < 0 || l1->srcLine() != prevLine) { ok = false; break; }
+            exRets.push_back(l1);
+        }
+        if (!ok)
+            continue;
+        elseb->setSuppressed(true);
+        for (auto& r : exRets)
+            r->setSuppressed(true);
+    }
+}
+
 void decompyle(PycRef<PycCode> code, PycModule* mod, std::ostream& pyc_output)
 {
     if (code_seen.find((PycCode *)code) != code_seen.end()) {
@@ -17650,6 +19855,9 @@ void decompyle(PycRef<PycCode> code, PycModule* mod, std::ostream& pyc_output)
     code_seen.insert((PycCode *)code);
 
     PycRef<ASTNode> source = BuildFromCode(code, mod);
+    /* Capture this code object's signature anchor NOPs before any nested code
+       object is decompiled (which would overwrite the global). */
+    std::set<int> sigAnchorNopOffs = g_sigAnchorNopOffs;
 
     PycRef<ASTNodeList> clean = source.cast<ASTNodeList>();
     if (cleanBuild) {
@@ -17749,6 +19957,46 @@ void decompyle(PycRef<PycCode> code, PycModule* mod, std::ostream& pyc_output)
             }
             pyc_output << "\n";
         }
+        /* Emit `nonlocal` for a free variable that this nested function ASSIGNS
+           (STORE_DEREF). Without the declaration, recompiling the assignment makes
+           the name a fresh local (STORE_FAST) instead of rebinding the enclosing
+           scope's cell -- changing every deref in the body. `nonlocal` produces no
+           bytecode, so this is co_code-neutral except for restoring the free/cell
+           binding. A free var that is only read needs no declaration. In 3.11 the
+           free vars share the combined locals-plus array; a slot is a free var iff
+           its kind byte carries CO_FAST_FREE (0x80). */
+        if (mod->verCompare(3, 11) >= 0 && code->code() != nullptr
+                && code->localKinds() != nullptr) {
+            PycRef<PycString> kinds = code->localKinds();
+            int nkinds = kinds->length();
+            const char* kv = kinds->value();
+            std::set<int> assignedFree;
+            PycBuffer s(code->code()->value(), code->code()->length());
+            int op, arg, p = 0;
+            while (!s.atEof()) {
+                int pv = p;
+                bc_next(s, mod, op, arg, p);
+                if (p <= pv) break;
+                if (op == Pyc::STORE_DEREF_A && arg >= 0 && arg < nkinds
+                        && (kv[arg] & 0x80))     // CO_FAST_FREE
+                    assignedFree.insert(arg);
+            }
+            if (!assignedFree.empty()) {
+                start_line(cur_indent + 1, pyc_output);
+                pyc_output << "nonlocal ";
+                bool first = true;
+                for (int idx : assignedFree) {   // ascending; order is irrelevant
+                    PycRef<PycString> nm = code->getLocal(idx);
+                    if (nm == nullptr)
+                        continue;
+                    if (!first)
+                        pyc_output << ", ";
+                    pyc_output << nm->value();
+                    first = false;
+                }
+                pyc_output << "\n";
+            }
+        }
         printDocstringAndGlobals = false;
     }
 
@@ -17840,17 +20088,646 @@ void decompyle(PycRef<PycCode> code, PycModule* mod, std::ostream& pyc_output)
         }
     }
 
+    /* Restore INTERIOR stripped statements: a docstring / bare-constant /
+       debug-only line removed under -OO between two real statements survives as a
+       line-anchor NOP the decompiler drops. Reproduce it by inserting a `...`
+       placeholder at the matching between-statements slot. Confined to a FLAT
+       straight-line body (module const tables, enum-style class bodies): no
+       exception table, no compound-block nodes, and the count of bytecode
+       statement terminators equal to the rendered node count, so terminators map
+       1:1 onto nodes in order and the slot is exact. Runs BEFORE the leading
+       placeholder pass so the node count is still pristine. */
+    if (cleanBuild && clean != nullptr && mod->verCompare(3, 11) >= 0
+            && code->code() != nullptr
+            && code->exceptionTableEntries().empty()
+            && clean->nodes().size() >= 2) {
+        bool flatNodes = true;
+        for (const auto& n : clean->nodes())
+            if (n != nullptr && n.type() == ASTNode::NODE_BLOCK) { flatNodes = false; break; }
+        if (flatNodes) {
+            struct II { int op, arg, off; };
+            std::vector<II> ins;
+            {
+                PycBuffer s(code->code()->value(), code->code()->length());
+                int op, arg, p = 0;
+                while (!s.atEof()) {
+                    int prev = p;
+                    bc_next(s, mod, op, arg, p);
+                    if (p <= prev) break;
+                    if (op == Pyc::CACHE) continue;
+                    ins.push_back({op, arg, prev});
+                }
+            }
+            /* Skip the code-object prologue (RESUME/cells/generator) and, for a
+               class body, the __module__/__qualname__ stores. */
+            size_t k = 0; bool sawRG = false;
+            while (k < ins.size()) {
+                int op = ins[k].op;
+                if (op == Pyc::RESUME_A || op == Pyc::MAKE_CELL_A
+                        || op == Pyc::COPY_FREE_VARS_A || op == Pyc::RETURN_GENERATOR) {
+                    if (op == Pyc::RETURN_GENERATOR) sawRG = true;
+                    k++; continue;
+                }
+                if (op == Pyc::POP_TOP && sawRG) { sawRG = false; k++; continue; }
+                break;
+            }
+            auto nameIs = [&](int idx, const char* n) {
+                PycRef<PycString> s = code->getName(idx);
+                return s != nullptr && s->isEqual(n);
+            };
+            if (k + 3 < ins.size()
+                    && ins[k].op == Pyc::LOAD_NAME_A && nameIs(ins[k].arg, "__name__")
+                    && ins[k + 1].op == Pyc::STORE_NAME_A && nameIs(ins[k + 1].arg, "__module__")
+                    && ins[k + 2].op == Pyc::LOAD_CONST_A
+                    && ins[k + 3].op == Pyc::STORE_NAME_A && nameIs(ins[k + 3].arg, "__qualname__"))
+                k += 4;
+            auto isTerm = [](int op) {
+                return op == Pyc::STORE_NAME_A || op == Pyc::STORE_GLOBAL_A
+                    || op == Pyc::STORE_FAST_A || op == Pyc::STORE_DEREF_A
+                    || op == Pyc::STORE_SUBSCR || op == Pyc::STORE_ATTR_A
+                    || op == Pyc::POP_TOP || op == Pyc::DELETE_NAME_A
+                    || op == Pyc::DELETE_GLOBAL_A || op == Pyc::DELETE_FAST_A;
+            };
+            /* A NOP whose statement ends in a def-creation (MAKE_FUNCTION then a
+               STORE of the function's name) is a signature-continuation anchor:
+               a def whose signature spans several source lines leaves one NOP per
+               continuation line just before the creation sequence. When pycdc
+               renders that signature on a SINGLE line it regenerates NONE of
+               them, so every NOP in the run must be reproduced (the
+               line-uniqueness rule below would otherwise drop the ones sharing
+               the def's line). The single-line condition is verified per-def
+               against the rendered AST (sigRendersInline) -- an annotation or
+               default holding a list/set/dict display or comprehension makes
+               pycdc wrap the signature and regenerate some anchors itself. */
+            auto isDefSigNop = [&](size_t j) -> bool {
+                for (size_t t = j + 1; t < ins.size(); t++) {
+                    if (!isTerm(ins[t].op))
+                        continue;
+                    if (ins[t].op == Pyc::STORE_NAME_A || ins[t].op == Pyc::STORE_FAST_A
+                            || ins[t].op == Pyc::STORE_GLOBAL_A || ins[t].op == Pyc::STORE_DEREF_A) {
+                        int p = (int)t - 1;
+                        while (p >= 0 && ins[p].op == Pyc::CACHE) p--;
+                        return p >= 0 && ins[p].op == Pyc::MAKE_FUNCTION_A;
+                    }
+                    return false;
+                }
+                return false;
+            };
+            /* True when the def stored as `defNode` renders its whole signature
+               on one physical line -- i.e. no annotation or default renders with
+               an embedded newline, matching what the NODE_STORE signature render
+               actually emits. The real render disables collection compaction
+               only for a signature whose source spanned multiple lines (some
+               annotation/default sits on a later line than the `def`); this
+               scratch check applies the identical gate so the two agree. */
+            auto sigRendersInline = [&](const PycRef<ASTNode>& defNode) -> bool {
+                if (defNode == nullptr || defNode.type() != ASTNode::NODE_STORE)
+                    return false;
+                PycRef<ASTNode> fn = defNode.cast<ASTStore>()->src();
+                if (fn == nullptr || fn.type() != ASTNode::NODE_FUNCTION)
+                    return false;
+                PycRef<ASTFunction> f = fn.cast<ASTFunction>();
+                /* A one-per-line const-default signature (sigNopAnchors set) is
+                   rendered multi-line and regenerates its anchor NOPs itself, so
+                   it is NOT inline and needs no placeholder. */
+                if (f->sigNopAnchors() >= 0)
+                    return false;
+                int defLine = defNode->srcLine();
+                bool srcMulti = false;
+                auto laterLine = [&](const PycRef<ASTNode>& n) {
+                    if (n == nullptr)
+                        return;
+                    int l = n->srcLine();
+                    if (l > 0 && defLine > 0 && l != defLine)
+                        srcMulti = true;
+                };
+                for (const auto& a : f->annotations())
+                    laterLine(a.second);
+                for (const auto& d : f->defargs())
+                    laterLine(d);
+                for (const auto& d : f->kwdefargs())
+                    laterLine(d);
+                auto hasNL = [&](const PycRef<ASTNode>& n) -> bool {
+                    if (n == nullptr)
+                        return false;
+                    std::ostringstream ss;
+                    if (srcMulti) g_noCompact++;
+                    print_src(n, mod, ss);
+                    if (srcMulti) g_noCompact--;
+                    return ss.str().find('\n') != std::string::npos;
+                };
+                for (const auto& a : f->annotations())
+                    if (hasNL(a.second)) return false;
+                for (const auto& d : f->defargs())
+                    if (hasNL(d)) return false;
+                for (const auto& d : f->kwdefargs())
+                    if (hasNL(d)) return false;
+                return true;
+            };
+            auto nodeAtSlot = [&](int slot) -> PycRef<ASTNode> {
+                if (slot < 0 || slot >= (int)clean->nodes().size())
+                    return nullptr;
+                auto it = clean->nodes().begin();
+                std::advance(it, slot);
+                return *it;
+            };
+            /* Cheap first pass (no line lookups): find each interior NOP and the
+               statement-terminator count before it. Bail early when there are no
+               interior NOPs -- avoids the O(n^2) line scan below on huge
+               generated data tables (tens of thousands of instructions, zero
+               NOPs). */
+            struct NopC { int slot, off; bool defSig; };
+            std::vector<NopC> nopCand;
+            int termCount = 0;
+            for (size_t j = k; j < ins.size(); j++) {
+                if (ins[j].op == Pyc::NOP) {
+                    if (termCount >= 1 && !sigAnchorNopOffs.count(ins[j].off))
+                        nopCand.push_back({termCount, ins[j].off, isDefSigNop(j)});
+                } else if (isTerm(ins[j].op)) {
+                    termCount++;
+                }
+            }
+            int origSize = (int)clean->nodes().size();
+            /* lineForOffset re-parses the whole line table per call, so bound the
+               line-uniqueness scan to a sane body size (real stripped-statement
+               bodies are small; giant data tables are not a target). */
+            std::vector<std::pair<int,int> > nopAfter;  // {slot, byte offset}
+            if (!nopCand.empty() && termCount == origSize && ins.size() <= 4000) {
+                /* A genuine stripped statement occupies its OWN source line, so
+                   its line-anchor NOP is the only thing on that line. A NOP whose
+                   line ALSO carries code is a redundant anchor for that code (e.g.
+                   a following def's multi-line signature / annotation) which the
+                   decompiler regenerates when it renders the code -- inserting a
+                   placeholder there would double it. */
+                std::set<int> codeLines;
+                for (size_t j = 0; j < ins.size(); j++)
+                    if (ins[j].op != Pyc::NOP)
+                        codeLines.insert(code->lineForOffset(ins[j].off));
+                std::unordered_map<int, int> sigInlineCache;  // slot -> 0/1
+                for (const auto& nc : nopCand) {
+                    bool useDefSig = false;
+                    if (nc.defSig) {
+                        auto ci = sigInlineCache.find(nc.slot);
+                        int v;
+                        if (ci != sigInlineCache.end())
+                            v = ci->second;
+                        else {
+                            v = sigRendersInline(nodeAtSlot(nc.slot)) ? 1 : 0;
+                            sigInlineCache[nc.slot] = v;
+                        }
+                        useDefSig = (v == 1);
+                    }
+                    if (useDefSig
+                            || codeLines.find(code->lineForOffset(nc.off)) == codeLines.end())
+                        nopAfter.push_back({nc.slot, nc.off});
+                }
+            } else if (!nopCand.empty() && termCount != origSize && ins.size() <= 4000) {
+                /* The terminator count exceeds the AST child count: a statement in
+                   this flat body compiles to several terminators but ONE node (a
+                   multi-name `from x import a, b`, an annotated class attribute
+                   `x: T` storing into __annotations__ plus a value, a chained/tuple
+                   assign). The terminator-index slot above would then be too high,
+                   so map each line-free stripped NOP to its child slot by SOURCE
+                   OFFSET instead: the slot is the number of children whose source
+                   offset precedes the NOP, and the NOP must sit strictly between the
+                   two children that bracket it. Requires ascending child offsets. */
+                std::set<int> codeLines;
+                for (size_t j = 0; j < ins.size(); j++)
+                    if (ins[j].op != Pyc::NOP)
+                        codeLines.insert(code->lineForOffset(ins[j].off));
+                std::vector<int> childOff;
+                bool ok = true;
+                int prevOff = -1;
+                for (const auto& n : clean->nodes()) {
+                    int so = n ? n->srcOff() : -1;
+                    if (so < 0 || so <= prevOff) { ok = false; break; }  // missing / non-ascending
+                    childOff.push_back(so);
+                    prevOff = so;
+                }
+                if (ok) {
+                    for (const auto& nc : nopCand) {
+                        int slot = 0;
+                        for (int c : childOff)
+                            if (c < nc.off) slot++;
+                        if (slot < 1 || slot >= (int)childOff.size())
+                            continue;   // leading / trailing -> other passes handle
+                        if (!(childOff[slot - 1] < nc.off && nc.off < childOff[slot]))
+                            continue;   // not strictly bracketed between two statements
+                        /* A NOP whose statement is a following def's multi-line
+                           signature anchor is regenerated when pycdc renders that
+                           signature (one param per line), so place it ONLY if the
+                           signature renders inline; otherwise require a code-free
+                           line (a genuine stripped statement owns its own line). */
+                        bool place;
+                        if (nc.defSig)
+                            place = sigRendersInline(nodeAtSlot(slot));
+                        else
+                            place = codeLines.find(code->lineForOffset(nc.off)) == codeLines.end();
+                        if (place)
+                            nopAfter.push_back({slot, nc.off});
+                    }
+                }
+            }
+            if (!nopAfter.empty()) {
+                /* nopAfter is ascending (forward walk); insert from the highest
+                   slot down so earlier insertions do not shift later indices. */
+                for (auto rit = nopAfter.rbegin(); rit != nopAfter.rend(); ++rit) {
+                    int pos = rit->first;
+                    if (pos < 1 || pos >= origSize)
+                        continue;
+                    auto it = clean->mutableNodes().begin();
+                    std::advance(it, pos);
+                    PycRef<ASTNode> ph = new ASTObject(Pyc_Ellipsis);
+                    ph->setSrcOff(rit->second);
+                    clean->mutableNodes().insert(it, ph);
+                }
+            }
+        }
+    }
+
+    /* General interior placeholder pass for NON-flat bodies (nested if/for/while/
+       try suites, or bodies with an exception table) that the flat fast path
+       above skips. Places each line-unique stripped NOP into its enclosing suite
+       by byte-range; leading NOPs are left to the pass below. */
+    if (cleanBuild && clean != nullptr && mod->verCompare(3, 11) >= 0
+            && code->code() != nullptr && clean->nodes().size() >= 2) {
+        bool hasBlock = false;
+        for (const auto& n : clean->nodes())
+            if (n != nullptr && n.type() == ASTNode::NODE_BLOCK) { hasBlock = true; break; }
+        if (hasBlock || !code->exceptionTableEntries().empty()) {
+            std::vector<int> nops = collectStrippedNops(code, mod, sigAnchorNopOffs);
+            if (!nops.empty()) {
+                std::set<int> remaining(nops.begin(), nops.end());
+                insertGeneralPlaceholders(clean->mutableNodes(), remaining);
+                /* NOP-locator: place each still-unplaced stripped bare-const NOP
+                   (now that try-heads are excluded, `remaining` holds genuine
+                   dropped statements). When the preceding instruction ends a
+                   RETURNing `if` body the NOP sits at that branch's merge -- place
+                   a `...` sibling after the `if`. Otherwise place it directly after
+                   the statement built by the preceding instruction, unless that
+                   predecessor is another branch/exit boundary (jump/raise), where
+                   the position is not a simple after-statement slot. */
+                if (!remaining.empty()) {
+                    struct II { int op, off; };
+                    std::vector<II> bcins;
+                    {
+                        PycBuffer s(code->code()->value(), code->code()->length());
+                        int op, arg, p = 0;
+                        while (!s.atEof()) {
+                            int pv = p;
+                            bc_next(s, mod, op, arg, p);
+                            if (p <= pv) break;
+                            if (op == Pyc::CACHE) continue;
+                            bcins.push_back({op, pv});
+                        }
+                    }
+                    auto isBoundary = [](int op) {
+                        return op == Pyc::RETURN_VALUE || op == Pyc::RETURN_CONST_A
+                            || op == Pyc::RAISE_VARARGS_A || op == Pyc::RERAISE_A
+                            || op == Pyc::JUMP_FORWARD_A || op == Pyc::JUMP_BACKWARD_A
+                            || op == Pyc::JUMP_ABSOLUTE_A
+                            || op == Pyc::POP_JUMP_FORWARD_IF_FALSE_A
+                            || op == Pyc::POP_JUMP_FORWARD_IF_TRUE_A
+                            || op == Pyc::POP_JUMP_FORWARD_IF_NONE_A
+                            || op == Pyc::POP_JUMP_FORWARD_IF_NOT_NONE_A
+                            || op == Pyc::POP_JUMP_BACKWARD_IF_FALSE_A
+                            || op == Pyc::POP_JUMP_BACKWARD_IF_TRUE_A;
+                    };
+                    std::vector<int> todo(remaining.begin(), remaining.end());
+                    for (int o : todo) {
+                        int prevOff = -1, prevOp = -1;
+                        for (const auto& x : bcins) {
+                            if (x.off >= o) break;
+                            if (x.op == Pyc::NOP) continue;
+                            prevOff = x.off; prevOp = x.op;
+                        }
+                        if (prevOff < 0)
+                            continue;
+                        bool exitPrev = (prevOp == Pyc::RETURN_VALUE
+                                || prevOp == Pyc::RETURN_CONST_A
+                                || prevOp == Pyc::RAISE_VARARGS_A);
+                        if (exitPrev) {
+                            /* The NOP is at a merge whose preceding branch exited with
+                               a `return` or `raise`. Try the last-leaf `if` match first;
+                               if it misses, the NOP is the merge after an `if` OR a `match`
+                               statement (all its cases return, so a statement after the
+                               match lands at its merge = block end), keyed on the block
+                               END == NOP offset. A `raise` inside an exception-table
+                               protected range is part of entangled try/finally unwinding
+                               whose merge anchor pycdc regenerates -- skip it entirely
+                               (the `return` merge keeps its established behaviour). */
+                            bool inProtected = false;
+                            for (const auto& e : code->exceptionTableEntries())
+                                if (prevOff >= e.start_offset && prevOff < e.end_offset) {
+                                    inProtected = true; break;
+                                }
+                            if (prevOp == Pyc::RAISE_VARARGS_A && inProtected)
+                                continue;
+                            if (insertPlaceholderAfterIfEndingAt(clean->mutableNodes(),
+                                                                 prevOff, o)) {
+                                remaining.erase(o);
+                                continue;
+                            }
+                            if (!inProtected
+                                    && insertPlaceholderAfterBlockEndingAt(
+                                           clean->mutableNodes(), o, o))
+                                remaining.erase(o);
+                            continue;
+                        }
+                        bool condBranch = (prevOp == Pyc::POP_JUMP_FORWARD_IF_FALSE_A);
+                        if (condBranch) {
+                            /* The NOP starts the fall-through `if` body -- but only
+                               for a clean `if` that is not itself inside an
+                               exception-table protected range (an `if` nested in a
+                               `try`/`with`/loop-in-try has entangled control flow
+                               whose branch-start anchor pycdc regenerates by other
+                               means). */
+                            bool inProtected = false;
+                            for (const auto& e : code->exceptionTableEntries())
+                                if (prevOff >= e.start_offset && prevOff < e.end_offset) {
+                                    inProtected = true; break;
+                                }
+                            if (!inProtected
+                                    && insertPlaceholderAtIfBodyStart(clean->mutableNodes(),
+                                                                      prevOff, o))
+                                remaining.erase(o);
+                            continue;
+                        }
+                        if (isBoundary(prevOp))
+                            continue;
+                        if (insertPlaceholderAfterOff(clean->mutableNodes(), prevOff, o)) {
+                            remaining.erase(o);
+                            continue;
+                        }
+                        /* A stripped statement as the FIRST statement of a `for` body:
+                           the preceding instruction is the loop-variable STORE (which
+                           unpacks the FOR_ITER value), so no AST node has that offset.
+                           Detect it -- walk back over the store run (and any tuple
+                           UNPACK) to a FOR_ITER -- and prepend the `...` to the `for`
+                           body by containment. Skip a loop var store inside a protected
+                           range (entangled unwinding regenerates the anchor). */
+                        bool storePrev = (prevOp == Pyc::STORE_FAST_A
+                                || prevOp == Pyc::STORE_NAME_A
+                                || prevOp == Pyc::STORE_GLOBAL_A
+                                || prevOp == Pyc::STORE_DEREF_A);
+                        if (storePrev) {
+                            int pi = -1;
+                            for (int k2 = 0; k2 < (int)bcins.size(); k2++)
+                                if (bcins[k2].off == prevOff) { pi = k2; break; }
+                            bool forVar = false;
+                            for (int k2 = pi; k2 >= 0; k2--) {
+                                int op2 = bcins[k2].op;
+                                if (op2 == Pyc::STORE_FAST_A || op2 == Pyc::STORE_NAME_A
+                                        || op2 == Pyc::STORE_GLOBAL_A || op2 == Pyc::STORE_DEREF_A
+                                        || op2 == Pyc::UNPACK_SEQUENCE_A || op2 == Pyc::UNPACK_EX_A)
+                                    continue;
+                                forVar = (op2 == Pyc::FOR_ITER_A);
+                                break;
+                            }
+                            bool inProtected = false;
+                            for (const auto& e : code->exceptionTableEntries())
+                                if (prevOff >= e.start_offset && prevOff < e.end_offset) {
+                                    inProtected = true; break;
+                                }
+                            if (forVar && !inProtected
+                                    && insertPlaceholderAtForBodyStart(clean->mutableNodes(), o)) {
+                                remaining.erase(o);
+                                continue;
+                            }
+                        }
+                        /* A stripped statement whose preceding instruction is a
+                           POP_TOP (an expression statement whose value is discarded)
+                           that ends a fall-through `if` body: the NOP is the branch
+                           merge, a sibling right after the `if` (block end == NOP).
+                           insertPlaceholderAfterOff can't anchor it (a POP_TOP has no
+                           AST node of its own), so place it after that block. Skip
+                           when the POP_TOP is inside an exception-table protected
+                           range: there the `if`'s merge anchor is entangled with the
+                           enclosing try/loop unwinding and pycdc regenerates it, so a
+                           placeholder would double the NOP. */
+                        if (prevOp == Pyc::POP_TOP) {
+                            bool inProtected = false;
+                            for (const auto& e : code->exceptionTableEntries())
+                                if (prevOff >= e.start_offset && prevOff < e.end_offset) {
+                                    inProtected = true; break;
+                                }
+                            if (!inProtected
+                                    && insertPlaceholderAfterBlockEndingAt(
+                                           clean->mutableNodes(), o, o))
+                                remaining.erase(o);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     /* Restore leading statements the compiler stripped to bare NOPs (see
        leadingStrippedNops): one `...` placeholder per NOP so the recompiled
        co_code reproduces the original's head-of-body NOPs byte-for-byte. */
     if (cleanBuild && clean != nullptr && !clean->nodes().empty()
-            && leadingStrippedNops(code, mod) > 0
             && !leadingNopAlreadyHandled(clean->nodes().front())) {
-        PycRef<ASTNode> ph = new ASTObject(Pyc_Ellipsis);
-        clean->mutableNodes().insert(clean->mutableNodes().begin(), ph);
+        std::vector<int> leadOffs;
+        int nStripped = leadingStrippedNops(code, mod, &leadOffs, &sigAnchorNopOffs);
+        /* Prepend one `...` per stripped leading statement. Each `...` is a
+           bare-constant expression statement, which recompiles to a line-anchor
+           NOP as long as it is NOT the final statement -- the existing body (or a
+           trailing `pass` pycdc already synthesized for an empty body) keeps the
+           last placeholder non-final, so N placeholders yield N NOPs.
+
+           Injecting MORE than one placeholder is unsafe when the body's first
+           statement is a compound block (`try`/`while`/`for`/... rendered as a
+           NODE_BLOCK): its header carries a line-anchor NOP that pycdc
+           regenerates on its own, so one of the counted leading NOPs belongs to
+           it, not to a stripped statement. Restrict the multi-placeholder case to
+           a simple/`pass`/def front and keep the proven single placeholder when
+           the body opens with a compound block. */
+        PycRef<ASTNode> front = clean->nodes().front();
+        bool frontIsBlock = (front != nullptr
+                && front.type() == ASTNode::NODE_BLOCK);
+        /* A leading `try` (BLK_CONTAINER) or `while` (BLK_WHILE) regenerates one
+           head line-anchor NOP on its own; nested ones (e.g. `try: try:`) each
+           add another. Count that self-regenerated depth by descending through
+           the front's leading try/while blocks so those NOPs are not
+           double-counted as stripped statements. Only try/while are counted
+           (if/for/with/match heads regenerate no head NOP), so this can only
+           under-inject -- never over-inject onto a byte-matching function. */
+        int frontAnchors = 0;
+        {
+            PycRef<ASTNode> n = front;
+            while (n != nullptr && n.type() == ASTNode::NODE_BLOCK) {
+                PycRef<ASTBlock> blk = n.cast<ASTBlock>();
+                ASTBlock::BlkType bt = blk->blktype();
+                if (bt == ASTBlock::BLK_CONTAINER
+                        || (bt == ASTBlock::BLK_WHILE && is_infinite_while(blk))) {
+                    /* Only an infinite `while True:` (like a `try`) regenerates a
+                       leading head anchor NOP. A CONDITIONAL `while cond:` evaluates
+                       its condition first, so its head carries a real instruction
+                       and emits no leading NOP -- counting it wrongly cancels a
+                       genuine stripped leading statement (e.g. a coroutine docstring
+                       before a `while cond:` loop). Treat it like if/for: stop. */
+                    frontAnchors++;
+                    n = blk->nodes().empty() ? nullptr : blk->nodes().front();
+                } else if (bt == ASTBlock::BLK_TRY) {
+                    /* the try body inside a container: descend without counting */
+                    n = blk->nodes().empty() ? nullptr : blk->nodes().front();
+                } else {
+                    break;
+                }
+            }
+        }
+        int nInject;
+        if (frontAnchors > 0) {
+            nInject = nStripped - frontAnchors;
+            if (nInject < 0)
+                nInject = 0;
+        } else {
+            nInject = (nStripped >= 2 && frontIsBlock) ? 0 : nStripped;
+        }
+        /* Insert in reverse so the placeholder for the earliest leading NOP ends
+           up front-most; tag each with its NOP byte offset (the first nInject
+           leading NOPs are the stripped statements) so its width can be set. */
+        for (int k = nInject - 1; k >= 0; k--) {
+            PycRef<ASTNode> ph = new ASTObject(Pyc_Ellipsis);
+            if (k < (int)leadOffs.size())
+                ph->setSrcOff(leadOffs[k]);
+            clean->mutableNodes().insert(clean->mutableNodes().begin(), ph);
+        }
     }
 
+    /* A stripped module docstring can sit before a `from __future__` import -- the
+       one kind of statement allowed to precede it. The `...` placeholder above is
+       skipped for a `__future__` front (leadingNopAlreadyHandled) because `...` is
+       illegal there, but a string-literal docstring IS legal and, compiled under
+       -OO, is stripped to exactly the same head line-anchor NOP. Prepend one such
+       string placeholder when the front is a `__future__` import and the head
+       carries a stripped leading NOP. Only one: a second bare string before a
+       future import is itself a syntax error. */
+    if (cleanBuild && clean != nullptr && !clean->nodes().empty()) {
+        PycRef<ASTNode> front = clean->nodes().front();
+        bool futureFront = front != nullptr && front.type() == ASTNode::NODE_IMPORT
+                && front.cast<ASTImport>()->name() != nullptr
+                && front.cast<ASTImport>()->name().type() == ASTNode::NODE_NAME
+                && front.cast<ASTImport>()->name().cast<ASTName>()->name() != nullptr
+                && front.cast<ASTImport>()->name().cast<ASTName>()->name()->isEqual("__future__");
+        if (futureFront) {
+            std::vector<int> leadOffs;
+            int nStripped = leadingStrippedNops(code, mod, &leadOffs, &sigAnchorNopOffs);
+            if (nStripped >= 1) {
+                PycRef<PycString> str = new PycString(PycObject::TYPE_UNICODE);
+                str->setValue("");
+                PycRef<ASTNode> ph = new ASTObject(str.cast<PycObject>());
+                if (!leadOffs.empty())
+                    ph->setSrcOff(leadOffs[0]);
+                clean->mutableNodes().insert(clean->mutableNodes().begin(), ph);
+            }
+        }
+    }
+
+    /* Recover consts/names orphaned by a stripped `if __debug__:` block (see
+       recoverOrphanTableEntries): render the block instead of a bare `...` so the
+       recompile re-registers the orphaned table entries at their original indices. */
+    if (cleanBuild)
+        recoverOrphanTableEntries(clean, code, mod);
+
+    /* Emit module-level `global` declarations. A `global x` at module scope
+       forces STORE_GLOBAL for x; the decompiler marks such names (markGlobal)
+       but only emits `global` for FUNCTION bodies, so a module's globals are
+       dropped and recompile to STORE_NAME. Emit them at the top of the module
+       body. Skipped when the module has a `from __future__` import (which must
+       be the first statement, so a preceding `global` would be illegal). */
+    if (cleanBuild && clean != nullptr && code.isIdent(mod->code())) {
+        PycCode::globals_t globs = code->getGlobals();
+        bool hasFuture = false;
+        for (const auto& n : clean->nodes()) {
+            if (n != nullptr && n.type() == ASTNode::NODE_IMPORT) {
+                PycRef<ASTNode> nm = n.cast<ASTImport>()->name();
+                if (nm != nullptr && nm.type() == ASTNode::NODE_NAME
+                        && nm.cast<ASTName>()->name() != nullptr
+                        && nm.cast<ASTName>()->name()->isEqual("__future__")) {
+                    hasFuture = true;
+                    break;
+                }
+            }
+        }
+        if (globs.size()) {
+            /* A module `global x` must follow any `from __future__` import (which
+               has to be the module's first statement) but precede x's assignment.
+               When the module leads with future imports, render THOSE first and
+               drop them from the body list, then emit `global` before the rest;
+               otherwise emit it at the very top. `global` produces no bytecode, so
+               placing it after the futures is co_code-neutral. */
+            if (hasFuture) {
+                auto& nodes = clean->mutableNodes();
+                /* Render and drop everything that must precede the `global`: the
+                   leading docstring / stripped-statement placeholder (a NODE_OBJECT)
+                   and the `from __future__` import(s). Stop at the first other
+                   statement (`global` may follow imports; it only has to precede the
+                   assignment of a global name). */
+                while (!nodes.empty() && nodes.front() != nullptr) {
+                    int ft = nodes.front().type();
+                    bool skip = false;
+                    if (ft == ASTNode::NODE_OBJECT) {
+                        skip = true;
+                    } else if (ft == ASTNode::NODE_IMPORT) {
+                        PycRef<ASTNode> nm = nodes.front().cast<ASTImport>()->name();
+                        skip = nm != nullptr && nm.type() == ASTNode::NODE_NAME
+                                && nm.cast<ASTName>()->name() != nullptr
+                                && nm.cast<ASTName>()->name()->isEqual("__future__");
+                    }
+                    if (!skip)
+                        break;
+                    print_src(nodes.front(), mod, pyc_output);
+                    pyc_output << "\n";
+                    nodes.erase(nodes.begin());
+                }
+            }
+            start_line(cur_indent, pyc_output);
+            pyc_output << "global ";
+            bool first = true;
+            for (const auto& glob : globs) {
+                if (!first)
+                    pyc_output << ", ";
+                pyc_output << glob->value();
+                first = false;
+            }
+            pyc_output << "\n";
+        }
+    }
+
+    if (cleanBuild && clean != nullptr)
+        setPlaceholderWidths(clean.cast<ASTNode>(), code, true);
+
+    if (cleanBuild && clean != nullptr)
+        coalesceElifChains(clean->mutableNodes(), true, 0);
+    if (cleanBuild && clean != nullptr)
+        markEpilogueSuppress(clean->mutableNodes(), true, false);
+    /* Enable line-faithful multi-line expression rendering (master switch). Each
+       wrap site further gates on lfSafe(): a specific expression is wrapped only
+       when it carries no nested code object, whose source line the re-wrap would
+       shift (changing its line-anchor NOP -> co_code, the old Fix B wall). A flat
+       expression carries no such NOP, so wrapping it at its recorded element
+       lines is co_code-inert. g_funcHasNestedCode lets a fully flat function skip
+       the per-expression scan. Save/restore around the recursive render. */
+    bool savedLineFaithful = g_lineFaithful;
+    bool savedFuncNested = g_funcHasNestedCode;
+    {
+        bool hasNestedCode = false;
+        if (code->consts() != nullptr) {
+            for (int ci = 0; ci < code->consts()->size(); ci++) {
+                PycRef<PycObject> cc = code->consts()->get(ci);
+                if (cc != nullptr && cc->type() == PycObject::TYPE_CODE) {
+                    hasNestedCode = true;
+                    break;
+                }
+            }
+        }
+        g_funcHasNestedCode = hasNestedCode;
+        g_lineFaithful = true;
+    }
     print_src(source, mod, pyc_output);
+    g_lineFaithful = savedLineFaithful;
+    g_funcHasNestedCode = savedFuncNested;
 
     if (!cleanBuild || !part1clean) {
         start_line(cur_indent, pyc_output);
