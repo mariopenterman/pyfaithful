@@ -1,0 +1,6 @@
+( ( a , b ) , c ) = seq <EOL>
+( a , ( b , c ) ) = seq <EOL>
+( ( a , b ) , ( c , d ) ) = seq <EOL>
+( ( ( a , b ) , c ) , d ) = seq <EOL>
+( i , ( x , y ) ) = seq <EOL>
+( ( p , q ) , r , ( s , t ) ) = seq <EOL>

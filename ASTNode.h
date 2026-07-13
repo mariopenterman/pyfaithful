@@ -109,7 +109,7 @@ private:
 class ASTUnary : public ASTNode {
 public:
     enum UnOp {
-        UN_POSITIVE, UN_NEGATIVE, UN_INVERT, UN_NOT
+        UN_POSITIVE, UN_NEGATIVE, UN_INVERT, UN_NOT, UN_STAR
     };
 
     ASTUnary(PycRef<ASTNode> operand, int op)
@@ -191,15 +191,18 @@ public:
 
 class ASTStore : public ASTNode {
 public:
-    ASTStore(PycRef<ASTNode> src, PycRef<ASTNode> dest)
-        : ASTNode(NODE_STORE), m_src(std::move(src)), m_dest(std::move(dest)) { }
+    ASTStore(PycRef<ASTNode> src, PycRef<ASTNode> dest, bool walrus = false)
+        : ASTNode(NODE_STORE), m_src(std::move(src)), m_dest(std::move(dest)),
+          m_walrus(walrus) { }
 
     PycRef<ASTNode> src() const { return m_src; }
     PycRef<ASTNode> dest() const { return m_dest; }
+    bool isWalrus() const { return m_walrus; }
 
 private:
     PycRef<ASTNode> m_src;
     PycRef<ASTNode> m_dest;
+    bool m_walrus;
 };
 
 
@@ -257,10 +260,15 @@ public:
     const defarg_t& defargs() const { return m_defargs; }
     const defarg_t& kwdefargs() const { return m_kwdefargs; }
 
+    typedef std::list<PycRef<ASTNode>> decorator_t;
+    const decorator_t& decorators() const { return m_decorators; }
+    void addDecorator(PycRef<ASTNode> d) { m_decorators.push_back(std::move(d)); }
+
 private:
     PycRef<ASTNode> m_code;
     defarg_t m_defargs;
     defarg_t m_kwdefargs;
+    decorator_t m_decorators;
 };
 
 
@@ -274,10 +282,15 @@ public:
     PycRef<ASTNode> bases() const { return m_bases; }
     PycRef<ASTNode> name() const { return m_name; }
 
+    typedef std::list<PycRef<ASTNode>> decorator_t;
+    const decorator_t& decorators() const { return m_decorators; }
+    void addDecorator(PycRef<ASTNode> d) { m_decorators.push_back(std::move(d)); }
+
 private:
     PycRef<ASTNode> m_code;
     PycRef<ASTNode> m_bases;
     PycRef<ASTNode> m_name;
+    decorator_t m_decorators;
 };
 
 
@@ -315,20 +328,23 @@ class ASTImport : public ASTNode {
 public:
     typedef std::list<PycRef<ASTStore>> list_t;
 
-    ASTImport(PycRef<ASTNode> name, PycRef<ASTNode> fromlist)
-        : ASTNode(NODE_IMPORT), m_name(std::move(name)), m_fromlist(std::move(fromlist)) { }
+    ASTImport(PycRef<ASTNode> name, PycRef<ASTNode> fromlist, int level = 0)
+        : ASTNode(NODE_IMPORT), m_name(std::move(name)),
+          m_fromlist(std::move(fromlist)), m_level(level) { }
 
     PycRef<ASTNode> name() const { return m_name; }
     list_t stores() const { return m_stores; }
     void add_store(PycRef<ASTStore> store) { m_stores.emplace_back(std::move(store)); }
 
     PycRef<ASTNode> fromlist() const { return m_fromlist; }
+    int level() const { return m_level; }
 
 private:
     PycRef<ASTNode> m_name;
     list_t m_stores;
 
     PycRef<ASTNode> m_fromlist;
+    int m_level;
 };
 
 

@@ -1,0 +1,8 @@
+if ( n := len ( data ) ) > 10 : <EOL>
+<INDENT>
+print ( n ) <EOL>
+<OUTDENT>
+y = ( z := 5 ) + 1 <EOL>
+a = b = c = init ( ) <EOL>
+obj . x = obj . y = 0 <EOL>
+container [ 0 ] = container [ 1 ] = fill ( ) <EOL>
