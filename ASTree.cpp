@@ -10,6 +10,36 @@
 #include "pyc_numeric.h"
 #include "bytecode.h"
 
+/* ==========================================================================
+ * ASTree.cpp -- the decompiler core: Python byte-code -> readable source.
+ *
+ * Decompilation happens in three phases (look for the "PHASE" banners; the
+ * renderer physically sits between the builder and the faithfulness passes):
+ *
+ *   PHASE 1  BuildFromCode()      byte-code  ->  AST
+ *       A stack-machine walk over the instruction stream that rebuilds
+ *       expressions (an operand stack) and statements/control flow (a stack
+ *       of open blocks: if/for/while/try/with/...). This is the large, hard
+ *       part -- 3.11's jump-threaded control flow is reconstructed here.
+ *
+ *   PHASE 2  the faithfulness passes + decompyle()
+ *       Post-build AST transforms that make the reconstructed source
+ *       recompile to the *same* byte-code and source positions as the
+ *       original: recover statements stripped under -OO (placeholders),
+ *       fold if-return chains, suppress the implicit return-None epilogue,
+ *       etc. decompyle() orchestrates build -> transform -> render.
+ *
+ *   PHASE 3  print_src() / print_block()   AST  ->  source text
+ *       A recursive AST printer, plus the layout engine that reproduces the
+ *       original line and column positions (multi-line expressions, compound
+ *       statements, padding). INVARIANT: layout only ever adds whitespace, so
+ *       it never changes the recompiled byte-code.
+ *
+ * Shared state: a number of file-scope flags/maps (e.g. inLambda, cur_indent,
+ * g_lineFaithful) carry context between the phases; each is documented at its
+ * definition below.
+ * ========================================================================== */
+
 // This must be a triple quote (''' or """), to handle interpolated string literals containing the opposite quote style.
 // E.g. f'''{"interpolated "123' literal"}'''    -> valid.
 // E.g. f"""{"interpolated "123' literal"}"""    -> valid.
@@ -386,6 +416,13 @@ static PycRef<ASTNode> recoverFoldedAndOperand(PycRef<ASTNode> left, bool isOr,
                                          ASTBinary::BIN_LOG_AND));
 }
 
+/* ==========================================================================
+ * PHASE 1 -- BuildFromCode: byte-code -> AST
+ * Stack-machine walk over the instruction stream. `stack` holds partial
+ * expressions; `blocks` holds the open statement blocks (if/for/while/try/...).
+ * Most of the size here is 3.11 control-flow reconstruction: matching jumps to
+ * their blocks and coalescing try/except/finally, match, and loop shapes.
+ * ========================================================================== */
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
 {
     PycBuffer source(code->code()->value(), code->code()->length());
@@ -16263,6 +16300,14 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
     return new ASTNodeList(defblock->nodes());
 }
 
+/* ==========================================================================
+ * PHASE 3 -- the renderer: AST -> source text
+ * A recursive printer (print_src / print_block) plus the layout engine
+ * (cmp_prec paren minimization, padToCol, breakBeforeElem, compound-statement
+ * joining). INVARIANT: the layout engine only adds/removes whitespace and
+ * redundant parentheses, so it never changes the recompiled byte-code -- only
+ * the reproduced source positions (co_positions).
+ * ========================================================================== */
 static void append_to_chain_store(const PycRef<ASTNode> &chainStore,
         PycRef<ASTNode> item, FastStack& stack, const PycRef<ASTBlock>& curblock)
 {
@@ -18712,6 +18757,15 @@ static bool stmtEmitsScopeCode(const PycRef<ASTNode>& n)
    empty (cheaply) when the body has no NOPs, and bails on very large bodies
    (lineForOffset is O(log n) cached, but giant generated tables have no NOPs
    anyway). */
+/* ==========================================================================
+ * PHASE 2 -- faithfulness passes + the decompyle() orchestrator
+ * Post-build AST transforms that make the reconstructed source recompile to
+ * the SAME byte-code and source positions as the original: recover statements
+ * stripped under -OO as placeholders, recover orphaned constant/name table
+ * entries, fold terminal if-return chains into if/elif/else, suppress the
+ * implicit return-None epilogue, and reproduce multi-line layout. decompyle()
+ * (at the end) ties the phases together: build -> transform -> render.
+ * ========================================================================== */
 static std::vector<int> collectStrippedNops(PycRef<PycCode> code, PycModule* mod,
                                             const std::set<int>& exclude)
 {
