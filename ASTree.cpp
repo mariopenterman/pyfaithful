@@ -523,6 +523,7 @@ private:
     void handleCopy(int operand);
     void handleReturnValue();
     void handleLoadConst(int operand);
+    void handleJumpForward();
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -665,6 +666,22 @@ private:
     /* True while a comprehension's trailing filter (`if cond`) is still being
        threaded forward onto the comprehension's condition. */
     bool compFilterFwd = false;
+    // --- state promoted for handleJumpForward ---
+    std::unordered_map<int,int> dupForBreakJF;
+    std::unordered_map<int,int> dupForBreakIfEnd;
+    std::unordered_set<int> nestedElseHandlerVals;
+    std::set<int> forExitFallThrough;
+    std::set<int> doubleBreakContLoop;
+    std::unordered_map<int, int> chainWhileBottomExit;
+    std::unordered_set<int> openFinallyTargets;
+    std::unordered_map<int, int> finallyCopySkip;
+    std::unordered_map<int, int> chainedBareExcept;
+    std::vector<std::pair<int,int> > excHandlerSpan;
+    std::unordered_map<int, int> exceptElseAt;
+    std::unordered_map<int, int> elseBoundaryByTryEnd;
+    std::unordered_map<int, PycRef<ASTNode> > teoElseAbsorbRet;
+    bool onlyPaddingBetween(int from, int to);
+    PycRef<ASTBlock> teoSplitElse(PycRef<ASTBlock> tryb);
 };
 
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
@@ -680,18 +697,6 @@ PycRef<ASTNode> CodeBuilder::build()
        no-op fillers the compiler inserted are skipped. Used so a forward
        jump can still be recognised as targeting a loop exit even when a
        stray NOP sits between the recorded exit and the jump target. */
-    auto onlyPaddingBetween = [&](int from, int to) -> bool {
-        if (from > to) return false;
-        PycBuffer s(code->code()->value(), code->code()->length());
-        s.setPos(from);
-        int o, a, p = from;
-        while (p < to && !s.atEof()) {
-            bc_next(s, mod, o, a, p);
-            if (o != Pyc::NOP && o != Pyc::CACHE)
-                return false;
-        }
-        return p == to;
-    };
 
     defblock = new ASTBlock(ASTBlock::BLK_MAIN);
     defblock->init();
@@ -1140,8 +1145,6 @@ PycRef<ASTNode> CodeBuilder::build()
     };
     std::unordered_map<int, FinallyCoalesce> finallyPlanByTarget;
     std::unordered_set<int> finallyP1Wrap;
-    std::unordered_map<int, int> finallyCopySkip;
-    std::unordered_set<int> openFinallyTargets;
     /* Targets of an EMPTY finally (`try: B finally: pass`): the handler is just
        PUSH_EXC_INFO; RERAISE 0 (no body). The try-close emits an empty BLK_FINALLY
        and resumes directly at `after` (past the dead handler) WITHOUT jumping to a
@@ -1208,7 +1211,6 @@ PycRef<ASTNode> CodeBuilder::build()
     std::unordered_set<int> orReconFinalNoNeg;
     std::unordered_set<int> orReconLoopBody;
     std::unordered_map<int, int> finElseAt;
-    std::unordered_map<int, int> exceptElseAt;
     std::set<ASTBlock*> exceptElseNoCollapse;
     std::unordered_set<int> elseStartOffsets;
     /* else-starts admitted by the two-typed-clause terminal-else path (asyncio
@@ -1217,9 +1219,7 @@ PycRef<ASTNode> CodeBuilder::build()
        terminal-else starts keep the original BLK_TRY-on-top boundary rule so an
        ordinary try-body tail ending in an `if` is not reshaped into a spurious else. */
     std::unordered_set<int> elseStartMultiClause;
-    std::unordered_map<int, int> elseBoundaryByTryEnd;
     std::unordered_map<int, int> nestedElseHandler;
-    std::unordered_set<int> nestedElseHandlerVals;
     /* TERMINAL-else / terminal try/except (clauses all return/raise): handler offset
        -> post-handler merge M, and whether the handler is a multi-clause chain. The
        clauses have no jump-to-merge, so the LAST clause has no inferable end — bound
@@ -1236,35 +1236,8 @@ PycRef<ASTNode> CodeBuilder::build()
        pre-scan from the LOAD op at the JF target); teoSplitElse appends it into the
        BLK_ELSE, and teoElseAbsorbSuppress marks the JF-target offset so it is not
        re-emitted at function level. */
-    std::unordered_map<int, PycRef<ASTNode> > teoElseAbsorbRet;
     std::unordered_set<int> teoElseAbsorbSuppress;
-    auto teoSplitElse = [&](PycRef<ASTBlock> tryb) -> PycRef<ASTBlock> {
-        if (tryb == nullptr || tryb->blktype() != ASTBlock::BLK_TRY)
-            return PycRef<ASTBlock>(nullptr);
-        auto it = elseBoundaryByTryEnd.find(tryb->end());
-        if (it == elseBoundaryByTryEnd.end())
-            return PycRef<ASTBlock>(nullptr);
-        int bc = it->second;
-        if ((int)tryb->size() <= bc)
-            return PycRef<ASTBlock>(nullptr);
-        PycRef<ASTBlock> elseb = new ASTBlock(ASTBlock::BLK_ELSE, 0, 1);
-        std::list<PycRef<ASTNode> > tail;
-        while ((int)tryb->size() > bc) {
-            tail.push_front(tryb->nodes().back());
-            tryb->removeLast();
-        }
-        for (auto& n : tail)
-            elseb->append(n);
-        /* Absorb the else's shared-tail `return X` (see teoElseAbsorbRet). The
-           else nodes ended at the JUMP_FORWARD that targets the return; append
-           the synthesized return so the else reads `…; return X`. */
-        auto ar = teoElseAbsorbRet.find(tryb->end());
-        if (ar != teoElseAbsorbRet.end())
-            elseb->append(ar->second);
-        return elseb;
-    };
     std::vector<std::pair<int,int> > nestedFinRegions;
-    std::vector<std::pair<int,int> > excHandlerSpan;
     if (mod->verCompare(3, 11) >= 0 && !exception_entries.empty()) {
         const PycString* codeBuf = code->code();
         auto opAt = [&](int off, int& op, int& arg) -> int {
@@ -4071,7 +4044,6 @@ PycRef<ASTNode> CodeBuilder::build()
                 ifElseRaise[E] = M;
         }
     }
-    std::set<int> forExitFallThrough;
     for (const auto& kv : forStartToExit) {
         auto it = opEndingBefore.find(kv.second);
         if (it == opEndingBefore.end())
@@ -4113,7 +4085,6 @@ PycRef<ASTNode> CodeBuilder::build()
        before the exit is a POP_TOP), plus an inner continue back-edge. The two
        breaks' circular guards each disable the other, so the construct mis-renders;
        mark this exact shape so both breaks emit `break`. */
-    std::set<int> doubleBreakContLoop;
     for (const auto& kv : forStartToExit) {
         int s = kv.first, E = kv.second;
         if (!forExitFallThrough.count(s) || !forHasBreak.count(s)
@@ -4447,7 +4418,6 @@ PycRef<ASTNode> CodeBuilder::build()
     }
     for (const auto& lr : loopRanges)
         backedgeCount[lr.start]++;
-    std::unordered_map<int, int> chainedBareExcept;
     std::set<int> forUncondBreak;
     for (const auto& kv : forStartToExit) {
         int fstart = kv.first, E = kv.second;
@@ -4461,8 +4431,6 @@ PycRef<ASTNode> CodeBuilder::build()
         if (it != opEndingBefore.end() && it->second == Pyc::POP_TOP)
             forUncondBreak.insert(E);
     }
-    std::unordered_map<int,int> dupForBreakJF;
-    std::unordered_map<int,int> dupForBreakIfEnd;
     {
         struct II { int op, arg, off, next; };
         std::vector<II> iv;
@@ -5337,7 +5305,6 @@ PycRef<ASTNode> CodeBuilder::build()
     std::unordered_set<int> chainCleanupPop;
     std::unordered_map<int, int> chainIfTrue;
     std::unordered_set<int> chainIfNoneFinal;
-    std::unordered_map<int, int> chainWhileBottomExit;
     std::unordered_set<int> chainAndLeadGuard;
     std::unordered_set<int> chainLeadSkip;
     std::unordered_set<int> chainWhileBwdEnd;
@@ -12046,831 +12013,7 @@ PycRef<ASTNode> CodeBuilder::build()
             break;
         case Pyc::JUMP_FORWARD_A:
         case Pyc::INSTRUMENTED_JUMP_FORWARD_A:
-            {
-                int offs = operand;
-                if (mod->verCompare(3, 10) >= 0)
-                    offs *= sizeof(uint16_t); // // BPO-27129
-
-                if (dupForBreakJF.count(curpos)
-                        && curblock->blktype() == ASTBlock::BLK_IF
-                        && curblock->end() == dupForBreakIfEnd[curpos]
-                        && blocks.size() > 1) {
-                    int E = dupForBreakJF[curpos];
-                    PycRef<ASTBlock> ifb = curblock;
-                    if (!stack_hist.empty())
-                        stack_hist.pop();
-                    blocks.pop();
-                    curblock = blocks.top();
-                    curblock->append(ifb.cast<ASTNode>());
-                    curblock->append(new ASTKeyword(ASTKeyword::KW_BREAK));
-                    source.setPos(E);
-                    pos = E;
-                    break;
-                }
-
-                if ((curblock->blktype() == ASTBlock::BLK_IF
-                            || curblock->blktype() == ASTBlock::BLK_ELIF)
-                        && curblock->end() == curpos
-                        && (pos + offs) >= curblock->end()
-                        && blocks.size() > 2) {
-                    std::stack<PycRef<ASTBlock> > pk = blocks;
-                    pk.pop();
-                    PycRef<ASTBlock> par = pk.top();
-                    if (par->blktype() == ASTBlock::BLK_ELSE
-                            && nestedElseHandlerVals.count(par->end())
-                            && (pos + offs) >= par->end()) {
-                        PycRef<ASTBlock> ifb = curblock;
-                        if (!stack_hist.empty())
-                            stack_hist.pop();
-                        blocks.pop();
-                        curblock = blocks.top();
-                        curblock->append(ifb.cast<ASTNode>());
-                    }
-                }
-
-                if (curblock->blktype() == ASTBlock::BLK_ELSE
-                        && nestedElseHandlerVals.count(curblock->end())
-                        && (pos + offs) >= curblock->end()
-                        && blocks.size() > 1) {
-                    PycRef<ASTBlock> elseb = curblock;
-                    blocks.pop();
-                    curblock = blocks.top();
-                    if (curblock->blktype() == ASTBlock::BLK_CONTAINER
-                            && curblock.cast<ASTContainerBlock>()->hasExcept()) {
-                        if (!stack_hist.empty()) {
-                            stack = stack_hist.top();
-                            stack_hist.pop();
-                        }
-                        curblock->append(elseb.cast<ASTNode>());
-                        stack_hist.push(stack);
-                        PycRef<ASTBlock> except = new ASTCondBlock(ASTBlock::BLK_EXCEPT, 0, NULL, false);
-                        except->init();
-                        blocks.push(except.cast<ASTBlock>());
-                        curblock = blocks.top();
-                        break;
-                    }
-                    blocks.push(elseb.cast<ASTBlock>());
-                    curblock = elseb;
-                }
-
-                if (!stack.empty() && stack.top() != nullptr
-                        && stack.top().type() == ASTNode::NODE_CHAINCOMPARE) {
-                    int target = pos + offs;
-                    source.setPos(target);
-                    pos = target;
-                    break;
-                }
-
-                if (curblock->blktype() != ASTBlock::BLK_CONTAINER) {
-                    int btarget = pos + offs;
-                    bool isBreak = false;
-                    for (const auto& lr : loopRanges) {
-                        /* WHILE-loop continue back-edge: when a LATER back-edge to the
-                           same header exists, this earlier back-edge is a `continue` and
-                           its recorded exit (right after it) is an if/elif MERGE inside
-                           the loop, not the loop exit — so a forward jump-over-else
-                           landing there must NOT be read as a `break` (aiohttp/multipart
-                           parse_content_disposition). The for-loop analogue is the
-                           contBE handling below; this covers while loops (lr.start not a
-                           FOR_ITER start). Scoped to ranges with a later sibling
-                           back-edge so a single-back-edge while still detects real
-                           breaks. */
-                        if (!forStartToExit.count(lr.start)) {
-                            bool laterBE = false;
-                            for (const auto& lr2 : loopRanges)
-                                if (lr2.start == lr.start && lr2.end > lr.end) {
-                                    laterBE = true; break;
-                                }
-                            if (laterBE)
-                                continue;
-                        }
-                        bool contBE = forStartToExit.count(lr.start)
-                                && forStartToExit.at(lr.start) != lr.exit;
-                        if (contBE) {
-                            bool hasTailBE = false;
-                            for (const auto& lr2 : loopRanges)
-                                if (lr2.start == lr.start && lr2.end > lr.end) {
-                                    hasTailBE = true; break;
-                                }
-                            if (hasTailBE
-                                    || (forExitFallThrough.count(lr.start)
-                                        && !doubleBreakContLoop.count(lr.start)))
-                                continue;
-                        }
-                        bool toExit = (lr.exit == btarget)
-                                || (lr.exit < btarget
-                                    && onlyPaddingBetween(lr.exit, btarget))
-                                || (forElseMerge.count(lr.exit)
-                                    && forElseMerge[lr.exit] == btarget)
-                                || (contBE
-                                    && forStartToExit.at(lr.start) == btarget)
-                                || (chainWhileBottomExit.count(lr.end)
-                                    && chainWhileBottomExit.at(lr.end) == btarget);
-                        /* A jump landing on a rotated-while continue-merge (the
-                           offset right after a mid-body `continue` back-edge, with
-                           loop-body tail following) is a jump-over-else, NOT a
-                           break — see whileContMerge in the while-True end scan. */
-                        if (whileContMerge.count(btarget))
-                            toExit = false;
-                        /* This loopRange is a rotated-`while cond:` CONTINUE back-edge
-                           (unconditional JUMP_BACKWARD to the header) whose `exit`
-                           (right after it) is the loop's CONDITIONAL bottom re-test,
-                           not the loop exit (see rotWhileContinueExit). A forward jump
-                           landing there is the body's normal completion falling through
-                           INTO the bottom re-test — NOT a break. */
-                        if (rotWhileContinueExit.count(lr.exit) && lr.exit == btarget)
-                            toExit = false;
-                        if (toExit && curpos >= lr.start && curpos < lr.end) {
-                            isBreak = true;
-                            break;
-                        }
-                    }
-                    if (!isBreak) {
-                        int btarget2 = pos + offs;
-                        for (const auto& kv : forStartToExit) {
-                            if (btarget2 == kv.second
-                                    && curpos >= kv.first && curpos < kv.second
-                                    && !forElseMerge.count(kv.second)
-                                    && ((!forExitFallThrough.count(kv.first)
-                                         && !forBreakBeyondExit.count(kv.first))
-                                        || doubleBreakContLoop.count(kv.first))) {
-                                isBreak = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (!isBreak) {
-                        int btarget2b = pos + offs;
-                        for (const auto& kv : forStartToExit) {
-                            int s = kv.first, E = kv.second;
-                            if (forElseBreakLoop.count(s)
-                                    && forElseMerge.count(E) && forElseMerge[E] == btarget2b
-                                    && curpos >= s && curpos < E) {
-                                isBreak = true;
-                                break;
-                            }
-                        }
-                    }
-                    if (!isBreak && curblock->blktype() == ASTBlock::BLK_TRY) {
-                        int btarget3 = pos + offs;
-                        for (const auto& kv : forStartToExit) {
-                            if (forElseMerge.count(kv.second)
-                                    && forElseMerge[kv.second] == btarget3
-                                    && curpos >= kv.first && curpos < kv.second) {
-                                curblock->append(new ASTKeyword(ASTKeyword::KW_BREAK));
-                                break;
-                            }
-                        }
-                    }
-                    if (isBreak) {
-                        while (blocks.size() > 1
-                                && (curblock->blktype() == ASTBlock::BLK_IF
-                                    || curblock->blktype() == ASTBlock::BLK_ELSE)
-                                && curblock->end() == curpos) {
-                            PycRef<ASTBlock> ib = curblock;
-                            if (!stack_hist.empty())
-                                stack_hist.pop();
-                            blocks.pop();
-                            curblock = blocks.top();
-                            curblock->append(ib.cast<ASTNode>());
-                        }
-                        curblock->append(new ASTKeyword(ASTKeyword::KW_BREAK));
-                        break;
-                    }
-                    {
-                        int btC = pos + offs;
-                        bool isWtContinue = false;
-                        /* The continue recovery above must NOT fire when this
-                           JUMP_FORWARD is the mandatory jump the last elif of an
-                           if/elif/else chain makes to skip its OWN else clause(s). That
-                           case is locally identical to a trailing `continue` (an arm
-                           whose body ends in a forward jump over a run of terminal
-                           blocks to the loop's shared back-edge), but the skipped region
-                           is the chain's else-arms, not trailing loop-body code, so a
-                           `continue` is wrong and recompiles to a per-arm back-edge.
-                           Tell them apart by a SIBLING arm: in an if/elif/else chain the
-                           earlier arms' bodies each end in an unconditional JUMP_FORWARD
-                           to the SAME merge (here the loop's shared back-edge btC), so a
-                           preceding JUMP_FORWARD->btC marks a chain merge. A genuine
-                           lone `continue` has no preceding arm jumping to btC. Paired
-                           with the nTerm>=2 gate (a one-armed if/else has a single
-                           terminal block and never reaches here) this is reliable. */
-                        {
-                            PycBuffer es(code->code()->value(), code->code()->length());
-                            es.setPos(0);
-                            int eo, ea, ep = 0;
-                            while (ep < curpos && !es.atEof()) {
-                                bc_next(es, mod, eo, ea, ep);
-                                if (eo == Pyc::JUMP_FORWARD_A
-                                        && ep + ea * (int)sizeof(uint16_t) == btC) {
-                                    isWtContinue = false;
-                                    goto wtDone;
-                                }
-                            }
-                        }
-                        for (const auto& lr : loopRanges) {
-                            if (lr.end != btC || !whileTrueHdr.count(lr.start)
-                                    || curpos < lr.start || curpos >= lr.end)
-                                continue;
-                            int nBack = 0;
-                            for (const auto& lr2 : loopRanges)
-                                if (lr2.start == lr.start) nBack++;
-                            if (nBack != 1)
-                                continue;
-                            PycBuffer rs(code->code()->value(), code->code()->length());
-                            rs.setPos(pos);
-                            int ro, ra, rp = pos, nTerm = 0;
-                            bool clean = true;
-                            while (rp < btC && !rs.atEof()) {
-                                bc_next(rs, mod, ro, ra, rp);
-                                if (ro == Pyc::RETURN_VALUE || ro == Pyc::RETURN_CONST_A
-                                        || ro == Pyc::RAISE_VARARGS_A) { nTerm++; continue; }
-                                if (ro == Pyc::POP_JUMP_FORWARD_IF_FALSE_A || ro == Pyc::POP_JUMP_FORWARD_IF_TRUE_A
-                                        || ro == Pyc::POP_JUMP_FORWARD_IF_NONE_A || ro == Pyc::POP_JUMP_FORWARD_IF_NOT_NONE_A
-                                        || ro == Pyc::POP_JUMP_BACKWARD_IF_FALSE_A || ro == Pyc::POP_JUMP_BACKWARD_IF_TRUE_A
-                                        || ro == Pyc::JUMP_FORWARD_A || ro == Pyc::JUMP_BACKWARD_A
-                                        || ro == Pyc::JUMP_BACKWARD_NO_INTERRUPT_A || ro == Pyc::JUMP_ABSOLUTE_A
-                                        || ro == Pyc::JUMP_IF_TRUE_OR_POP_A || ro == Pyc::JUMP_IF_FALSE_OR_POP_A
-                                        || ro == Pyc::FOR_ITER_A || ro == Pyc::SEND_A
-                                        || ro == Pyc::SETUP_FINALLY_A || ro == Pyc::SETUP_EXCEPT_A
-                                        || ro == Pyc::PUSH_EXC_INFO || ro == Pyc::POP_EXCEPT
-                                        || ro == Pyc::CHECK_EXC_MATCH) { clean = false; break; }
-                            }
-                            if (clean && nTerm >= 2 && rp == btC) {
-                                isWtContinue = true;
-                                break;
-                            }
-                        }
-                    wtDone:
-                        if (isWtContinue) {
-                            curblock->append(new ASTKeyword(ASTKeyword::KW_CONTINUE));
-                            break;
-                        }
-                    }
-                }
-
-                if (curblock->blktype() == ASTBlock::BLK_CONTAINER) {
-                    PycRef<ASTContainerBlock> cont = curblock.cast<ASTContainerBlock>();
-                    if (cont->hasExcept()) {
-                        stack_hist.push(stack);
-
-                        curblock->setEnd(pos+offs);
-                        PycRef<ASTBlock> except = new ASTCondBlock(ASTBlock::BLK_EXCEPT, pos+offs, NULL, false);
-                        except->init();
-                        blocks.push(except);
-                        curblock = blocks.top();
-                    }
-                    break;
-                }
-
-                if (!stack_hist.empty()) {
-                    if (stack.empty()) // if it's part of if-expression, TOS at the moment is the result of "if" part
-                        stack = stack_hist.top();
-                    stack_hist.pop();
-                }
-
-                if (curblock->blktype() == ASTBlock::BLK_TRY
-                        && openFinallyTargets.count(curblock->end())
-                        && offs != 0 && pos + offs > curpos
-                        && pos + offs < curblock->end()) {
-                    source.setPos(pos + offs);
-                    pos = pos + offs;
-                    break;
-                }
-
-                PycRef<ASTBlock> prev = curblock;
-                PycRef<ASTBlock> nil;
-                bool push = true;
-                int exceptToMerge = -1;
-                bool siblingExceptFollows = false;
-                if (offs != 0 && finallyCopySkip.count(pos + offs)) {
-                    PycBuffer sk(code->code()->value(), code->code()->length());
-                    int cur = pos, target = pos + offs;
-                    sk.setPos(cur);
-                    while (cur < target && !sk.atEof()) {
-                        int so, sa, sp = cur;
-                        bc_next(sk, mod, so, sa, sp);
-                        if (so == Pyc::CHECK_EXC_MATCH) { siblingExceptFollows = true; break; }
-                        /* A trailing BARE `except:` sibling has no CHECK_EXC_MATCH — it
-                           begins with a POP_TOP at the start of its own handler exception
-                           entry. When a typed clause inside a try/finally jumps over such
-                           a bare clause to the finally copy, the bare clause must still be
-                           rendered, so treat it as a following sibling too (else the
-                           finally-skip swallows it). */
-                        if (so == Pyc::POP_TOP) {
-                            for (const auto& e : exception_entries)
-                                if (e.start_offset == cur && e.push_lasti) {
-                                    siblingExceptFollows = true; break;
-                                }
-                            /* A bare `except:` that is the fall-through of a typed
-                               except-chain with an `as e` binding is preceded by the typed
-                               clause's own exceptional `del e` cleanup, so the shared lasti
-                               protection entry starts BEFORE the bare clause's POP_TOP (at
-                               the cleanup, not the POP_TOP). The entry-start test above then
-                               misses it. The typed clause's fireBare scan has already
-                               recorded this bare-clause start in chainedBareExcept; honour
-                               that as the authoritative bare-except sibling marker so the
-                               finally-copy skip does not swallow the clause. */
-                            if (!siblingExceptFollows && chainedBareExcept.count(cur))
-                                siblingExceptFollows = true;
-                            if (siblingExceptFollows) break;
-                        }
-                        if (sp <= cur) break;
-                        cur = sp;
-                    }
-                }
-
-                do {
-                    if (blocks.empty())
-                        throw std::runtime_error("except-merge block underflow");
-                    blocks.pop();
-
-                    PycRef<ASTBlock> teoElse = teoSplitElse(prev);
-                    if (!blocks.empty())
-                        blocks.top()->append(prev.cast<ASTNode>());
-                    if (teoElse != nullptr && !blocks.empty())
-                        blocks.top()->append(teoElse.cast<ASTNode>());
-
-                    if (prev->blktype() == ASTBlock::BLK_EXCEPT
-                            && offs != 0 && finallyCopySkip.count(pos + offs)
-                            && !siblingExceptFollows) {
-                        exceptToMerge = pos + offs;
-                        if (!blocks.empty()) {
-                            prev = blocks.top();
-                            continue;
-                        }
-                        prev = nil;
-                    } else if (prev->blktype() == ASTBlock::BLK_IF
-                            || prev->blktype() == ASTBlock::BLK_ELIF) {
-                        if (offs == 0) {
-                            prev = nil;
-                            continue;
-                        }
-
-                        if (prev->end() == curpos && !blocks.empty()) {
-                            bool qualifies = false;
-                            std::stack<PycRef<ASTBlock> > sc = blocks;
-                            while (!sc.empty()) {
-                                PycRef<ASTBlock> b = sc.top(); sc.pop();
-                                ASTBlock::BlkType tb = b->blktype();
-                                if (tb == ASTBlock::BLK_TRY
-                                        && b->end() >= pos
-                                        && b->end() < pos + offs) {
-                                    qualifies = true; break;
-                                }
-                                if (tb == ASTBlock::BLK_IF || tb == ASTBlock::BLK_ELIF) {
-                                    if (b->end() > curpos && b->end() < pos + offs) {
-                                        qualifies = true; break;
-                                    }
-                                    if (b->end() == curpos)
-                                        continue;
-                                }
-                                if (tb == ASTBlock::BLK_ELSE
-                                        && b->end() >= curpos && b->end() <= pos + offs)
-                                    continue;
-                                break;
-                            }
-                            if (qualifies) {
-                                prev = blocks.top();
-                                continue;
-                            }
-                        }
-
-                        if (push) {
-                            stack_hist.push(stack);
-                        }
-                        PycRef<ASTBlock> next = new ASTBlock(ASTBlock::BLK_ELSE, pos+offs);
-                        if (prev->inited() == ASTCondBlock::PRE_POPPED) {
-                            next->init(ASTCondBlock::PRE_POPPED);
-                        }
-
-                        blocks.push(next.cast<ASTBlock>());
-                        prev = nil;
-                    } else if (prev->blktype() == ASTBlock::BLK_EXCEPT) {
-                        if (offs == 0) {
-                            prev = nil;
-                            continue;
-                        }
-
-                        {
-                            int spanA = -1, bestT = -1;
-                            for (const auto& sp : excHandlerSpan) {
-                                if (sp.first <= curpos && curpos < sp.second
-                                        && sp.first > bestT) {
-                                    bestT = sp.first; spanA = sp.second;
-                                }
-                            }
-                            if (spanA > 0 && spanA < pos + offs) {
-                                bool siblingFollows = false;
-                                int opAtA = -1, aArg = 0, aNext = spanA;
-                                {
-                                    PycBuffer ck(code->code()->value(), code->code()->length());
-                                    ck.setPos(pos);
-                                    int ko, ka, kp = pos;
-                                    while (kp < spanA && !ck.atEof()) {
-                                        int kip = kp;
-                                        bc_next(ck, mod, ko, ka, kp);
-                                        if (ko == Pyc::CHECK_EXC_MATCH) {
-                                            siblingFollows = true; break;
-                                        }
-                                        if (kp <= kip) break;
-                                    }
-                                    PycBuffer ak(code->code()->value(), code->code()->length());
-                                    ak.setPos(spanA);
-                                    if (!ak.atEof())
-                                        bc_next(ak, mod, opAtA, aArg, aNext);
-                                }
-                                if (!siblingFollows) {
-                                    bool fire = false, openElse = false;
-                                    bool dupReturnMerge = false;
-                                    int dupRetSpanRet = -1, dupRetTgtRet = -1;
-                                    if (opAtA == Pyc::JUMP_FORWARD_A
-                                            || opAtA == Pyc::INSTRUMENTED_JUMP_FORWARD_A) {
-                                        fire = true;
-                                    } else {
-                                        std::stack<PycRef<ASTBlock> > sc = blocks;
-                                        bool encl = false;
-                                        if (!sc.empty()
-                                                && sc.top()->blktype() == ASTBlock::BLK_CONTAINER) {
-                                            sc.pop();
-                                            /* Peel through intervening BLK_ELSE arms whose
-                                               body's last statement is this try/except — the
-                                               else shares the resume merge so its end is
-                                               >= A. The real owner of the resume (the
-                                               enclosing BLK_IF/BLK_ELIF whose false-target
-                                               is A) sits just below it (`elif X: if c: …
-                                               else: try/except` nested in an outer `elif Y:`
-                                               — the inner if-else holds the try/except and A
-                                               is the outer arm's own `else`). Without
-                                               peeling, the spurious bare `except:` opens and
-                                               swallows the sibling arm(s). */
-                                            while (!sc.empty()
-                                                    && sc.top()->blktype() == ASTBlock::BLK_ELSE
-                                                    && sc.top()->end() >= spanA)
-                                                sc.pop();
-                                            if (!sc.empty()) {
-                                                if ((sc.top()->blktype() == ASTBlock::BLK_IF
-                                                        || sc.top()->blktype() == ASTBlock::BLK_ELIF)
-                                                        && sc.top()->end() == spanA)
-                                                    encl = true;
-                                            }
-                                        }
-                                        if (encl) {
-                                            fire = true;
-                                            openElse = true;
-                                        }
-                                    }
-                                    /* No sibling except follows and the JUMP_FORWARD
-                                       overshoots the inner handler's natural merge
-                                       (spanA) because this whole try/except is the LAST
-                                       statement of an ENCLOSING `except E as v:` handler
-                                       — its normal-exit jump lands on the enclosing
-                                       handler's `as v` name-cleanup rather than on spanA.
-                                       spanA itself is a DIFFERENT copy of that same
-                                       cleanup (the inner-try body-success path). Without
-                                       this, the fall-through below opens a spurious
-                                       swallowing bare `except:` over the cleanup copy
-                                       (asyncio BaseEventLoop.call_exception_handler:
-                                       `except BaseException as exc: try: … except
-                                       (SystemExit,KeyboardInterrupt): raise except
-                                       BaseException: log`). Detect the shape by the
-                                       compiler-generated `as v` cleanup at spanA:
-                                       POP_EXCEPT; LOAD_CONST None; STORE_FAST v;
-                                       DELETE_FAST v (same v). Close the inner except at
-                                       spanA so the enclosing handler renders its own
-                                       implicit cleanup. Tightly gated to that exact
-                                       byte sequence; no else opened. */
-                                    if (!fire && opAtA == Pyc::POP_EXCEPT) {
-                                        PycBuffer ns(code->code()->value(),
-                                                code->code()->length());
-                                        ns.setPos(spanA);
-                                        int no, na, np = spanA;
-                                        auto step = [&]() -> bool {
-                                            int ip = np;
-                                            if (ns.atEof()) return false;
-                                            bc_next(ns, mod, no, na, np);
-                                            return np > ip;
-                                        };
-                                        bool asVarCleanup = false;
-                                        if (step() && no == Pyc::POP_EXCEPT
-                                                && step() && no == Pyc::LOAD_CONST_A
-                                                && step() && no == Pyc::STORE_FAST_A) {
-                                            int storeVar = na;
-                                            if (step() && no == Pyc::DELETE_FAST_A
-                                                    && na == storeVar)
-                                                asVarCleanup = true;
-                                        }
-                                        if (asVarCleanup)
-                                            fire = true;
-                                    }
-                                    /* No sibling except follows and the except
-                                       handler's normal-exit JUMP_FORWARD overshoots
-                                       its own try/except's natural merge (spanA)
-                                       because the try has an `else:` clause whose
-                                       body already falls through to a bare
-                                       `return None` AT spanA. The compiler emits a
-                                       SECOND identical `return None` for the except
-                                       handler's normal exit and the JUMP_FORWARD
-                                       targets that duplicate (pos+offs) rather than
-                                       spanA. Without this, the fall-through below
-                                       opens a spurious swallowing bare `except:
-                                       return None` over the else-return copy at
-                                       spanA — dropping the else and adding a
-                                       swallowing handler (mailbox._lock_file:
-                                       `try: os.link…; dotlock_done=True except
-                                       (AttributeError,PermissionError): os.rename…
-                                       else: os.unlink`). Detect the shape by an
-                                       identical `LOAD_CONST c; RETURN_VALUE` at BOTH
-                                       spanA and the JUMP_FORWARD target. Close the
-                                       except at spanA so the else renders and the
-                                       duplicate return is skipped. Tightly gated to
-                                       that exact byte pattern; no else opened. */
-                                    if (!fire
-                                            && opAtA == Pyc::LOAD_CONST_A) {
-                                        int spanConst = aArg, spanOp = opAtA;
-                                        /* op right after the LOAD_CONST at spanA */
-                                        int so2 = -1, sa2 = 0, sp2 = aNext;
-                                        {
-                                            PycBuffer ss(code->code()->value(),
-                                                    code->code()->length());
-                                            ss.setPos(aNext);
-                                            if (!ss.atEof())
-                                                bc_next(ss, mod, so2, sa2, sp2);
-                                        }
-                                        /* LOAD_CONST c; RETURN_VALUE at the target */
-                                        int to0 = -1, ta0 = 0, tp0 = pos + offs;
-                                        int to1 = -1, ta1 = 0, tp1 = pos + offs;
-                                        {
-                                            PycBuffer ts(code->code()->value(),
-                                                    code->code()->length());
-                                            ts.setPos(pos + offs);
-                                            if (!ts.atEof())
-                                                bc_next(ts, mod, to0, ta0, tp0);
-                                            ts.setPos(tp0);
-                                            if (!ts.atEof())
-                                                bc_next(ts, mod, to1, ta1, tp1);
-                                        }
-                                        if (so2 == Pyc::RETURN_VALUE
-                                                && to0 == Pyc::LOAD_CONST_A
-                                                && ta0 == spanConst
-                                                && to1 == Pyc::RETURN_VALUE) {
-                                            (void)spanOp;
-                                            dupReturnMerge = true;
-                                            dupRetSpanRet = aNext; /* RETURN_VALUE at spanA */
-                                            dupRetTgtRet = tp0;    /* RETURN_VALUE at target */
-                                        }
-                                    }
-                                    if (dupReturnMerge) {
-                                        /* Close the except; merge at the try/except's
-                                           natural merge (spanA = the else-body's
-                                           normal-exit `return None` copy). Record both
-                                           duplicate `return None` copies' RETURN_VALUE
-                                           offsets (else-body copy at spanA and the
-                                           except-handler copy at pos+offs) as
-                                           suppressible implicit epilogues so neither
-                                           renders as an explicit statement. */
-                                        dupRetNoneSkip.insert(dupRetSpanRet);
-                                        dupRetNoneSkip.insert(dupRetTgtRet);
-                                        exceptToMerge = spanA;
-                                        if (!blocks.empty()) {
-                                            prev = blocks.top();
-                                            continue;
-                                        }
-                                        prev = nil;
-                                        continue;
-                                    }
-                                    if (fire) {
-                                        exceptToMerge = spanA;
-                                        if (openElse && !blocks.empty()
-                                                && blocks.top()->blktype() == ASTBlock::BLK_CONTAINER) {
-                                            PycRef<ASTBlock> cont = blocks.top();
-                                            blocks.pop();
-                                            if (!blocks.empty())
-                                                blocks.top()->append(cont.cast<ASTNode>());
-                                        }
-                                        if (!blocks.empty()) {
-                                            prev = blocks.top();
-                                            continue;
-                                        }
-                                        prev = nil;
-                                        continue;
-                                    }
-                                }
-                            }
-                        }
-
-                        /* A try/except whose entire body lives on the true-branch of an
-                           `if C:` that is itself the last statement before an ENCLOSING
-                           try/finally's normal-exit jump: the try body's own normal-exit
-                           JUMP_FORWARD skips the post-handler merge and jumps straight to
-                           the finally, so the container (and hence this typed except) took
-                           the finally target as its end. When control finally reaches that
-                           JUMP_FORWARD instruction (curpos), the handler's natural merge —
-                           the end A of its excHandlerSpan (T, A) — sits exactly AT curpos,
-                           so the `curpos < A` span lookup above missed it and spanA came back
-                           -1. Without this, the fall-through opens a spurious swallowing bare
-                           `except:` spanning [curpos, finally) that absorbs the enclosing
-                           `else:` branch (logging.config DictConfigurator.configure:
-                           `if root: try: self.configure_root(root, True) except Exception as
-                           e: raise …`). Detect the exact shape — a handler span ending at
-                           curpos, the op at curpos is this JUMP_FORWARD, and the except
-                           over-extended to the JUMP target (prev->end() == pos+offs > A) —
-                           and close the except at A (== curpos) instead of opening a bare
-                           except. Resuming at A re-processes the JUMP_FORWARD at the
-                           enclosing level so the `if`/`else` structure closes normally. */
-                        if (exceptToMerge < 0 && offs != 0) {
-                            bool spanEndsAtCur = false;
-                            for (const auto& sp : excHandlerSpan)
-                                if (sp.second == curpos && sp.first < curpos) {
-                                    spanEndsAtCur = true; break;
-                                }
-                            if (spanEndsAtCur
-                                    && prev->end() == pos + offs
-                                    && pos + offs > curpos) {
-                                exceptToMerge = curpos;
-                                if (!blocks.empty()) {
-                                    prev = blocks.top();
-                                    continue;
-                                }
-                                prev = nil;
-                                continue;
-                            }
-                        }
-
-                        bool lastNested = false;
-                        if (prev->end() > 0 && !blocks.empty()) {
-                            PycBuffer pk(code->code()->value(), code->code()->length());
-                            pk.setPos(prev->end());
-                            if (!pk.atEof()) {
-                                int po, pa, pp;
-                                bc_next(pk, mod, po, pa, pp);
-                                if (po == Pyc::RERAISE || po == Pyc::RERAISE_A) {
-                                    std::stack<PycRef<ASTBlock> > sc = blocks;
-                                    while (!sc.empty()) {
-                                        PycRef<ASTBlock> b = sc.top(); sc.pop();
-                                        if (b->blktype() == ASTBlock::BLK_TRY
-                                                && b->end() > pos
-                                                && b->end() < pos + offs) {
-                                            lastNested = true; break;
-                                        }
-                                        if (b->blktype() == ASTBlock::BLK_ELSE
-                                                && nestedElseHandlerVals.count(b->end())
-                                                && b->end() > pos
-                                                && b->end() <= pos + offs) {
-                                            lastNested = true; break;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if (lastNested) {
-                            prev = blocks.top();
-                            continue;
-                        }
-
-                        if (push) {
-                            stack_hist.push(stack);
-                        }
-                        int sibEnd = pos + offs;
-                        {
-                            std::stack<PycRef<ASTBlock> > sc = blocks;
-                            while (!sc.empty()) {
-                                PycRef<ASTBlock> b = sc.top(); sc.pop();
-                                if (b->blktype() == ASTBlock::BLK_ELSE
-                                        && nestedElseHandlerVals.count(b->end())
-                                        && b->end() > pos && b->end() < sibEnd) {
-                                    sibEnd = b->end(); break;
-                                }
-                            }
-                        }
-                        PycRef<ASTBlock> next = new ASTCondBlock(ASTBlock::BLK_EXCEPT, sibEnd, NULL, false);
-                        next->init();
-
-                        blocks.push(next.cast<ASTBlock>());
-                        prev = nil;
-                    } else if (prev->blktype() == ASTBlock::BLK_ELSE) {
-                        /* Special case */
-                        if (blocks.empty() || (!push && stack_hist.empty()))
-                            throw std::runtime_error("except-else block/stack underflow");
-                        prev = blocks.top();
-                        if (!push) {
-                            stack = stack_hist.top();
-                            stack_hist.pop();
-                        }
-                        push = false;
-
-                        if (prev->blktype() == ASTBlock::BLK_MAIN) {
-                            /* Something went out of control! */
-                            prev = nil;
-                        }
-                    } else if (prev->blktype() == ASTBlock::BLK_TRY
-                            && prev->end() < pos+offs) {
-                        /* Need to add an except/finally block */
-                        if (!stack_hist.empty()) {
-                            stack = stack_hist.top();
-                            stack_hist.pop();
-                        }
-
-                        if (blocks.top()->blktype() == ASTBlock::BLK_CONTAINER) {
-                            PycRef<ASTContainerBlock> cont = blocks.top().cast<ASTContainerBlock>();
-                            if (cont->hasExcept()) {
-                                if (push) {
-                                    stack_hist.push(stack);
-                                }
-
-                                PycRef<ASTBlock> except = new ASTCondBlock(ASTBlock::BLK_EXCEPT, pos+offs, NULL, false);
-                                except->init();
-                                blocks.push(except);
-                            }
-                        } else {
-                            fprintf(stderr, "Something TERRIBLE happened!!\n");
-                        }
-                        prev = nil;
-                    } else if ((prev->blktype() == ASTBlock::BLK_FOR
-                                || prev->blktype() == ASTBlock::BLK_WHILE)
-                            && offs != 0
-                            && !blocks.empty()
-                            && (blocks.top()->blktype() == ASTBlock::BLK_IF
-                                || blocks.top()->blktype() == ASTBlock::BLK_ELIF)
-                            && blocks.top()->end() == pos
-                            && pos + offs > blocks.top()->end()) {
-                        if (prev->blktype() == ASTBlock::BLK_FOR
-                                && backedgeCount[prev.cast<ASTIterBlock>()->start()] == 0)
-                            prev->append(new ASTKeyword(ASTKeyword::KW_BREAK));
-                        prev = blocks.top();
-                        continue;
-                    } else {
-                        prev = nil;
-                    }
-
-                } while (prev != nil);
-
-                if (!blocks.empty()) {
-                    curblock = blocks.top();
-                    if (exceptToMerge < 0 && curblock->blktype() == ASTBlock::BLK_EXCEPT) {
-                        int exEnd = pos + offs;
-                        for (const auto& kv : forStartToExit) {
-                            if (forElseMerge.count(kv.second)
-                                    && forElseMerge[kv.second] == exEnd
-                                    && curpos >= kv.first && curpos < kv.second) {
-                                exEnd = kv.second;
-                                forElseBreakLoop.insert(kv.first);
-                                loopCloseAtExit.insert(kv.second);
-                                break;
-                            }
-                        }
-                        if (exEnd == pos + offs) {
-                            std::stack<PycRef<ASTBlock> > sc = blocks;
-                            sc.pop();
-                            if (!sc.empty() && sc.top()->blktype() == ASTBlock::BLK_CONTAINER)
-                                sc.pop();
-                            if (!sc.empty()
-                                    && sc.top()->blktype() == ASTBlock::BLK_IF
-                                    && sc.top()->end() > pos
-                                    && sc.top()->end() < pos + offs) {
-                                int elseT = sc.top()->end(), merge = pos + offs;
-                                bool simple = true;
-                                PycBuffer es(code->code()->value(), code->code()->length());
-                                es.setPos(elseT);
-                                int eo, ea, ep = elseT;
-                                while (ep < merge && !es.atEof()) {
-                                    int eip = ep;
-                                    bc_next(es, mod, eo, ea, ep);
-                                    int tgt = -1;
-                                    if (eo == Pyc::JUMP_FORWARD_A || eo == Pyc::POP_JUMP_FORWARD_IF_FALSE_A
-                                            || eo == Pyc::POP_JUMP_FORWARD_IF_TRUE_A
-                                            || eo == Pyc::POP_JUMP_FORWARD_IF_NONE_A
-                                            || eo == Pyc::POP_JUMP_FORWARD_IF_NOT_NONE_A)
-                                        tgt = ep + ea * (int)sizeof(uint16_t);
-                                    else if (eo == Pyc::JUMP_BACKWARD_A
-                                            || eo == Pyc::POP_JUMP_BACKWARD_IF_FALSE_A
-                                            || eo == Pyc::POP_JUMP_BACKWARD_IF_TRUE_A)
-                                        tgt = ep - ea * (int)sizeof(uint16_t);
-                                    /* A jump escaping the region (past the merge) or a real
-                                       backward branch means this is not a plain else arm.
-                                       Multiple forward exits to the merge are fine, though:
-                                       an else whose body holds its own if/try has each arm
-                                       jump to the same merge (e.g. an `if … else: if X:
-                                       try/except` branch). */
-                                    if (tgt >= 0 && (tgt > merge || tgt <= eip)) {
-                                        simple = false; break;
-                                    }
-                                    if (ep <= eip) break;
-                                }
-                                if (simple) {
-                                    exceptElseAt[elseT] = merge;
-                                    exEnd = elseT;
-                                }
-                            }
-                        }
-                        curblock->setEnd(exEnd);
-                    }
-                }
-                if (exceptToMerge >= 0) {
-                    source.setPos(exceptToMerge);
-                    pos = exceptToMerge;
-                }
-            }
+            handleJumpForward();
             break;
         case Pyc::LIST_APPEND:
         case Pyc::LIST_APPEND_A:
@@ -17045,6 +16188,887 @@ void CodeBuilder::handleReturnValue()
                         pos = sv_pos;
                     }
                 }
+}
+
+/* JUMP_FORWARD / INSTRUMENTED_JUMP_FORWARD — unconditional forward jump.
+   Beyond skipping to the target, this handler resolves the many block
+   shapes a forward jump terminates: for/while break arms, else/except
+   coalescing, finally-copy dedup, and the exception-handler chain walk
+   (the do/while below). Switch-level breaks return; loop-internal
+   breaks/continues stay. */
+void CodeBuilder::handleJumpForward()
+{
+                int offs = operand;
+                if (mod->verCompare(3, 10) >= 0)
+                    offs *= sizeof(uint16_t); // // BPO-27129
+
+                if (dupForBreakJF.count(curpos)
+                        && curblock->blktype() == ASTBlock::BLK_IF
+                        && curblock->end() == dupForBreakIfEnd[curpos]
+                        && blocks.size() > 1) {
+                    int E = dupForBreakJF[curpos];
+                    PycRef<ASTBlock> ifb = curblock;
+                    if (!stack_hist.empty())
+                        stack_hist.pop();
+                    blocks.pop();
+                    curblock = blocks.top();
+                    curblock->append(ifb.cast<ASTNode>());
+                    curblock->append(new ASTKeyword(ASTKeyword::KW_BREAK));
+                    source.setPos(E);
+                    pos = E;
+                    return;
+                }
+
+                if ((curblock->blktype() == ASTBlock::BLK_IF
+                            || curblock->blktype() == ASTBlock::BLK_ELIF)
+                        && curblock->end() == curpos
+                        && (pos + offs) >= curblock->end()
+                        && blocks.size() > 2) {
+                    std::stack<PycRef<ASTBlock> > pk = blocks;
+                    pk.pop();
+                    PycRef<ASTBlock> par = pk.top();
+                    if (par->blktype() == ASTBlock::BLK_ELSE
+                            && nestedElseHandlerVals.count(par->end())
+                            && (pos + offs) >= par->end()) {
+                        PycRef<ASTBlock> ifb = curblock;
+                        if (!stack_hist.empty())
+                            stack_hist.pop();
+                        blocks.pop();
+                        curblock = blocks.top();
+                        curblock->append(ifb.cast<ASTNode>());
+                    }
+                }
+
+                if (curblock->blktype() == ASTBlock::BLK_ELSE
+                        && nestedElseHandlerVals.count(curblock->end())
+                        && (pos + offs) >= curblock->end()
+                        && blocks.size() > 1) {
+                    PycRef<ASTBlock> elseb = curblock;
+                    blocks.pop();
+                    curblock = blocks.top();
+                    if (curblock->blktype() == ASTBlock::BLK_CONTAINER
+                            && curblock.cast<ASTContainerBlock>()->hasExcept()) {
+                        if (!stack_hist.empty()) {
+                            stack = stack_hist.top();
+                            stack_hist.pop();
+                        }
+                        curblock->append(elseb.cast<ASTNode>());
+                        stack_hist.push(stack);
+                        PycRef<ASTBlock> except = new ASTCondBlock(ASTBlock::BLK_EXCEPT, 0, NULL, false);
+                        except->init();
+                        blocks.push(except.cast<ASTBlock>());
+                        curblock = blocks.top();
+                        return;
+                    }
+                    blocks.push(elseb.cast<ASTBlock>());
+                    curblock = elseb;
+                }
+
+                if (!stack.empty() && stack.top() != nullptr
+                        && stack.top().type() == ASTNode::NODE_CHAINCOMPARE) {
+                    int target = pos + offs;
+                    source.setPos(target);
+                    pos = target;
+                    return;
+                }
+
+                if (curblock->blktype() != ASTBlock::BLK_CONTAINER) {
+                    int btarget = pos + offs;
+                    bool isBreak = false;
+                    for (const auto& lr : loopRanges) {
+                        /* WHILE-loop continue back-edge: when a LATER back-edge to the
+                           same header exists, this earlier back-edge is a `continue` and
+                           its recorded exit (right after it) is an if/elif MERGE inside
+                           the loop, not the loop exit — so a forward jump-over-else
+                           landing there must NOT be read as a `break` (aiohttp/multipart
+                           parse_content_disposition). The for-loop analogue is the
+                           contBE handling below; this covers while loops (lr.start not a
+                           FOR_ITER start). Scoped to ranges with a later sibling
+                           back-edge so a single-back-edge while still detects real
+                           breaks. */
+                        if (!forStartToExit.count(lr.start)) {
+                            bool laterBE = false;
+                            for (const auto& lr2 : loopRanges)
+                                if (lr2.start == lr.start && lr2.end > lr.end) {
+                                    laterBE = true; break;
+                                }
+                            if (laterBE)
+                                continue;
+                        }
+                        bool contBE = forStartToExit.count(lr.start)
+                                && forStartToExit.at(lr.start) != lr.exit;
+                        if (contBE) {
+                            bool hasTailBE = false;
+                            for (const auto& lr2 : loopRanges)
+                                if (lr2.start == lr.start && lr2.end > lr.end) {
+                                    hasTailBE = true; break;
+                                }
+                            if (hasTailBE
+                                    || (forExitFallThrough.count(lr.start)
+                                        && !doubleBreakContLoop.count(lr.start)))
+                                continue;
+                        }
+                        bool toExit = (lr.exit == btarget)
+                                || (lr.exit < btarget
+                                    && onlyPaddingBetween(lr.exit, btarget))
+                                || (forElseMerge.count(lr.exit)
+                                    && forElseMerge[lr.exit] == btarget)
+                                || (contBE
+                                    && forStartToExit.at(lr.start) == btarget)
+                                || (chainWhileBottomExit.count(lr.end)
+                                    && chainWhileBottomExit.at(lr.end) == btarget);
+                        /* A jump landing on a rotated-while continue-merge (the
+                           offset right after a mid-body `continue` back-edge, with
+                           loop-body tail following) is a jump-over-else, NOT a
+                           break — see whileContMerge in the while-True end scan. */
+                        if (whileContMerge.count(btarget))
+                            toExit = false;
+                        /* This loopRange is a rotated-`while cond:` CONTINUE back-edge
+                           (unconditional JUMP_BACKWARD to the header) whose `exit`
+                           (right after it) is the loop's CONDITIONAL bottom re-test,
+                           not the loop exit (see rotWhileContinueExit). A forward jump
+                           landing there is the body's normal completion falling through
+                           INTO the bottom re-test — NOT a break. */
+                        if (rotWhileContinueExit.count(lr.exit) && lr.exit == btarget)
+                            toExit = false;
+                        if (toExit && curpos >= lr.start && curpos < lr.end) {
+                            isBreak = true;
+                            break;
+                        }
+                    }
+                    if (!isBreak) {
+                        int btarget2 = pos + offs;
+                        for (const auto& kv : forStartToExit) {
+                            if (btarget2 == kv.second
+                                    && curpos >= kv.first && curpos < kv.second
+                                    && !forElseMerge.count(kv.second)
+                                    && ((!forExitFallThrough.count(kv.first)
+                                         && !forBreakBeyondExit.count(kv.first))
+                                        || doubleBreakContLoop.count(kv.first))) {
+                                isBreak = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!isBreak) {
+                        int btarget2b = pos + offs;
+                        for (const auto& kv : forStartToExit) {
+                            int s = kv.first, E = kv.second;
+                            if (forElseBreakLoop.count(s)
+                                    && forElseMerge.count(E) && forElseMerge[E] == btarget2b
+                                    && curpos >= s && curpos < E) {
+                                isBreak = true;
+                                break;
+                            }
+                        }
+                    }
+                    if (!isBreak && curblock->blktype() == ASTBlock::BLK_TRY) {
+                        int btarget3 = pos + offs;
+                        for (const auto& kv : forStartToExit) {
+                            if (forElseMerge.count(kv.second)
+                                    && forElseMerge[kv.second] == btarget3
+                                    && curpos >= kv.first && curpos < kv.second) {
+                                curblock->append(new ASTKeyword(ASTKeyword::KW_BREAK));
+                                break;
+                            }
+                        }
+                    }
+                    if (isBreak) {
+                        while (blocks.size() > 1
+                                && (curblock->blktype() == ASTBlock::BLK_IF
+                                    || curblock->blktype() == ASTBlock::BLK_ELSE)
+                                && curblock->end() == curpos) {
+                            PycRef<ASTBlock> ib = curblock;
+                            if (!stack_hist.empty())
+                                stack_hist.pop();
+                            blocks.pop();
+                            curblock = blocks.top();
+                            curblock->append(ib.cast<ASTNode>());
+                        }
+                        curblock->append(new ASTKeyword(ASTKeyword::KW_BREAK));
+                        return;
+                    }
+                    {
+                        int btC = pos + offs;
+                        bool isWtContinue = false;
+                        /* The continue recovery above must NOT fire when this
+                           JUMP_FORWARD is the mandatory jump the last elif of an
+                           if/elif/else chain makes to skip its OWN else clause(s). That
+                           case is locally identical to a trailing `continue` (an arm
+                           whose body ends in a forward jump over a run of terminal
+                           blocks to the loop's shared back-edge), but the skipped region
+                           is the chain's else-arms, not trailing loop-body code, so a
+                           `continue` is wrong and recompiles to a per-arm back-edge.
+                           Tell them apart by a SIBLING arm: in an if/elif/else chain the
+                           earlier arms' bodies each end in an unconditional JUMP_FORWARD
+                           to the SAME merge (here the loop's shared back-edge btC), so a
+                           preceding JUMP_FORWARD->btC marks a chain merge. A genuine
+                           lone `continue` has no preceding arm jumping to btC. Paired
+                           with the nTerm>=2 gate (a one-armed if/else has a single
+                           terminal block and never reaches here) this is reliable. */
+                        {
+                            PycBuffer es(code->code()->value(), code->code()->length());
+                            es.setPos(0);
+                            int eo, ea, ep = 0;
+                            while (ep < curpos && !es.atEof()) {
+                                bc_next(es, mod, eo, ea, ep);
+                                if (eo == Pyc::JUMP_FORWARD_A
+                                        && ep + ea * (int)sizeof(uint16_t) == btC) {
+                                    isWtContinue = false;
+                                    goto wtDone;
+                                }
+                            }
+                        }
+                        for (const auto& lr : loopRanges) {
+                            if (lr.end != btC || !whileTrueHdr.count(lr.start)
+                                    || curpos < lr.start || curpos >= lr.end)
+                                continue;
+                            int nBack = 0;
+                            for (const auto& lr2 : loopRanges)
+                                if (lr2.start == lr.start) nBack++;
+                            if (nBack != 1)
+                                continue;
+                            PycBuffer rs(code->code()->value(), code->code()->length());
+                            rs.setPos(pos);
+                            int ro, ra, rp = pos, nTerm = 0;
+                            bool clean = true;
+                            while (rp < btC && !rs.atEof()) {
+                                bc_next(rs, mod, ro, ra, rp);
+                                if (ro == Pyc::RETURN_VALUE || ro == Pyc::RETURN_CONST_A
+                                        || ro == Pyc::RAISE_VARARGS_A) { nTerm++; continue; }
+                                if (ro == Pyc::POP_JUMP_FORWARD_IF_FALSE_A || ro == Pyc::POP_JUMP_FORWARD_IF_TRUE_A
+                                        || ro == Pyc::POP_JUMP_FORWARD_IF_NONE_A || ro == Pyc::POP_JUMP_FORWARD_IF_NOT_NONE_A
+                                        || ro == Pyc::POP_JUMP_BACKWARD_IF_FALSE_A || ro == Pyc::POP_JUMP_BACKWARD_IF_TRUE_A
+                                        || ro == Pyc::JUMP_FORWARD_A || ro == Pyc::JUMP_BACKWARD_A
+                                        || ro == Pyc::JUMP_BACKWARD_NO_INTERRUPT_A || ro == Pyc::JUMP_ABSOLUTE_A
+                                        || ro == Pyc::JUMP_IF_TRUE_OR_POP_A || ro == Pyc::JUMP_IF_FALSE_OR_POP_A
+                                        || ro == Pyc::FOR_ITER_A || ro == Pyc::SEND_A
+                                        || ro == Pyc::SETUP_FINALLY_A || ro == Pyc::SETUP_EXCEPT_A
+                                        || ro == Pyc::PUSH_EXC_INFO || ro == Pyc::POP_EXCEPT
+                                        || ro == Pyc::CHECK_EXC_MATCH) { clean = false; break; }
+                            }
+                            if (clean && nTerm >= 2 && rp == btC) {
+                                isWtContinue = true;
+                                break;
+                            }
+                        }
+                    wtDone:
+                        if (isWtContinue) {
+                            curblock->append(new ASTKeyword(ASTKeyword::KW_CONTINUE));
+                            return;
+                        }
+                    }
+                }
+
+                if (curblock->blktype() == ASTBlock::BLK_CONTAINER) {
+                    PycRef<ASTContainerBlock> cont = curblock.cast<ASTContainerBlock>();
+                    if (cont->hasExcept()) {
+                        stack_hist.push(stack);
+
+                        curblock->setEnd(pos+offs);
+                        PycRef<ASTBlock> except = new ASTCondBlock(ASTBlock::BLK_EXCEPT, pos+offs, NULL, false);
+                        except->init();
+                        blocks.push(except);
+                        curblock = blocks.top();
+                    }
+                    return;
+                }
+
+                if (!stack_hist.empty()) {
+                    if (stack.empty()) // if it's part of if-expression, TOS at the moment is the result of "if" part
+                        stack = stack_hist.top();
+                    stack_hist.pop();
+                }
+
+                if (curblock->blktype() == ASTBlock::BLK_TRY
+                        && openFinallyTargets.count(curblock->end())
+                        && offs != 0 && pos + offs > curpos
+                        && pos + offs < curblock->end()) {
+                    source.setPos(pos + offs);
+                    pos = pos + offs;
+                    return;
+                }
+
+                PycRef<ASTBlock> prev = curblock;
+                PycRef<ASTBlock> nil;
+                bool push = true;
+                int exceptToMerge = -1;
+                bool siblingExceptFollows = false;
+                if (offs != 0 && finallyCopySkip.count(pos + offs)) {
+                    PycBuffer sk(code->code()->value(), code->code()->length());
+                    int cur = pos, target = pos + offs;
+                    sk.setPos(cur);
+                    while (cur < target && !sk.atEof()) {
+                        int so, sa, sp = cur;
+                        bc_next(sk, mod, so, sa, sp);
+                        if (so == Pyc::CHECK_EXC_MATCH) { siblingExceptFollows = true; break; }
+                        /* A trailing BARE `except:` sibling has no CHECK_EXC_MATCH — it
+                           begins with a POP_TOP at the start of its own handler exception
+                           entry. When a typed clause inside a try/finally jumps over such
+                           a bare clause to the finally copy, the bare clause must still be
+                           rendered, so treat it as a following sibling too (else the
+                           finally-skip swallows it). */
+                        if (so == Pyc::POP_TOP) {
+                            for (const auto& e : exception_entries)
+                                if (e.start_offset == cur && e.push_lasti) {
+                                    siblingExceptFollows = true; break;
+                                }
+                            /* A bare `except:` that is the fall-through of a typed
+                               except-chain with an `as e` binding is preceded by the typed
+                               clause's own exceptional `del e` cleanup, so the shared lasti
+                               protection entry starts BEFORE the bare clause's POP_TOP (at
+                               the cleanup, not the POP_TOP). The entry-start test above then
+                               misses it. The typed clause's fireBare scan has already
+                               recorded this bare-clause start in chainedBareExcept; honour
+                               that as the authoritative bare-except sibling marker so the
+                               finally-copy skip does not swallow the clause. */
+                            if (!siblingExceptFollows && chainedBareExcept.count(cur))
+                                siblingExceptFollows = true;
+                            if (siblingExceptFollows) break;
+                        }
+                        if (sp <= cur) break;
+                        cur = sp;
+                    }
+                }
+
+                do {
+                    if (blocks.empty())
+                        throw std::runtime_error("except-merge block underflow");
+                    blocks.pop();
+
+                    PycRef<ASTBlock> teoElse = teoSplitElse(prev);
+                    if (!blocks.empty())
+                        blocks.top()->append(prev.cast<ASTNode>());
+                    if (teoElse != nullptr && !blocks.empty())
+                        blocks.top()->append(teoElse.cast<ASTNode>());
+
+                    if (prev->blktype() == ASTBlock::BLK_EXCEPT
+                            && offs != 0 && finallyCopySkip.count(pos + offs)
+                            && !siblingExceptFollows) {
+                        exceptToMerge = pos + offs;
+                        if (!blocks.empty()) {
+                            prev = blocks.top();
+                            continue;
+                        }
+                        prev = nil;
+                    } else if (prev->blktype() == ASTBlock::BLK_IF
+                            || prev->blktype() == ASTBlock::BLK_ELIF) {
+                        if (offs == 0) {
+                            prev = nil;
+                            continue;
+                        }
+
+                        if (prev->end() == curpos && !blocks.empty()) {
+                            bool qualifies = false;
+                            std::stack<PycRef<ASTBlock> > sc = blocks;
+                            while (!sc.empty()) {
+                                PycRef<ASTBlock> b = sc.top(); sc.pop();
+                                ASTBlock::BlkType tb = b->blktype();
+                                if (tb == ASTBlock::BLK_TRY
+                                        && b->end() >= pos
+                                        && b->end() < pos + offs) {
+                                    qualifies = true; break;
+                                }
+                                if (tb == ASTBlock::BLK_IF || tb == ASTBlock::BLK_ELIF) {
+                                    if (b->end() > curpos && b->end() < pos + offs) {
+                                        qualifies = true; break;
+                                    }
+                                    if (b->end() == curpos)
+                                        continue;
+                                }
+                                if (tb == ASTBlock::BLK_ELSE
+                                        && b->end() >= curpos && b->end() <= pos + offs)
+                                    continue;
+                                break;
+                            }
+                            if (qualifies) {
+                                prev = blocks.top();
+                                continue;
+                            }
+                        }
+
+                        if (push) {
+                            stack_hist.push(stack);
+                        }
+                        PycRef<ASTBlock> next = new ASTBlock(ASTBlock::BLK_ELSE, pos+offs);
+                        if (prev->inited() == ASTCondBlock::PRE_POPPED) {
+                            next->init(ASTCondBlock::PRE_POPPED);
+                        }
+
+                        blocks.push(next.cast<ASTBlock>());
+                        prev = nil;
+                    } else if (prev->blktype() == ASTBlock::BLK_EXCEPT) {
+                        if (offs == 0) {
+                            prev = nil;
+                            continue;
+                        }
+
+                        {
+                            int spanA = -1, bestT = -1;
+                            for (const auto& sp : excHandlerSpan) {
+                                if (sp.first <= curpos && curpos < sp.second
+                                        && sp.first > bestT) {
+                                    bestT = sp.first; spanA = sp.second;
+                                }
+                            }
+                            if (spanA > 0 && spanA < pos + offs) {
+                                bool siblingFollows = false;
+                                int opAtA = -1, aArg = 0, aNext = spanA;
+                                {
+                                    PycBuffer ck(code->code()->value(), code->code()->length());
+                                    ck.setPos(pos);
+                                    int ko, ka, kp = pos;
+                                    while (kp < spanA && !ck.atEof()) {
+                                        int kip = kp;
+                                        bc_next(ck, mod, ko, ka, kp);
+                                        if (ko == Pyc::CHECK_EXC_MATCH) {
+                                            siblingFollows = true; break;
+                                        }
+                                        if (kp <= kip) break;
+                                    }
+                                    PycBuffer ak(code->code()->value(), code->code()->length());
+                                    ak.setPos(spanA);
+                                    if (!ak.atEof())
+                                        bc_next(ak, mod, opAtA, aArg, aNext);
+                                }
+                                if (!siblingFollows) {
+                                    bool fire = false, openElse = false;
+                                    bool dupReturnMerge = false;
+                                    int dupRetSpanRet = -1, dupRetTgtRet = -1;
+                                    if (opAtA == Pyc::JUMP_FORWARD_A
+                                            || opAtA == Pyc::INSTRUMENTED_JUMP_FORWARD_A) {
+                                        fire = true;
+                                    } else {
+                                        std::stack<PycRef<ASTBlock> > sc = blocks;
+                                        bool encl = false;
+                                        if (!sc.empty()
+                                                && sc.top()->blktype() == ASTBlock::BLK_CONTAINER) {
+                                            sc.pop();
+                                            /* Peel through intervening BLK_ELSE arms whose
+                                               body's last statement is this try/except — the
+                                               else shares the resume merge so its end is
+                                               >= A. The real owner of the resume (the
+                                               enclosing BLK_IF/BLK_ELIF whose false-target
+                                               is A) sits just below it (`elif X: if c: …
+                                               else: try/except` nested in an outer `elif Y:`
+                                               — the inner if-else holds the try/except and A
+                                               is the outer arm's own `else`). Without
+                                               peeling, the spurious bare `except:` opens and
+                                               swallows the sibling arm(s). */
+                                            while (!sc.empty()
+                                                    && sc.top()->blktype() == ASTBlock::BLK_ELSE
+                                                    && sc.top()->end() >= spanA)
+                                                sc.pop();
+                                            if (!sc.empty()) {
+                                                if ((sc.top()->blktype() == ASTBlock::BLK_IF
+                                                        || sc.top()->blktype() == ASTBlock::BLK_ELIF)
+                                                        && sc.top()->end() == spanA)
+                                                    encl = true;
+                                            }
+                                        }
+                                        if (encl) {
+                                            fire = true;
+                                            openElse = true;
+                                        }
+                                    }
+                                    /* No sibling except follows and the JUMP_FORWARD
+                                       overshoots the inner handler's natural merge
+                                       (spanA) because this whole try/except is the LAST
+                                       statement of an ENCLOSING `except E as v:` handler
+                                       — its normal-exit jump lands on the enclosing
+                                       handler's `as v` name-cleanup rather than on spanA.
+                                       spanA itself is a DIFFERENT copy of that same
+                                       cleanup (the inner-try body-success path). Without
+                                       this, the fall-through below opens a spurious
+                                       swallowing bare `except:` over the cleanup copy
+                                       (asyncio BaseEventLoop.call_exception_handler:
+                                       `except BaseException as exc: try: … except
+                                       (SystemExit,KeyboardInterrupt): raise except
+                                       BaseException: log`). Detect the shape by the
+                                       compiler-generated `as v` cleanup at spanA:
+                                       POP_EXCEPT; LOAD_CONST None; STORE_FAST v;
+                                       DELETE_FAST v (same v). Close the inner except at
+                                       spanA so the enclosing handler renders its own
+                                       implicit cleanup. Tightly gated to that exact
+                                       byte sequence; no else opened. */
+                                    if (!fire && opAtA == Pyc::POP_EXCEPT) {
+                                        PycBuffer ns(code->code()->value(),
+                                                code->code()->length());
+                                        ns.setPos(spanA);
+                                        int no, na, np = spanA;
+                                        auto step = [&]() -> bool {
+                                            int ip = np;
+                                            if (ns.atEof()) return false;
+                                            bc_next(ns, mod, no, na, np);
+                                            return np > ip;
+                                        };
+                                        bool asVarCleanup = false;
+                                        if (step() && no == Pyc::POP_EXCEPT
+                                                && step() && no == Pyc::LOAD_CONST_A
+                                                && step() && no == Pyc::STORE_FAST_A) {
+                                            int storeVar = na;
+                                            if (step() && no == Pyc::DELETE_FAST_A
+                                                    && na == storeVar)
+                                                asVarCleanup = true;
+                                        }
+                                        if (asVarCleanup)
+                                            fire = true;
+                                    }
+                                    /* No sibling except follows and the except
+                                       handler's normal-exit JUMP_FORWARD overshoots
+                                       its own try/except's natural merge (spanA)
+                                       because the try has an `else:` clause whose
+                                       body already falls through to a bare
+                                       `return None` AT spanA. The compiler emits a
+                                       SECOND identical `return None` for the except
+                                       handler's normal exit and the JUMP_FORWARD
+                                       targets that duplicate (pos+offs) rather than
+                                       spanA. Without this, the fall-through below
+                                       opens a spurious swallowing bare `except:
+                                       return None` over the else-return copy at
+                                       spanA — dropping the else and adding a
+                                       swallowing handler (mailbox._lock_file:
+                                       `try: os.link…; dotlock_done=True except
+                                       (AttributeError,PermissionError): os.rename…
+                                       else: os.unlink`). Detect the shape by an
+                                       identical `LOAD_CONST c; RETURN_VALUE` at BOTH
+                                       spanA and the JUMP_FORWARD target. Close the
+                                       except at spanA so the else renders and the
+                                       duplicate return is skipped. Tightly gated to
+                                       that exact byte pattern; no else opened. */
+                                    if (!fire
+                                            && opAtA == Pyc::LOAD_CONST_A) {
+                                        int spanConst = aArg, spanOp = opAtA;
+                                        /* op right after the LOAD_CONST at spanA */
+                                        int so2 = -1, sa2 = 0, sp2 = aNext;
+                                        {
+                                            PycBuffer ss(code->code()->value(),
+                                                    code->code()->length());
+                                            ss.setPos(aNext);
+                                            if (!ss.atEof())
+                                                bc_next(ss, mod, so2, sa2, sp2);
+                                        }
+                                        /* LOAD_CONST c; RETURN_VALUE at the target */
+                                        int to0 = -1, ta0 = 0, tp0 = pos + offs;
+                                        int to1 = -1, ta1 = 0, tp1 = pos + offs;
+                                        {
+                                            PycBuffer ts(code->code()->value(),
+                                                    code->code()->length());
+                                            ts.setPos(pos + offs);
+                                            if (!ts.atEof())
+                                                bc_next(ts, mod, to0, ta0, tp0);
+                                            ts.setPos(tp0);
+                                            if (!ts.atEof())
+                                                bc_next(ts, mod, to1, ta1, tp1);
+                                        }
+                                        if (so2 == Pyc::RETURN_VALUE
+                                                && to0 == Pyc::LOAD_CONST_A
+                                                && ta0 == spanConst
+                                                && to1 == Pyc::RETURN_VALUE) {
+                                            (void)spanOp;
+                                            dupReturnMerge = true;
+                                            dupRetSpanRet = aNext; /* RETURN_VALUE at spanA */
+                                            dupRetTgtRet = tp0;    /* RETURN_VALUE at target */
+                                        }
+                                    }
+                                    if (dupReturnMerge) {
+                                        /* Close the except; merge at the try/except's
+                                           natural merge (spanA = the else-body's
+                                           normal-exit `return None` copy). Record both
+                                           duplicate `return None` copies' RETURN_VALUE
+                                           offsets (else-body copy at spanA and the
+                                           except-handler copy at pos+offs) as
+                                           suppressible implicit epilogues so neither
+                                           renders as an explicit statement. */
+                                        dupRetNoneSkip.insert(dupRetSpanRet);
+                                        dupRetNoneSkip.insert(dupRetTgtRet);
+                                        exceptToMerge = spanA;
+                                        if (!blocks.empty()) {
+                                            prev = blocks.top();
+                                            continue;
+                                        }
+                                        prev = nil;
+                                        continue;
+                                    }
+                                    if (fire) {
+                                        exceptToMerge = spanA;
+                                        if (openElse && !blocks.empty()
+                                                && blocks.top()->blktype() == ASTBlock::BLK_CONTAINER) {
+                                            PycRef<ASTBlock> cont = blocks.top();
+                                            blocks.pop();
+                                            if (!blocks.empty())
+                                                blocks.top()->append(cont.cast<ASTNode>());
+                                        }
+                                        if (!blocks.empty()) {
+                                            prev = blocks.top();
+                                            continue;
+                                        }
+                                        prev = nil;
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
+                        /* A try/except whose entire body lives on the true-branch of an
+                           `if C:` that is itself the last statement before an ENCLOSING
+                           try/finally's normal-exit jump: the try body's own normal-exit
+                           JUMP_FORWARD skips the post-handler merge and jumps straight to
+                           the finally, so the container (and hence this typed except) took
+                           the finally target as its end. When control finally reaches that
+                           JUMP_FORWARD instruction (curpos), the handler's natural merge —
+                           the end A of its excHandlerSpan (T, A) — sits exactly AT curpos,
+                           so the `curpos < A` span lookup above missed it and spanA came back
+                           -1. Without this, the fall-through opens a spurious swallowing bare
+                           `except:` spanning [curpos, finally) that absorbs the enclosing
+                           `else:` branch (logging.config DictConfigurator.configure:
+                           `if root: try: self.configure_root(root, True) except Exception as
+                           e: raise …`). Detect the exact shape — a handler span ending at
+                           curpos, the op at curpos is this JUMP_FORWARD, and the except
+                           over-extended to the JUMP target (prev->end() == pos+offs > A) —
+                           and close the except at A (== curpos) instead of opening a bare
+                           except. Resuming at A re-processes the JUMP_FORWARD at the
+                           enclosing level so the `if`/`else` structure closes normally. */
+                        if (exceptToMerge < 0 && offs != 0) {
+                            bool spanEndsAtCur = false;
+                            for (const auto& sp : excHandlerSpan)
+                                if (sp.second == curpos && sp.first < curpos) {
+                                    spanEndsAtCur = true; break;
+                                }
+                            if (spanEndsAtCur
+                                    && prev->end() == pos + offs
+                                    && pos + offs > curpos) {
+                                exceptToMerge = curpos;
+                                if (!blocks.empty()) {
+                                    prev = blocks.top();
+                                    continue;
+                                }
+                                prev = nil;
+                                continue;
+                            }
+                        }
+
+                        bool lastNested = false;
+                        if (prev->end() > 0 && !blocks.empty()) {
+                            PycBuffer pk(code->code()->value(), code->code()->length());
+                            pk.setPos(prev->end());
+                            if (!pk.atEof()) {
+                                int po, pa, pp;
+                                bc_next(pk, mod, po, pa, pp);
+                                if (po == Pyc::RERAISE || po == Pyc::RERAISE_A) {
+                                    std::stack<PycRef<ASTBlock> > sc = blocks;
+                                    while (!sc.empty()) {
+                                        PycRef<ASTBlock> b = sc.top(); sc.pop();
+                                        if (b->blktype() == ASTBlock::BLK_TRY
+                                                && b->end() > pos
+                                                && b->end() < pos + offs) {
+                                            lastNested = true; break;
+                                        }
+                                        if (b->blktype() == ASTBlock::BLK_ELSE
+                                                && nestedElseHandlerVals.count(b->end())
+                                                && b->end() > pos
+                                                && b->end() <= pos + offs) {
+                                            lastNested = true; break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        if (lastNested) {
+                            prev = blocks.top();
+                            continue;
+                        }
+
+                        if (push) {
+                            stack_hist.push(stack);
+                        }
+                        int sibEnd = pos + offs;
+                        {
+                            std::stack<PycRef<ASTBlock> > sc = blocks;
+                            while (!sc.empty()) {
+                                PycRef<ASTBlock> b = sc.top(); sc.pop();
+                                if (b->blktype() == ASTBlock::BLK_ELSE
+                                        && nestedElseHandlerVals.count(b->end())
+                                        && b->end() > pos && b->end() < sibEnd) {
+                                    sibEnd = b->end(); break;
+                                }
+                            }
+                        }
+                        PycRef<ASTBlock> next = new ASTCondBlock(ASTBlock::BLK_EXCEPT, sibEnd, NULL, false);
+                        next->init();
+
+                        blocks.push(next.cast<ASTBlock>());
+                        prev = nil;
+                    } else if (prev->blktype() == ASTBlock::BLK_ELSE) {
+                        /* Special case */
+                        if (blocks.empty() || (!push && stack_hist.empty()))
+                            throw std::runtime_error("except-else block/stack underflow");
+                        prev = blocks.top();
+                        if (!push) {
+                            stack = stack_hist.top();
+                            stack_hist.pop();
+                        }
+                        push = false;
+
+                        if (prev->blktype() == ASTBlock::BLK_MAIN) {
+                            /* Something went out of control! */
+                            prev = nil;
+                        }
+                    } else if (prev->blktype() == ASTBlock::BLK_TRY
+                            && prev->end() < pos+offs) {
+                        /* Need to add an except/finally block */
+                        if (!stack_hist.empty()) {
+                            stack = stack_hist.top();
+                            stack_hist.pop();
+                        }
+
+                        if (blocks.top()->blktype() == ASTBlock::BLK_CONTAINER) {
+                            PycRef<ASTContainerBlock> cont = blocks.top().cast<ASTContainerBlock>();
+                            if (cont->hasExcept()) {
+                                if (push) {
+                                    stack_hist.push(stack);
+                                }
+
+                                PycRef<ASTBlock> except = new ASTCondBlock(ASTBlock::BLK_EXCEPT, pos+offs, NULL, false);
+                                except->init();
+                                blocks.push(except);
+                            }
+                        } else {
+                            fprintf(stderr, "Something TERRIBLE happened!!\n");
+                        }
+                        prev = nil;
+                    } else if ((prev->blktype() == ASTBlock::BLK_FOR
+                                || prev->blktype() == ASTBlock::BLK_WHILE)
+                            && offs != 0
+                            && !blocks.empty()
+                            && (blocks.top()->blktype() == ASTBlock::BLK_IF
+                                || blocks.top()->blktype() == ASTBlock::BLK_ELIF)
+                            && blocks.top()->end() == pos
+                            && pos + offs > blocks.top()->end()) {
+                        if (prev->blktype() == ASTBlock::BLK_FOR
+                                && backedgeCount[prev.cast<ASTIterBlock>()->start()] == 0)
+                            prev->append(new ASTKeyword(ASTKeyword::KW_BREAK));
+                        prev = blocks.top();
+                        continue;
+                    } else {
+                        prev = nil;
+                    }
+
+                } while (prev != nil);
+
+                if (!blocks.empty()) {
+                    curblock = blocks.top();
+                    if (exceptToMerge < 0 && curblock->blktype() == ASTBlock::BLK_EXCEPT) {
+                        int exEnd = pos + offs;
+                        for (const auto& kv : forStartToExit) {
+                            if (forElseMerge.count(kv.second)
+                                    && forElseMerge[kv.second] == exEnd
+                                    && curpos >= kv.first && curpos < kv.second) {
+                                exEnd = kv.second;
+                                forElseBreakLoop.insert(kv.first);
+                                loopCloseAtExit.insert(kv.second);
+                                break;
+                            }
+                        }
+                        if (exEnd == pos + offs) {
+                            std::stack<PycRef<ASTBlock> > sc = blocks;
+                            sc.pop();
+                            if (!sc.empty() && sc.top()->blktype() == ASTBlock::BLK_CONTAINER)
+                                sc.pop();
+                            if (!sc.empty()
+                                    && sc.top()->blktype() == ASTBlock::BLK_IF
+                                    && sc.top()->end() > pos
+                                    && sc.top()->end() < pos + offs) {
+                                int elseT = sc.top()->end(), merge = pos + offs;
+                                bool simple = true;
+                                PycBuffer es(code->code()->value(), code->code()->length());
+                                es.setPos(elseT);
+                                int eo, ea, ep = elseT;
+                                while (ep < merge && !es.atEof()) {
+                                    int eip = ep;
+                                    bc_next(es, mod, eo, ea, ep);
+                                    int tgt = -1;
+                                    if (eo == Pyc::JUMP_FORWARD_A || eo == Pyc::POP_JUMP_FORWARD_IF_FALSE_A
+                                            || eo == Pyc::POP_JUMP_FORWARD_IF_TRUE_A
+                                            || eo == Pyc::POP_JUMP_FORWARD_IF_NONE_A
+                                            || eo == Pyc::POP_JUMP_FORWARD_IF_NOT_NONE_A)
+                                        tgt = ep + ea * (int)sizeof(uint16_t);
+                                    else if (eo == Pyc::JUMP_BACKWARD_A
+                                            || eo == Pyc::POP_JUMP_BACKWARD_IF_FALSE_A
+                                            || eo == Pyc::POP_JUMP_BACKWARD_IF_TRUE_A)
+                                        tgt = ep - ea * (int)sizeof(uint16_t);
+                                    /* A jump escaping the region (past the merge) or a real
+                                       backward branch means this is not a plain else arm.
+                                       Multiple forward exits to the merge are fine, though:
+                                       an else whose body holds its own if/try has each arm
+                                       jump to the same merge (e.g. an `if … else: if X:
+                                       try/except` branch). */
+                                    if (tgt >= 0 && (tgt > merge || tgt <= eip)) {
+                                        simple = false; break;
+                                    }
+                                    if (ep <= eip) break;
+                                }
+                                if (simple) {
+                                    exceptElseAt[elseT] = merge;
+                                    exEnd = elseT;
+                                }
+                            }
+                        }
+                        curblock->setEnd(exEnd);
+                    }
+                }
+                if (exceptToMerge >= 0) {
+                    source.setPos(exceptToMerge);
+                    pos = exceptToMerge;
+                }
+}
+
+/* True iff every instruction in [from,to) is padding (NOP/CACHE) and the
+   scan lands exactly on `to`. Used to prove a jump target is reachable only
+   across compiler padding. */
+bool CodeBuilder::onlyPaddingBetween(int from, int to)
+{
+    if (from > to) return false;
+    PycBuffer s(code->code()->value(), code->code()->length());
+    s.setPos(from);
+    int o, a, p = from;
+    while (p < to && !s.atEof()) {
+        bc_next(s, mod, o, a, p);
+        if (o != Pyc::NOP && o != Pyc::CACHE)
+            return false;
+    }
+    return p == to;
+}
+
+/* Terminal try/except/else SPLIT helper: peel the else-boundary tail nodes
+   (recorded in elseBoundaryByTryEnd) off a BLK_TRY into a fresh BLK_ELSE,
+   re-attaching any absorbed shared-tail return (teoElseAbsorbRet). Returns
+   null when the block is not a splittable try. */
+PycRef<ASTBlock> CodeBuilder::teoSplitElse(PycRef<ASTBlock> tryb)
+{
+    if (tryb == nullptr || tryb->blktype() != ASTBlock::BLK_TRY)
+        return PycRef<ASTBlock>(nullptr);
+    auto it = elseBoundaryByTryEnd.find(tryb->end());
+    if (it == elseBoundaryByTryEnd.end())
+        return PycRef<ASTBlock>(nullptr);
+    int bc = it->second;
+    if ((int)tryb->size() <= bc)
+        return PycRef<ASTBlock>(nullptr);
+    PycRef<ASTBlock> elseb = new ASTBlock(ASTBlock::BLK_ELSE, 0, 1);
+    std::list<PycRef<ASTNode> > tail;
+    while ((int)tryb->size() > bc) {
+        tail.push_front(tryb->nodes().back());
+        tryb->removeLast();
+    }
+    for (auto& n : tail)
+        elseb->append(n);
+    /* Absorb the else's shared-tail `return X` (see teoElseAbsorbRet). The
+       else nodes ended at the JUMP_FORWARD that targets the return; append
+       the synthesized return so the else reads `…; return X`. */
+    auto ar = teoElseAbsorbRet.find(tryb->end());
+    if (ar != teoElseAbsorbRet.end())
+        elseb->append(ar->second);
+    return elseb;
 }
 
 /* LOAD_CONST — push a constant from the code object's const pool. A non-empty
