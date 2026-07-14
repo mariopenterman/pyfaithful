@@ -707,6 +707,16 @@ private:
     std::set<ASTBlock*> exceptElseNoCollapse;
     std::unordered_map<int, int> opEndingBefore;
     int canonTarget(int off);
+    // --- state promoted for handleCompareOp/handleMatchClass ---
+    struct MCase { bool isFirst; int matchEnd; int failTarget; int bodyStart;
+                   int popExtra; std::vector<PycRef<ASTNode>> caps; };
+    struct VCase { bool isFirst; bool isLast; int matchEnd; int failTarget; int bodyStart; int orNextAlt; };
+    struct OrCont { int orNextAlt; int bodyStart; };
+    std::unordered_map<int, MCase> matchCase;
+    std::unordered_map<int, OrCont> matchValueOr;
+    std::unordered_map<int, VCase> matchValue;
+    void handleCompareOp(int operand);
+    bool handleMatchClass();
 };
 
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
@@ -6336,15 +6346,8 @@ PycRef<ASTNode> CodeBuilder::build()
     }
     std::unordered_set<int> whileTrueOpened;
 
-    struct MCase { bool isFirst; int matchEnd; int failTarget; int bodyStart;
-                   int popExtra; std::vector<PycRef<ASTNode>> caps; };
-    std::unordered_map<int, MCase> matchCase;
     std::unordered_map<int, int> matchCaseEnd;
     std::unordered_set<int> matchBlockEnd;
-    struct VCase { bool isFirst; bool isLast; int matchEnd; int failTarget; int bodyStart; int orNextAlt; };
-    struct OrCont { int orNextAlt; int bodyStart; };
-    std::unordered_map<int, OrCont> matchValueOr;
-    std::unordered_map<int, VCase> matchValue;
     std::unordered_map<int, int> matchWildcardOpen;
     if (mod->verCompare(3, 11) >= 0) {
         struct Ins { int op; int arg; int off; int next; };
@@ -10594,69 +10597,7 @@ PycRef<ASTNode> CodeBuilder::build()
             curblock->append(new ASTKeyword(ASTKeyword::KW_CONTINUE));
             break;
         case Pyc::COMPARE_OP_A:
-            {
-                auto oci = matchValueOr.find(curpos);
-                if (oci != matchValueOr.end()) {
-                    const OrCont& oc = oci->second;
-                    PycRef<ASTNode> pattern = stack.top(); stack.pop();
-                    stack.pop();
-                    if (curblock->blktype() == ASTBlock::BLK_CASE) {
-                        PycRef<ASTNode> prev = curblock.cast<ASTCaseBlock>()->pattern();
-                        curblock.cast<ASTCaseBlock>()->setPattern(
-                                new ASTBinary(prev, pattern, ASTBinary::BIN_OR));
-                    }
-                    int dst = (oc.orNextAlt >= 0) ? oc.orNextAlt : oc.bodyStart;
-                    source.setPos(dst);
-                    pos = dst;
-                    while (next_exception_entry < exception_entries.size()
-                            && exception_entries[next_exception_entry].start_offset < pos)
-                        next_exception_entry++;
-                    break;
-                }
-                auto vmi = matchValue.find(curpos);
-                if (vmi != matchValue.end()) {
-                    const VCase& vc = vmi->second;
-                    PycRef<ASTNode> pattern = stack.top(); stack.pop();
-                    if (vc.isLast) {
-                        stack.pop();
-                    } else {
-                        PycRef<ASTNode> copy = stack.top(); stack.pop();
-                        if (vc.isFirst) {
-                            PycRef<ASTNode> subject = stack.top();
-                            blocks.push(new ASTMatchBlock(vc.matchEnd, subject));
-                            curblock = blocks.top();
-                        }
-                    }
-                    blocks.push(new ASTCaseBlock(vc.failTarget, pattern));
-                    curblock = blocks.top();
-                    curblock->init();
-                    int dst = (vc.orNextAlt >= 0) ? vc.orNextAlt : vc.bodyStart;
-                    source.setPos(dst);
-                    pos = dst;
-                    while (next_exception_entry < exception_entries.size()
-                            && exception_entries[next_exception_entry].start_offset < pos)
-                        next_exception_entry++;
-                    break;
-                }
-                PycRef<ASTNode> right = stack.top();
-                stack.pop();
-                PycRef<ASTNode> left = stack.top();
-                stack.pop();
-                auto arg = operand;
-                if (mod->verCompare(3, 12) == 0)
-                    arg >>= 4; // changed under GH-100923
-                else if (mod->verCompare(3, 13) >= 0)
-                    arg >>= 5;
-                if (left != nullptr && left.type() == ASTNode::NODE_CHAINCOMPARE) {
-                    left.cast<ASTChainCompare>()->extend(arg, right);
-                    stack.push(left);
-                } else if (chainCmp) {
-                    stack.push(new ASTChainCompare(left, right, arg));
-                } else {
-                    stack.push(new ASTCompare(left, right, arg));
-                }
-                chainCmp = 0;
-            }
+            handleCompareOp(operand);
             break;
         case Pyc::CONTAINS_OP_A:
             handleIsContainsOp(opcode, operand);
@@ -11013,35 +10954,8 @@ PycRef<ASTNode> CodeBuilder::build()
             handleUnpack(opcode, operand);
             break;
         case Pyc::MATCH_CLASS_A:
-            {
-                auto mci = matchCase.find(curpos);
-                if (mci == matchCase.end()) {
-                    fprintf(stderr, "Unsupported opcode: %s (%d)\n",
-                            Pyc::OpcodeName(opcode), opcode);
-                    cleanBuild = false;
-                    return new ASTNodeList(defblock->nodes());
-                }
-                const MCase& mc = mci->second;
-                stack.pop();
-                PycRef<ASTNode> classnode = stack.top(); stack.pop();
-                PycRef<ASTNode> subject = stack.top(); stack.pop();
-                for (int k = 0; k < mc.popExtra; ++k)
-                    if (!stack.empty()) stack.pop();
-                ASTCall::pparam_t pparams;
-                for (const auto& c : mc.caps)
-                    pparams.push_back(c);
-                PycRef<ASTNode> pattern = new ASTCall(classnode, pparams,
-                                                      ASTCall::kwparam_t());
-                if (mc.isFirst) {
-                    blocks.push(new ASTMatchBlock(mc.matchEnd, subject));
-                    curblock = blocks.top();
-                }
-                blocks.push(new ASTCaseBlock(mc.failTarget, pattern));
-                curblock = blocks.top();
-                curblock->init();
-                source.setPos(mc.bodyStart);
-                pos = mc.bodyStart;
-            }
+            if (!handleMatchClass())
+                return new ASTNodeList(defblock->nodes());
             break;
         case Pyc::YIELD_FROM:
         case Pyc::YIELD_VALUE:
@@ -17030,6 +16944,113 @@ bool CodeBuilder::handleConditionalJump()
 
                 blocks.push(ifblk.cast<ASTBlock>());
                 curblock = blocks.top();
+    return true;
+}
+
+/* COMPARE_OP — a comparison, or, inside a match statement, a value/OR
+   pattern test (matchValue/matchValueOr record which). For a match value
+   pattern it builds the ASTCaseBlock (or extends an OR pattern) and jumps to
+   the case body; otherwise it builds an ASTCompare, chaining into an
+   ASTChainCompare when chainCmp is set or the left is already a chain. */
+void CodeBuilder::handleCompareOp(int operand)
+{
+                auto oci = matchValueOr.find(curpos);
+                if (oci != matchValueOr.end()) {
+                    const OrCont& oc = oci->second;
+                    PycRef<ASTNode> pattern = stack.top(); stack.pop();
+                    stack.pop();
+                    if (curblock->blktype() == ASTBlock::BLK_CASE) {
+                        PycRef<ASTNode> prev = curblock.cast<ASTCaseBlock>()->pattern();
+                        curblock.cast<ASTCaseBlock>()->setPattern(
+                                new ASTBinary(prev, pattern, ASTBinary::BIN_OR));
+                    }
+                    int dst = (oc.orNextAlt >= 0) ? oc.orNextAlt : oc.bodyStart;
+                    source.setPos(dst);
+                    pos = dst;
+                    while (next_exception_entry < exception_entries.size()
+                            && exception_entries[next_exception_entry].start_offset < pos)
+                        next_exception_entry++;
+                    return;
+                }
+                auto vmi = matchValue.find(curpos);
+                if (vmi != matchValue.end()) {
+                    const VCase& vc = vmi->second;
+                    PycRef<ASTNode> pattern = stack.top(); stack.pop();
+                    if (vc.isLast) {
+                        stack.pop();
+                    } else {
+                        PycRef<ASTNode> copy = stack.top(); stack.pop();
+                        if (vc.isFirst) {
+                            PycRef<ASTNode> subject = stack.top();
+                            blocks.push(new ASTMatchBlock(vc.matchEnd, subject));
+                            curblock = blocks.top();
+                        }
+                    }
+                    blocks.push(new ASTCaseBlock(vc.failTarget, pattern));
+                    curblock = blocks.top();
+                    curblock->init();
+                    int dst = (vc.orNextAlt >= 0) ? vc.orNextAlt : vc.bodyStart;
+                    source.setPos(dst);
+                    pos = dst;
+                    while (next_exception_entry < exception_entries.size()
+                            && exception_entries[next_exception_entry].start_offset < pos)
+                        next_exception_entry++;
+                    return;
+                }
+                PycRef<ASTNode> right = stack.top();
+                stack.pop();
+                PycRef<ASTNode> left = stack.top();
+                stack.pop();
+                auto arg = operand;
+                if (mod->verCompare(3, 12) == 0)
+                    arg >>= 4; // changed under GH-100923
+                else if (mod->verCompare(3, 13) >= 0)
+                    arg >>= 5;
+                if (left != nullptr && left.type() == ASTNode::NODE_CHAINCOMPARE) {
+                    left.cast<ASTChainCompare>()->extend(arg, right);
+                    stack.push(left);
+                } else if (chainCmp) {
+                    stack.push(new ASTChainCompare(left, right, arg));
+                } else {
+                    stack.push(new ASTCompare(left, right, arg));
+                }
+                chainCmp = 0;
+}
+
+/* MATCH_CLASS — a class pattern `Cls(cap, ...)` in a match statement. Pops
+   the arg-names tuple, the class, and the subject, rebuilds the pattern as an
+   ASTCall(class, captures), opens the ASTMatchBlock on the first case, pushes
+   the ASTCaseBlock, and jumps to the case body. Returns false (clearing
+   cleanBuild) when no matchCase record covers this offset. */
+bool CodeBuilder::handleMatchClass()
+{
+                auto mci = matchCase.find(curpos);
+                if (mci == matchCase.end()) {
+                    fprintf(stderr, "Unsupported opcode: %s (%d)\n",
+                            Pyc::OpcodeName(opcode), opcode);
+                    cleanBuild = false;
+                    return false;
+                }
+                const MCase& mc = mci->second;
+                stack.pop();
+                PycRef<ASTNode> classnode = stack.top(); stack.pop();
+                PycRef<ASTNode> subject = stack.top(); stack.pop();
+                for (int k = 0; k < mc.popExtra; ++k)
+                    if (!stack.empty()) stack.pop();
+                ASTCall::pparam_t pparams;
+                for (const auto& c : mc.caps)
+                    pparams.push_back(c);
+                PycRef<ASTNode> pattern = new ASTCall(classnode, pparams,
+                                                      ASTCall::kwparam_t());
+                if (mc.isFirst) {
+                    blocks.push(new ASTMatchBlock(mc.matchEnd, subject));
+                    curblock = blocks.top();
+                }
+                blocks.push(new ASTCaseBlock(mc.failTarget, pattern));
+                curblock = blocks.top();
+                curblock->init();
+                source.setPos(mc.bodyStart);
+                pos = mc.bodyStart;
     return true;
 }
 
