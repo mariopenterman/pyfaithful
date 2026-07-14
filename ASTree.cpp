@@ -519,6 +519,7 @@ private:
     void handleMakeFunction(int operand);
     void handleBuildClassFunc(int opcode);
     void handleEndFinally();
+    void handleSwap(int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -13485,113 +13486,7 @@ PycRef<ASTNode> CodeBuilder::build()
             stack.pop();
             break;
         case Pyc::SWAP_A:
-            {
-                if (operand == 2) {
-                    int sv_bufpos = source.pos();
-                    int sv_pos = pos;
-                    int nop = 0, narg = 0;
-                    bc_next(source, mod, nop, narg, pos);
-                    if (nop == Pyc::COPY_A && narg == 2) {
-                        int afterCopy_bufpos = source.pos();
-                        int afterCopy_pos = pos;
-                        bool valueCtx = false;
-                        for (int g = 0; g < 8; ++g) {
-                            bc_next(source, mod, nop, narg, pos);
-                            if (nop == Pyc::CACHE || nop == Pyc::COMPARE_OP_A)
-                                continue;
-                            valueCtx = (nop == Pyc::JUMP_IF_FALSE_OR_POP_A);
-                            break;
-                        }
-                        if (valueCtx || chainIfSwap.count(curpos)) {
-                            source.setPos(afterCopy_bufpos);
-                            pos = afterCopy_pos;
-                            chainCmp = 1;
-                            break;
-                        }
-                    }
-                    source.setPos(sv_bufpos);
-                    pos = sv_pos;
-
-                    {
-                        int p_buf = source.pos(), p_pos = pos, nxop = 0, nxarg = 0;
-                        bc_next(source, mod, nxop, nxarg, pos);
-                        if ((nxop == Pyc::POP_TOP || nxop == Pyc::POP_EXCEPT)
-                                && stack.top() != nullptr) {
-                            PycRef<ASTNode> keep = stack.top();
-                            stack.pop();
-                            PycRef<ASTNode> below =
-                                    stack.empty() ? nullptr : stack.top();
-                            if (!stack.empty())
-                                stack.pop();
-                            // `import a.b.c as d`: CPython walks the dotted path
-                            // with IMPORT_FROM/SWAP/POP_TOP, discarding each
-                            // parent package and keeping the child module. The
-                            // ASTImport already carries the full dotted name, so
-                            // keep it (not the intermediate attribute name)
-                            // through the walk; the trailing STORE_NAME/POP_TOP
-                            // then renders the `import ... as ...`.
-                            if (below != nullptr
-                                    && below.type() == ASTNode::NODE_IMPORT) {
-                                PycRef<ASTImport> imp = below.cast<ASTImport>();
-                                PycRef<ASTNode> fl = imp->fromlist();
-                                bool noFromlist = (fl == nullptr)
-                                        || (fl.type() == ASTNode::NODE_OBJECT
-                                            && fl.cast<ASTObject>()->object()
-                                               == Pyc_None);
-                                if (noFromlist && imp->level() == 0)
-                                    keep = below;
-                            }
-                            stack.push(keep);
-                            break;
-                        }
-                        source.setPos(p_buf);
-                        pos = p_pos;
-                    }
-                }
-                if (operand >= 2) {
-                    int p_buf = source.pos(), p_pos = pos, nxop = 0, nxarg = 0;
-                    bc_next(source, mod, nxop, nxarg, pos);
-                    source.setPos(p_buf);
-                    pos = p_pos;
-                    if ((nxop == Pyc::UNPACK_SEQUENCE_A || nxop == Pyc::UNPACK_EX_A)
-                            && stack.top(operand) != nullptr) {
-                        std::vector<PycRef<ASTNode>> tmp(operand);
-                        for (int i = operand - 1; i >= 0; i--) {
-                            tmp[i] = stack.top();
-                            stack.pop();
-                        }
-                        std::swap(tmp[0], tmp[operand - 1]);
-                        for (int i = 0; i < operand; i++)
-                            stack.push(tmp[i]);
-                        break;
-                    }
-                }
-                if (inplaceStore && operand >= 2) {
-                    std::vector<PycRef<ASTNode>> tmp(operand);
-                    for (int i = operand - 1; i >= 0; i--) {
-                        tmp[i] = stack.top();
-                        stack.pop();
-                    }
-                    std::swap(tmp[0], tmp[operand - 1]);
-                    for (int i = 0; i < operand; i++)
-                        stack.push(tmp[i]);
-                    break;
-                }
-                unpack = operand;
-                ASTTuple::value_t values;
-                ASTTuple::value_t next_tuple;
-                values.resize(operand);
-                for (int i = 0; i < operand; i++) {
-                    values[operand - i - 1] = stack.top();
-                    stack.pop();
-                }
-                auto tup = new ASTTuple(values);
-                tup->setRequireParens(false);
-                auto next_tup = new ASTTuple(next_tuple);
-                next_tup->setRequireParens(false);
-                stack.push(tup);
-                stack.push(next_tup);
-            }
+            handleSwap(operand);
             break;
         case Pyc::BINARY_SLICE:
             handleSubscript(opcode);
@@ -14981,6 +14876,124 @@ void CodeBuilder::handleEndFinally()
             curblock->append(cont.cast<ASTNode>());
         }
     }
+}
+
+/* SWAP exchanges TOS with the operand-th entry, but pycdc uses it to recognise
+ * several source shapes rather than literally swapping. For SWAP 2 it looks
+ * ahead: a following COPY 2 that feeds a comparison (or a recorded chainIfSwap
+ * offset) is the start of a chained comparison (`a < b < c`), so it arms
+ * chainCmp and resumes past the COPY; a following POP_TOP/POP_EXCEPT is the
+ * dotted `import a.b.c as d` walk, so the import (kept whole) is preserved.
+ * A SWAP before UNPACK, or during an in-place op, reorders the top `operand`
+ * entries. Otherwise it opens a tuple-unpack target (an accumulator plus a
+ * placeholder). */
+void CodeBuilder::handleSwap(int operand)
+{
+    if (operand == 2) {
+        int sv_bufpos = source.pos();
+        int sv_pos = pos;
+        int nop = 0, narg = 0;
+        bc_next(source, mod, nop, narg, pos);
+        if (nop == Pyc::COPY_A && narg == 2) {
+            int afterCopy_bufpos = source.pos();
+            int afterCopy_pos = pos;
+            bool valueCtx = false;
+            for (int g = 0; g < 8; ++g) {
+                bc_next(source, mod, nop, narg, pos);
+                if (nop == Pyc::CACHE || nop == Pyc::COMPARE_OP_A)
+                    continue;
+                valueCtx = (nop == Pyc::JUMP_IF_FALSE_OR_POP_A);
+                break;
+            }
+            if (valueCtx || chainIfSwap.count(curpos)) {
+                source.setPos(afterCopy_bufpos);
+                pos = afterCopy_pos;
+                chainCmp = 1;
+                return;
+            }
+        }
+        source.setPos(sv_bufpos);
+        pos = sv_pos;
+
+        {
+            int p_buf = source.pos(), p_pos = pos, nxop = 0, nxarg = 0;
+            bc_next(source, mod, nxop, nxarg, pos);
+            if ((nxop == Pyc::POP_TOP || nxop == Pyc::POP_EXCEPT)
+                    && stack.top() != nullptr) {
+                PycRef<ASTNode> keep = stack.top();
+                stack.pop();
+                PycRef<ASTNode> below =
+                        stack.empty() ? nullptr : stack.top();
+                if (!stack.empty())
+                    stack.pop();
+                // `import a.b.c as d`: CPython walks the dotted path
+                // with IMPORT_FROM/SWAP/POP_TOP, discarding each
+                // parent package and keeping the child module. The
+                // ASTImport already carries the full dotted name, so
+                // keep it (not the intermediate attribute name)
+                // through the walk; the trailing STORE_NAME/POP_TOP
+                // then renders the `import ... as ...`.
+                if (below != nullptr
+                        && below.type() == ASTNode::NODE_IMPORT) {
+                    PycRef<ASTImport> imp = below.cast<ASTImport>();
+                    PycRef<ASTNode> fl = imp->fromlist();
+                    bool noFromlist = (fl == nullptr)
+                            || (fl.type() == ASTNode::NODE_OBJECT
+                                && fl.cast<ASTObject>()->object()
+                                   == Pyc_None);
+                    if (noFromlist && imp->level() == 0)
+                        keep = below;
+                }
+                stack.push(keep);
+                return;
+            }
+            source.setPos(p_buf);
+            pos = p_pos;
+        }
+    }
+    if (operand >= 2) {
+        int p_buf = source.pos(), p_pos = pos, nxop = 0, nxarg = 0;
+        bc_next(source, mod, nxop, nxarg, pos);
+        source.setPos(p_buf);
+        pos = p_pos;
+        if ((nxop == Pyc::UNPACK_SEQUENCE_A || nxop == Pyc::UNPACK_EX_A)
+                && stack.top(operand) != nullptr) {
+            std::vector<PycRef<ASTNode>> tmp(operand);
+            for (int i = operand - 1; i >= 0; i--) {
+                tmp[i] = stack.top();
+                stack.pop();
+            }
+            std::swap(tmp[0], tmp[operand - 1]);
+            for (int i = 0; i < operand; i++)
+                stack.push(tmp[i]);
+            return;
+        }
+    }
+    if (inplaceStore && operand >= 2) {
+        std::vector<PycRef<ASTNode>> tmp(operand);
+        for (int i = operand - 1; i >= 0; i--) {
+            tmp[i] = stack.top();
+            stack.pop();
+        }
+        std::swap(tmp[0], tmp[operand - 1]);
+        for (int i = 0; i < operand; i++)
+            stack.push(tmp[i]);
+        return;
+    }
+    unpack = operand;
+    ASTTuple::value_t values;
+    ASTTuple::value_t next_tuple;
+    values.resize(operand);
+    for (int i = 0; i < operand; i++) {
+        values[operand - i - 1] = stack.top();
+        stack.pop();
+    }
+    auto tup = new ASTTuple(values);
+    tup->setRequireParens(false);
+    auto next_tup = new ASTTuple(next_tuple);
+    next_tup->setRequireParens(false);
+    stack.push(tup);
+    stack.push(next_tup);
 }
 
 /* The `with`-statement setup opcodes.
