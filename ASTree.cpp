@@ -472,6 +472,10 @@ public:
     PycRef<ASTNode> build();
 
 private:
+    /* A loop's [start, end) byte range and its exit offset (a continue records
+       exit = the offset just past the loop). */
+    struct LoopRange { int start; int end; int exit; };
+
     /* Per-opcode-group handlers lifted out of build()'s dispatch switch. */
     void handleUnaryOp(int opcode);
     void handleBinaryOp(int opcode, int operand);
@@ -579,6 +583,14 @@ private:
     /* Set by SETUP_FINALLY and cleared by SETUP_EXCEPT: whether the container
        block just opened is a bare try/finally (no except clause). */
     bool need_try = false;
+    /* Prescan-collected [start,end,exit) ranges of every loop, and a map from a
+       FOR_ITER offset to an early loop-close offset when the loop body ends
+       before the recorded block end. */
+    std::vector<LoopRange> loopRanges;
+    std::unordered_map<int, int> forEarlyClose;
+    /* True while a comprehension's trailing filter (`if cond`) is still being
+       threaded forward onto the comprehension's condition. */
+    bool compFilterFwd = false;
 };
 
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
@@ -615,7 +627,6 @@ PycRef<ASTNode> CodeBuilder::build()
     struct BoolShortCircuit { PycRef<ASTNode> left; bool isOr; int target; int off; };
     std::vector<BoolShortCircuit> boolPending;
     bool else_pop = false;
-    bool compFilterFwd = false;
     int lastSubstantialOp = Pyc::PYC_INVALID_OPCODE;
     std::unordered_map<int,int> dupHandlerEnd;
     std::unordered_set<int> dupActiveSkip;
@@ -3840,8 +3851,6 @@ PycRef<ASTNode> CodeBuilder::build()
         }
     }
 
-    struct LoopRange { int start; int end; int exit; };
-    std::vector<LoopRange> loopRanges;
     std::unordered_map<int, int> forStartToExit;
     std::vector<std::pair<int,int>> fwdJumps;
     std::unordered_map<int, int> opEndingBefore;
@@ -4437,7 +4446,6 @@ PycRef<ASTNode> CodeBuilder::build()
     }
     for (int E : loopFinBreakExit)
         loopCloseAtExit.insert(E);
-    std::unordered_map<int, int> forEarlyClose;
     std::set<int> forElseBreakLoop;
     for (const auto& kv : forStartToExit) {
         int s = kv.first, E = kv.second;
