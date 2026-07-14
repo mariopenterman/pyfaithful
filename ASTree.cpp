@@ -476,6 +476,7 @@ private:
     void handleBinaryOp(int opcode, int operand);
     void handleIsContainsOp(int opcode, int operand);
     void handleBuildCollection(int opcode, int operand);
+    void handleLoad(int opcode, int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -13967,27 +13968,8 @@ PycRef<ASTNode> CodeBuilder::build()
             }
             break;
         case Pyc::LOAD_ATTR_A:
-            {
-                PycRef<ASTNode> name = stack.top();
-                if (name.type() != ASTNode::NODE_IMPORT) {
-                    stack.pop();
-
-                    if (mod->verCompare(3, 12) >= 0) {
-                        if (operand & 1) {
-                            /* Changed in version 3.12:
-                            If the low bit of name is set, then a NULL or self is pushed to the stack
-                            before the attribute or unbound method respectively. */
-                            stack.push(nullptr);
-                        }
-                        operand >>= 1;
-                    }
-
-                    stack.push(new ASTBinary(name, new ASTName(code->getName(operand)), ASTBinary::BIN_ATTR));
-                }
-            }
-            break;
         case Pyc::LOAD_BUILD_CLASS:
-            stack.push(new ASTLoadBuildClass(new PycObject()));
+            handleLoad(opcode, operand);
             break;
         case Pyc::LOAD_CLOSURE_A:
             if (mod->verCompare(3, 6) >= 0) {
@@ -14026,50 +14008,18 @@ PycRef<ASTNode> CodeBuilder::build()
             break;
         case Pyc::LOAD_DEREF_A:
         case Pyc::LOAD_CLASSDEREF_A:
-            stack.push(new ASTName(code->getCellVar(mod, operand)));
-            break;
         case Pyc::LOAD_FAST_A:
-            if (mod->verCompare(1, 3) < 0)
-                stack.push(new ASTName(code->getName(operand)));
-            else
-                stack.push(new ASTName(code->getLocal(operand)));
-            break;
         case Pyc::LOAD_FAST_LOAD_FAST_A:
-            stack.push(new ASTName(code->getLocal(operand >> 4)));
-            stack.push(new ASTName(code->getLocal(operand & 0xF)));
-            break;
         case Pyc::LOAD_GLOBAL_A:
-            if (mod->verCompare(3, 11) >= 0) {
-                // Loads the global named co_names[namei>>1] onto the stack.
-                if (operand & 1) {
-                    /* Changed in version 3.11: 
-                    If the low bit of "NAMEI" (operand) is set, 
-                    then a NULL is pushed to the stack before the global variable. */
-                    stack.push(nullptr);
-                }
-                operand >>= 1;
-            }
-            stack.push(new ASTName(code->getName(operand)));
-            break;
         case Pyc::LOAD_LOCALS:
-            stack.push(new ASTNode(ASTNode::NODE_LOCALS));
+            handleLoad(opcode, operand);
             break;
         case Pyc::STORE_LOCALS:
             stack.pop();
             break;
         case Pyc::LOAD_METHOD_A:
-            {
-                // Behave like LOAD_ATTR
-                PycRef<ASTNode> name = stack.top();
-                stack.pop();
-                PycRef<ASTNode> meth = new ASTBinary(name, new ASTName(code->getName(operand)), ASTBinary::BIN_ATTR);
-                if (mod->verCompare(3, 11) >= 0)
-                    stack.push(nullptr);
-                stack.push(meth);
-            }
-            break;
         case Pyc::LOAD_NAME_A:
-            stack.push(new ASTName(code->getName(operand)));
+            handleLoad(opcode, operand);
             break;
         case Pyc::MAKE_CLOSURE_A:
         case Pyc::MAKE_FUNCTION_A:
@@ -16408,6 +16358,92 @@ void CodeBuilder::handleBuildCollection(int opcode, int operand)
             }
             stack.push(new ASTTuple(values));
         }
+        break;
+    }
+}
+
+/* The simple load opcodes that just push a name/reference node (the operator
+ * loads and the constant load, which need extra state, stay inline in build()).
+ *   LOAD_FAST / LOAD_NAME / LOAD_GLOBAL / LOAD_DEREF / LOAD_CLASSDEREF ->
+ *       push the local / name / global / closure variable by index.
+ *   LOAD_FAST_LOAD_FAST (3.13) packs two local indices into one operand.
+ *   LOAD_ATTR / LOAD_METHOD -> pop the object and push `obj.attr` (BIN_ATTR);
+ *       LOAD_ATTR on an in-progress import is left untouched so it renders as
+ *       part of the import. From 3.11/3.12 the low operand bit signals that a
+ *       NULL/self placeholder is pushed first, and the real index is operand>>1.
+ *   LOAD_BUILD_CLASS / LOAD_LOCALS -> push the __build_class__ helper / the
+ *       frame locals marker.
+ * operand is taken by value; its in-case shifts do not escape (the dispatch
+ * loop re-reads operand each instruction and never uses it after the switch). */
+void CodeBuilder::handleLoad(int opcode, int operand)
+{
+    switch (opcode) {
+    case Pyc::LOAD_ATTR_A:
+        {
+            PycRef<ASTNode> name = stack.top();
+            if (name.type() != ASTNode::NODE_IMPORT) {
+                stack.pop();
+
+                if (mod->verCompare(3, 12) >= 0) {
+                    if (operand & 1) {
+                        /* Changed in version 3.12:
+                        If the low bit of name is set, then a NULL or self is pushed to the stack
+                        before the attribute or unbound method respectively. */
+                        stack.push(nullptr);
+                    }
+                    operand >>= 1;
+                }
+
+                stack.push(new ASTBinary(name, new ASTName(code->getName(operand)), ASTBinary::BIN_ATTR));
+            }
+        }
+        break;
+    case Pyc::LOAD_BUILD_CLASS:
+        stack.push(new ASTLoadBuildClass(new PycObject()));
+        break;
+    case Pyc::LOAD_DEREF_A:
+    case Pyc::LOAD_CLASSDEREF_A:
+        stack.push(new ASTName(code->getCellVar(mod, operand)));
+        break;
+    case Pyc::LOAD_FAST_A:
+        if (mod->verCompare(1, 3) < 0)
+            stack.push(new ASTName(code->getName(operand)));
+        else
+            stack.push(new ASTName(code->getLocal(operand)));
+        break;
+    case Pyc::LOAD_FAST_LOAD_FAST_A:
+        stack.push(new ASTName(code->getLocal(operand >> 4)));
+        stack.push(new ASTName(code->getLocal(operand & 0xF)));
+        break;
+    case Pyc::LOAD_GLOBAL_A:
+        if (mod->verCompare(3, 11) >= 0) {
+            // Loads the global named co_names[namei>>1] onto the stack.
+            if (operand & 1) {
+                /* Changed in version 3.11:
+                If the low bit of "NAMEI" (operand) is set,
+                then a NULL is pushed to the stack before the global variable. */
+                stack.push(nullptr);
+            }
+            operand >>= 1;
+        }
+        stack.push(new ASTName(code->getName(operand)));
+        break;
+    case Pyc::LOAD_LOCALS:
+        stack.push(new ASTNode(ASTNode::NODE_LOCALS));
+        break;
+    case Pyc::LOAD_METHOD_A:
+        {
+            // Behave like LOAD_ATTR
+            PycRef<ASTNode> name = stack.top();
+            stack.pop();
+            PycRef<ASTNode> meth = new ASTBinary(name, new ASTName(code->getName(operand)), ASTBinary::BIN_ATTR);
+            if (mod->verCompare(3, 11) >= 0)
+                stack.push(nullptr);
+            stack.push(meth);
+        }
+        break;
+    case Pyc::LOAD_NAME_A:
+        stack.push(new ASTName(code->getName(operand)));
         break;
     }
 }
