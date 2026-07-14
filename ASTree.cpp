@@ -532,6 +532,15 @@ private:
     int tupleStore = 0;
     std::vector<PycRef<ASTNode> > tupleStoreTargets;
     std::vector<PycRef<ASTNode> > tupleStoreValues;
+    /* Byte offset of the instruction currently being dispatched. */
+    int curpos = 0;
+    /* Walrus (`:=`) bookkeeping from the prescan: offsets whose STORE is the
+       named target of an assignment expression (walrusStores), and the paired
+       COPY offsets that duplicate the value (walrusCopies). */
+    std::unordered_set<int> walrusCopies, walrusStores;
+    /* Prescan map keyed by the STORE offset that begins a foldable simultaneous
+       tuple assignment; the value is the number of parallel targets in the run. */
+    std::unordered_map<int, int> tupleAssignStart;
 };
 
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
@@ -567,7 +576,6 @@ PycRef<ASTNode> CodeBuilder::build()
     blocks.push(defblock);
 
     int opcode, operand;
-    int curpos = 0;
     int pos = 0;
     struct BoolShortCircuit { PycRef<ASTNode> left; bool isOr; int target; int off; };
     std::vector<BoolShortCircuit> boolPending;
@@ -830,7 +838,6 @@ PycRef<ASTNode> CodeBuilder::build()
 
     std::unordered_set<int> chainCopyOffsets = scanChainAssignCopies(code, mod);
 
-    std::unordered_set<int> walrusCopies, walrusStores;
     {
         PycBuffer ws(code->code()->value(), code->code()->length());
         int wo, wa, wp = 0, prevOp = -1, prevArg = -1, prevOff = -1;
@@ -873,7 +880,6 @@ PycRef<ASTNode> CodeBuilder::build()
        assign `a = b = <expr>` also ends in consecutive stores, but each is
        preceded by a COPY, so a run whose first store follows a COPY is
        excluded. */
-    std::unordered_map<int, int> tupleAssignStart;
     {
         auto isSimpleStore = [](int op) {
             return op == Pyc::STORE_FAST_A || op == Pyc::STORE_NAME_A
