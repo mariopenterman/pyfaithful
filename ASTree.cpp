@@ -513,6 +513,8 @@ private:
     void handleReturnConst(int operand);
     bool handleSetupWith(int opcode, int operand);
     void handleWithCleanup();
+    void handleCheckExcMatch();
+    void handleEndFor();
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -13484,40 +13486,10 @@ PycRef<ASTNode> CodeBuilder::build()
             /* Python 3.11+: pushes exception info tuple. We ignore here to keep decompilation going. */
             break;
         case Pyc::CHECK_EXC_MATCH:
-            {
-                /* Python 3.11+: compares exception against handler type. */
-                PycRef<ASTNode> right = stack.top();
-                stack.pop();
-                PycRef<ASTNode> left = stack.top();
-                stack.pop();
-                stack.push(new ASTCompare(left, right, ASTCompare::CMP_EXCEPTION));
-            }
+            handleCheckExcMatch();
             break;
         case Pyc::END_FOR:
-            {
-                stack.pop();
-
-                if ((opcode == Pyc::END_FOR) && (mod->majorVer() == 3) && (mod->minorVer() == 12)) {
-                    // one additional pop for python 3.12
-                    stack.pop();
-                }
-
-                // end for loop here
-                /* TODO : Ensure that FOR loop ends here. 
-                   Due to CACHE instructions at play, the end indicated in
-                   the for loop by pycdas is not correct, it is off by
-                   some small amount. */
-                if (curblock->blktype() == ASTBlock::BLK_FOR) {
-                    PycRef<ASTBlock> prev = blocks.top();
-                    blocks.pop();
-
-                    curblock = blocks.top();
-                    curblock->append(prev.cast<ASTNode>());
-                }
-                else {
-                    fprintf(stderr, "Wrong block type %i for END_FOR\n", curblock->blktype());
-                }
-            }
+            handleEndFor();
             break;
         case Pyc::POP_TOP:
             if (!handlePopTop())
@@ -15534,6 +15506,47 @@ void CodeBuilder::handleWithCleanup()
     }
     else {
         fprintf(stderr, "Something TERRIBLE happened! No matching with block found for WITH_CLEANUP at %d\n", curpos);
+    }
+}
+
+/* CHECK_EXC_MATCH (3.11+) tests the active exception against a handler type,
+ * pushing an `except`-comparison node (`exc matches type`) built from the two
+ * operands. */
+void CodeBuilder::handleCheckExcMatch()
+{
+    /* Python 3.11+: compares exception against handler type. */
+    PycRef<ASTNode> right = stack.top();
+    stack.pop();
+    PycRef<ASTNode> left = stack.top();
+    stack.pop();
+    stack.push(new ASTCompare(left, right, ASTCompare::CMP_EXCEPTION));
+}
+
+/* END_FOR (3.12+) marks the end of a for loop: it pops the exhausted iterator
+ * (two values on 3.12) and closes the BLK_FOR into its parent. */
+void CodeBuilder::handleEndFor()
+{
+    stack.pop();
+
+    if ((opcode == Pyc::END_FOR) && (mod->majorVer() == 3) && (mod->minorVer() == 12)) {
+        // one additional pop for python 3.12
+        stack.pop();
+    }
+
+    // end for loop here
+    /* TODO : Ensure that FOR loop ends here.
+       Due to CACHE instructions at play, the end indicated in
+       the for loop by pycdas is not correct, it is off by
+       some small amount. */
+    if (curblock->blktype() == ASTBlock::BLK_FOR) {
+        PycRef<ASTBlock> prev = blocks.top();
+        blocks.pop();
+
+        curblock = blocks.top();
+        curblock->append(prev.cast<ASTNode>());
+    }
+    else {
+        fprintf(stderr, "Wrong block type %i for END_FOR\n", curblock->blktype());
     }
 }
 
