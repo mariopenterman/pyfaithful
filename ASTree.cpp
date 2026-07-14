@@ -490,6 +490,8 @@ private:
     /* Simultaneous tuple-assignment helpers (see the tupleAssignStart prescan). */
     bool tupleAssignSafe(int K);
     void tupleStoreStep(PycRef<ASTNode> tname);
+    /* Returns false to signal a bail-out (the caller returns the partial tree). */
+    bool handleStore(int opcode, int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -14684,381 +14686,11 @@ PycRef<ASTNode> CodeBuilder::build()
             }
             break;
         case Pyc::STORE_DEREF_A:
-            {
-                inplaceStore = 0;
-                if (walrusStores.count(curpos)) {
-                    PycRef<ASTNode> value = stack.top(); stack.pop();
-                    stack.push(new ASTStore(value, new ASTName(code->getCellVar(mod, operand)), true));
-                    break;
-                }
-                if (tupleStore == 0 && unpack == 0 && tupleAssignStart.count(curpos)
-                        && tupleAssignSafe(tupleAssignStart[curpos]))
-                    tupleStore = tupleAssignStart[curpos];
-                if (tupleStore > 0) {
-                    tupleStoreStep(new ASTName(code->getCellVar(mod, operand)));
-                    break;
-                }
-                if (unpack) {
-                    PycRef<ASTNode> name = new ASTName(code->getCellVar(mod, operand));
-                    if (unpack == unpackStar)
-                        name = new ASTUnary(name, ASTUnary::UN_STAR);
-
-                    PycRef<ASTNode> tup = stack.top();
-                    if (tup.type() == ASTNode::NODE_TUPLE)
-                        tup.cast<ASTTuple>()->add(name);
-                    else
-                        fputs("Something TERRIBLE happened!\n", stderr);
-
-                    --unpack;
-                    while (unpack <= 0 && !unpackNest.empty()) {
-                        PycRef<ASTNode> inner = stack.top(); stack.pop();
-                        tup = stack.top();
-                        if (tup.type() == ASTNode::NODE_TUPLE)
-                            tup.cast<ASTTuple>()->add(inner);
-                        unpack = unpackNest.back() - 1; unpackNest.pop_back();
-                    }
-                    if (unpack <= 0) {
-                        stack.pop();
-                        PycRef<ASTNode> seq = stack.top();
-                        stack.pop();
-
-                        if (curblock->blktype() == ASTBlock::BLK_FOR
-                                && !curblock->inited()) {
-                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
-                            if (tuple != NULL)
-                                tuple->setRequireParens(false);
-                            curblock.cast<ASTIterBlock>()->setIndex(tup);
-                        } else if (curblock->blktype() == ASTBlock::BLK_WITH
-                                   && !curblock->inited()) {
-                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
-                            if (tuple != NULL)
-                                tuple->setRequireParens(true);
-                            curblock.cast<ASTWithBlock>()->setExpr(seq);
-                            curblock.cast<ASTWithBlock>()->setVar(tup);
-                        } else if (seq.type() == ASTNode::NODE_CHAINSTORE) {
-                            append_to_chain_store(seq, tup, stack, curblock);
-                        } else {
-                            curblock->append(new ASTStore(seq, tup));
-                        }
-                    }
-                } else {
-                    PycRef<ASTNode> value = stack.top();
-                    stack.pop();
-                    PycRef<ASTNode> name = new ASTName(code->getCellVar(mod, operand));
-
-                    if ((curblock->blktype() == ASTBlock::BLK_FOR
-                                || curblock->blktype() == ASTBlock::BLK_ASYNCFOR)
-                            && !curblock->inited()) {
-                        curblock.cast<ASTIterBlock>()->setIndex(name);
-                    } else if (curblock->blktype() == ASTBlock::BLK_WITH
-                               && !curblock->inited()) {
-                        /* `with <mgr> as <cellvar>:` — the `as` target is a closure
-                           cell (an inner comprehension/function captures it), stored
-                           via STORE_DEREF. Set the with's expr+var like the STORE_FAST
-                           target, else the manager is lost and the with mis-renders. */
-                        if (value != nullptr && value.type() == ASTNode::NODE_COMPREHENSION) {
-                            cleanBuild = false;
-                            return new ASTNodeList(defblock->nodes());
-                        }
-                        curblock.cast<ASTWithBlock>()->setExpr(value);
-                        curblock.cast<ASTWithBlock>()->setVar(name);
-                    } else if (value.type() == ASTNode::NODE_CHAINSTORE) {
-                        append_to_chain_store(value, name, stack, curblock);
-                    } else if (!tryAttachDecorators(curblock, value, name)) {
-                        curblock->append(new ASTStore(value, name));
-                    }
-                }
-            }
-            break;
         case Pyc::STORE_FAST_A:
-            {
-                inplaceStore = 0;
-                if (walrusStores.count(curpos)) {
-                    PycRef<ASTNode> value = stack.top(); stack.pop();
-                    PycRef<ASTNode> wname = (mod->verCompare(1, 3) < 0)
-                        ? new ASTName(code->getName(operand))
-                        : new ASTName(code->getLocal(operand));
-                    stack.push(new ASTStore(value, wname, true));
-                    break;
-                }
-                if (tupleStore == 0 && unpack == 0 && tupleAssignStart.count(curpos)
-                        && tupleAssignSafe(tupleAssignStart[curpos]))
-                    tupleStore = tupleAssignStart[curpos];
-                if (tupleStore > 0) {
-                    tupleStoreStep((mod->verCompare(1, 3) < 0)
-                        ? new ASTName(code->getName(operand))
-                        : new ASTName(code->getLocal(operand)));
-                    break;
-                }
-                if (unpack) {
-                    PycRef<ASTNode> name;
-
-                    if (mod->verCompare(1, 3) < 0)
-                        name = new ASTName(code->getName(operand));
-                    else
-                        name = new ASTName(code->getLocal(operand));
-                    if (unpack == unpackStar)
-                        name = new ASTUnary(name, ASTUnary::UN_STAR);
-
-                    PycRef<ASTNode> tup = stack.top();
-                    if (tup.type() == ASTNode::NODE_TUPLE)
-                        tup.cast<ASTTuple>()->add(name);
-                    else
-                        fputs("Something TERRIBLE happened!\n", stderr);
-
-                    --unpack;
-                    while (unpack <= 0 && !unpackNest.empty()) {
-                        PycRef<ASTNode> inner = stack.top(); stack.pop();
-                        tup = stack.top();
-                        if (tup.type() == ASTNode::NODE_TUPLE)
-                            tup.cast<ASTTuple>()->add(inner);
-                        unpack = unpackNest.back() - 1; unpackNest.pop_back();
-                    }
-                    if (unpack <= 0) {
-                        stack.pop();
-                        PycRef<ASTNode> seq = stack.top();
-                        stack.pop();
-
-                        if (curblock->blktype() == ASTBlock::BLK_FOR
-                                && !curblock->inited()) {
-                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
-                            if (tuple != NULL)
-                                tuple->setRequireParens(false);
-                            curblock.cast<ASTIterBlock>()->setIndex(tup);
-                        } else if (curblock->blktype() == ASTBlock::BLK_WITH
-                                   && !curblock->inited()) {
-                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
-                            if (tuple != NULL)
-                                tuple->setRequireParens(true);
-                            curblock.cast<ASTWithBlock>()->setExpr(seq);
-                            curblock.cast<ASTWithBlock>()->setVar(tup);
-                        } else if (seq.type() == ASTNode::NODE_CHAINSTORE) {
-                            append_to_chain_store(seq, tup, stack, curblock);
-                        } else {
-                            curblock->append(new ASTStore(seq, tup));
-                        }
-                    }
-                } else {
-                    PycRef<ASTNode> value = stack.top();
-                    stack.pop();
-                    PycRef<ASTNode> name;
-
-                    if (mod->verCompare(1, 3) < 0)
-                        name = new ASTName(code->getName(operand));
-                    else
-                        name = new ASTName(code->getLocal(operand));
-
-                    if (name.cast<ASTName>()->name()->value()[0] == '_'
-                            && name.cast<ASTName>()->name()->value()[1] == '[') {
-                        /* Don't show stores of list comp append objects. */
-                        break;
-                    }
-
-                    if ((curblock->blktype() == ASTBlock::BLK_FOR
-                                || curblock->blktype() == ASTBlock::BLK_ASYNCFOR)
-                            && !curblock->inited()) {
-                        curblock.cast<ASTIterBlock>()->setIndex(name);
-                    } else if (!stack.empty() && stack.top() != nullptr
-                               && stack.top().type() == ASTNode::NODE_IMPORT) {
-                        stack.top().cast<ASTImport>()->add_store(new ASTStore(value, name));
-                    } else if (curblock->blktype() == ASTBlock::BLK_WITH
-                                   && !curblock->inited()) {
-                        if (value != nullptr && value.type() == ASTNode::NODE_COMPREHENSION) {
-                            cleanBuild = false;
-                            return new ASTNodeList(defblock->nodes());
-                        }
-                        curblock.cast<ASTWithBlock>()->setExpr(value);
-                        curblock.cast<ASTWithBlock>()->setVar(name);
-                    } else if (value.type() == ASTNode::NODE_CHAINSTORE) {
-                        append_to_chain_store(value, name, stack, curblock);
-                    } else if (!tryAttachDecorators(curblock, value, name)) {
-                        curblock->append(new ASTStore(value, name));
-                    }
-                }
-            }
-            break;
         case Pyc::STORE_GLOBAL_A:
-            {
-                inplaceStore = 0;
-                if (walrusStores.count(curpos)) {
-                    PycRef<ASTNode> value = stack.top(); stack.pop();
-                    stack.push(new ASTStore(value, new ASTName(code->getName(operand)), true));
-                    break;
-                }
-                if (tupleStore == 0 && unpack == 0 && tupleAssignStart.count(curpos)
-                        && tupleAssignSafe(tupleAssignStart[curpos]))
-                    tupleStore = tupleAssignStart[curpos];
-                if (tupleStore > 0) {
-                    tupleStoreStep(new ASTName(code->getName(operand)));
-                    break;
-                }
-                PycRef<ASTNode> name = new ASTName(code->getName(operand));
-
-                if (unpack) {
-                    if (unpack == unpackStar)
-                        name = new ASTUnary(name, ASTUnary::UN_STAR);
-                    PycRef<ASTNode> tup = stack.top();
-                    if (tup.type() == ASTNode::NODE_TUPLE)
-                        tup.cast<ASTTuple>()->add(name);
-                    else
-                        fputs("Something TERRIBLE happened!\n", stderr);
-
-                    --unpack;
-                    while (unpack <= 0 && !unpackNest.empty()) {
-                        PycRef<ASTNode> inner = stack.top(); stack.pop();
-                        tup = stack.top();
-                        if (tup.type() == ASTNode::NODE_TUPLE)
-                            tup.cast<ASTTuple>()->add(inner);
-                        unpack = unpackNest.back() - 1; unpackNest.pop_back();
-                    }
-                    if (unpack <= 0) {
-                        stack.pop();
-                        PycRef<ASTNode> seq = stack.top();
-                        stack.pop();
-
-                        if (curblock->blktype() == ASTBlock::BLK_FOR
-                                && !curblock->inited()) {
-                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
-                            if (tuple != NULL)
-                                tuple->setRequireParens(false);
-                            curblock.cast<ASTIterBlock>()->setIndex(tup);
-                        } else if (curblock->blktype() == ASTBlock::BLK_WITH
-                                   && !curblock->inited()) {
-                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
-                            if (tuple != NULL)
-                                tuple->setRequireParens(true);
-                            curblock.cast<ASTWithBlock>()->setExpr(seq);
-                            curblock.cast<ASTWithBlock>()->setVar(tup);
-                        } else if (seq.type() == ASTNode::NODE_CHAINSTORE) {
-                            append_to_chain_store(seq, tup, stack, curblock);
-                        } else {
-                            curblock->append(new ASTStore(seq, tup));
-                        }
-                    }
-                } else {
-                    PycRef<ASTNode> value = stack.top();
-                    stack.pop();
-                    if (!stack.empty() && stack.top() != nullptr
-                            && stack.top().type() == ASTNode::NODE_IMPORT) {
-                        /* `from mod import name` where `name` is declared `global`:
-                           the IMPORT_FROM value binds to the import (mirrors the
-                           STORE_NAME/STORE_FAST path) rather than a bare `name = name`. */
-                        stack.top().cast<ASTImport>()->add_store(new ASTStore(value, name));
-                    } else if (value.type() == ASTNode::NODE_CHAINSTORE) {
-                        append_to_chain_store(value, name, stack, curblock);
-                    } else if (!tryAttachDecorators(curblock, value, name)) {
-                        curblock->append(new ASTStore(value, name));
-                    }
-                }
-
-                /* Mark the global as used */
-                code->markGlobal(name.cast<ASTName>()->name());
-            }
-            break;
         case Pyc::STORE_NAME_A:
-            {
-                inplaceStore = 0;
-                if (walrusStores.count(curpos)) {
-                    PycRef<ASTNode> value = stack.top(); stack.pop();
-                    stack.push(new ASTStore(value, new ASTName(code->getName(operand)), true));
-                    break;
-                }
-                if (tupleStore == 0 && unpack == 0 && tupleAssignStart.count(curpos)
-                        && tupleAssignSafe(tupleAssignStart[curpos]))
-                    tupleStore = tupleAssignStart[curpos];
-                if (tupleStore > 0) {
-                    tupleStoreStep(new ASTName(code->getName(operand)));
-                    break;
-                }
-                if (unpack) {
-                    PycRef<ASTNode> name = new ASTName(code->getName(operand));
-                    if (unpack == unpackStar)
-                        name = new ASTUnary(name, ASTUnary::UN_STAR);
-
-                    PycRef<ASTNode> tup = stack.top();
-                    if (tup.type() == ASTNode::NODE_TUPLE)
-                        tup.cast<ASTTuple>()->add(name);
-                    else
-                        fputs("Something TERRIBLE happened!\n", stderr);
-
-                    --unpack;
-                    while (unpack <= 0 && !unpackNest.empty()) {
-                        PycRef<ASTNode> inner = stack.top(); stack.pop();
-                        tup = stack.top();
-                        if (tup.type() == ASTNode::NODE_TUPLE)
-                            tup.cast<ASTTuple>()->add(inner);
-                        unpack = unpackNest.back() - 1; unpackNest.pop_back();
-                    }
-                    if (unpack <= 0) {
-                        stack.pop();
-                        PycRef<ASTNode> seq = stack.top();
-                        stack.pop();
-
-                        if (curblock->blktype() == ASTBlock::BLK_FOR
-                                && !curblock->inited()) {
-                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
-                            if (tuple != NULL)
-                                tuple->setRequireParens(false);
-                            curblock.cast<ASTIterBlock>()->setIndex(tup);
-                        } else if (curblock->blktype() == ASTBlock::BLK_WITH
-                                   && !curblock->inited()) {
-                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
-                            if (tuple != NULL)
-                                tuple->setRequireParens(true);
-                            curblock.cast<ASTWithBlock>()->setExpr(seq);
-                            curblock.cast<ASTWithBlock>()->setVar(tup);
-                        } else if (seq.type() == ASTNode::NODE_CHAINSTORE) {
-                            append_to_chain_store(seq, tup, stack, curblock);
-                        } else {
-                            curblock->append(new ASTStore(seq, tup));
-                        }
-                    }
-                } else {
-                    PycRef<ASTNode> value = stack.top();
-                    stack.pop();
-
-                    PycRef<PycString> varname = code->getName(operand);
-                    if (varname->length() >= 2 && varname->value()[0] == '_'
-                            && varname->value()[1] == '[') {
-                        /* Don't show stores of list comp append objects. */
-                        break;
-                    }
-                    if (varname->isEqual("__classcell__"))
-                        break;
-
-                    // Return private names back to their original name
-                    const std::string class_prefix = std::string("_") + code->name()->strValue();
-                    if (varname->startsWith(class_prefix + std::string("__")))
-                        varname->setValue(varname->strValue().substr(class_prefix.size()));
-
-                    PycRef<ASTNode> name = new ASTName(varname);
-
-                    if ((curblock->blktype() == ASTBlock::BLK_FOR
-                                || curblock->blktype() == ASTBlock::BLK_ASYNCFOR)
-                            && !curblock->inited()) {
-                        curblock.cast<ASTIterBlock>()->setIndex(name);
-                    } else if (stack.top().type() == ASTNode::NODE_IMPORT) {
-                        PycRef<ASTImport> import = stack.top().cast<ASTImport>();
-
-                        import->add_store(new ASTStore(value, name));
-                    } else if (curblock->blktype() == ASTBlock::BLK_WITH
-                               && !curblock->inited()) {
-                        if (value != nullptr && value.type() == ASTNode::NODE_COMPREHENSION) {
-                            cleanBuild = false;
-                            return new ASTNodeList(defblock->nodes());
-                        }
-                        curblock.cast<ASTWithBlock>()->setExpr(value);
-                        curblock.cast<ASTWithBlock>()->setVar(name);
-                    } else if (value.type() == ASTNode::NODE_CHAINSTORE) {
-                        append_to_chain_store(value, name, stack, curblock);
-                    } else if (!tryAttachDecorators(curblock, value, name)) {
-                        curblock->append(new ASTStore(value, name));
-
-                        if (value.type() == ASTNode::NODE_INVALID)
-                            break;
-                    }
-                }
-            }
+            if (!handleStore(opcode, operand))
+                return new ASTNodeList(defblock->nodes());
             break;
         case Pyc::STORE_SLICE_0:
         case Pyc::STORE_SLICE_1:
@@ -15588,6 +15220,408 @@ void CodeBuilder::tupleStoreStep(PycRef<ASTNode> tname)
         tupleStoreTargets.clear();
         tupleStoreValues.clear();
     }
+}
+
+/* The simple name/local/global/closure stores. All four share the same shape and
+ * differ only in how the target name is looked up (getLocal / getName /
+ * getCellVar) plus a few per-opcode extras. In order, each store:
+ *   1. clears inplaceStore (a plain store is not an augmented assignment);
+ *   2. if this offset is a walrus target, pushes an `(name := value)` store
+ *      expression back onto the stack instead of emitting a statement;
+ *   3. if this offset begins a foldable parallel assignment, folds it via
+ *      tupleStoreStep into one `t1, ..., tN = v1, ..., vN`;
+ *   4. if a sequence unpack is in progress, adds the target into the tuple
+ *      pattern (handling a starred target and nested tuples), and on the last
+ *      element emits the unpack -- or wires it as a for/with target;
+ *   5. otherwise emits a normal `name = value` store, with special cases for a
+ *      for/with target, binding to an in-progress import, extending a chained
+ *      assignment, and attaching pending decorators.
+ * STORE_NAME additionally drops list-comp temporaries and __classcell__ and
+ * un-mangles private names; STORE_GLOBAL marks the name global. Returns false
+ * (after setting cleanBuild) when a comprehension turns up as a with-manager,
+ * which cannot be reconstructed -- the caller then returns the partial tree. */
+bool CodeBuilder::handleStore(int opcode, int operand)
+{
+    switch (opcode) {
+        case Pyc::STORE_DEREF_A:
+            {
+                inplaceStore = 0;
+                if (walrusStores.count(curpos)) {
+                    PycRef<ASTNode> value = stack.top(); stack.pop();
+                    stack.push(new ASTStore(value, new ASTName(code->getCellVar(mod, operand)), true));
+                    break;
+                }
+                if (tupleStore == 0 && unpack == 0 && tupleAssignStart.count(curpos)
+                        && tupleAssignSafe(tupleAssignStart[curpos]))
+                    tupleStore = tupleAssignStart[curpos];
+                if (tupleStore > 0) {
+                    tupleStoreStep(new ASTName(code->getCellVar(mod, operand)));
+                    break;
+                }
+                if (unpack) {
+                    PycRef<ASTNode> name = new ASTName(code->getCellVar(mod, operand));
+                    if (unpack == unpackStar)
+                        name = new ASTUnary(name, ASTUnary::UN_STAR);
+
+                    PycRef<ASTNode> tup = stack.top();
+                    if (tup.type() == ASTNode::NODE_TUPLE)
+                        tup.cast<ASTTuple>()->add(name);
+                    else
+                        fputs("Something TERRIBLE happened!\n", stderr);
+
+                    --unpack;
+                    while (unpack <= 0 && !unpackNest.empty()) {
+                        PycRef<ASTNode> inner = stack.top(); stack.pop();
+                        tup = stack.top();
+                        if (tup.type() == ASTNode::NODE_TUPLE)
+                            tup.cast<ASTTuple>()->add(inner);
+                        unpack = unpackNest.back() - 1; unpackNest.pop_back();
+                    }
+                    if (unpack <= 0) {
+                        stack.pop();
+                        PycRef<ASTNode> seq = stack.top();
+                        stack.pop();
+
+                        if (curblock->blktype() == ASTBlock::BLK_FOR
+                                && !curblock->inited()) {
+                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
+                            if (tuple != NULL)
+                                tuple->setRequireParens(false);
+                            curblock.cast<ASTIterBlock>()->setIndex(tup);
+                        } else if (curblock->blktype() == ASTBlock::BLK_WITH
+                                   && !curblock->inited()) {
+                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
+                            if (tuple != NULL)
+                                tuple->setRequireParens(true);
+                            curblock.cast<ASTWithBlock>()->setExpr(seq);
+                            curblock.cast<ASTWithBlock>()->setVar(tup);
+                        } else if (seq.type() == ASTNode::NODE_CHAINSTORE) {
+                            append_to_chain_store(seq, tup, stack, curblock);
+                        } else {
+                            curblock->append(new ASTStore(seq, tup));
+                        }
+                    }
+                } else {
+                    PycRef<ASTNode> value = stack.top();
+                    stack.pop();
+                    PycRef<ASTNode> name = new ASTName(code->getCellVar(mod, operand));
+
+                    if ((curblock->blktype() == ASTBlock::BLK_FOR
+                                || curblock->blktype() == ASTBlock::BLK_ASYNCFOR)
+                            && !curblock->inited()) {
+                        curblock.cast<ASTIterBlock>()->setIndex(name);
+                    } else if (curblock->blktype() == ASTBlock::BLK_WITH
+                               && !curblock->inited()) {
+                        /* `with <mgr> as <cellvar>:` — the `as` target is a closure
+                           cell (an inner comprehension/function captures it), stored
+                           via STORE_DEREF. Set the with's expr+var like the STORE_FAST
+                           target, else the manager is lost and the with mis-renders. */
+                        if (value != nullptr && value.type() == ASTNode::NODE_COMPREHENSION) {
+                            cleanBuild = false;
+                            return false;
+                        }
+                        curblock.cast<ASTWithBlock>()->setExpr(value);
+                        curblock.cast<ASTWithBlock>()->setVar(name);
+                    } else if (value.type() == ASTNode::NODE_CHAINSTORE) {
+                        append_to_chain_store(value, name, stack, curblock);
+                    } else if (!tryAttachDecorators(curblock, value, name)) {
+                        curblock->append(new ASTStore(value, name));
+                    }
+                }
+            }
+            break;
+        case Pyc::STORE_FAST_A:
+            {
+                inplaceStore = 0;
+                if (walrusStores.count(curpos)) {
+                    PycRef<ASTNode> value = stack.top(); stack.pop();
+                    PycRef<ASTNode> wname = (mod->verCompare(1, 3) < 0)
+                        ? new ASTName(code->getName(operand))
+                        : new ASTName(code->getLocal(operand));
+                    stack.push(new ASTStore(value, wname, true));
+                    break;
+                }
+                if (tupleStore == 0 && unpack == 0 && tupleAssignStart.count(curpos)
+                        && tupleAssignSafe(tupleAssignStart[curpos]))
+                    tupleStore = tupleAssignStart[curpos];
+                if (tupleStore > 0) {
+                    tupleStoreStep((mod->verCompare(1, 3) < 0)
+                        ? new ASTName(code->getName(operand))
+                        : new ASTName(code->getLocal(operand)));
+                    break;
+                }
+                if (unpack) {
+                    PycRef<ASTNode> name;
+
+                    if (mod->verCompare(1, 3) < 0)
+                        name = new ASTName(code->getName(operand));
+                    else
+                        name = new ASTName(code->getLocal(operand));
+                    if (unpack == unpackStar)
+                        name = new ASTUnary(name, ASTUnary::UN_STAR);
+
+                    PycRef<ASTNode> tup = stack.top();
+                    if (tup.type() == ASTNode::NODE_TUPLE)
+                        tup.cast<ASTTuple>()->add(name);
+                    else
+                        fputs("Something TERRIBLE happened!\n", stderr);
+
+                    --unpack;
+                    while (unpack <= 0 && !unpackNest.empty()) {
+                        PycRef<ASTNode> inner = stack.top(); stack.pop();
+                        tup = stack.top();
+                        if (tup.type() == ASTNode::NODE_TUPLE)
+                            tup.cast<ASTTuple>()->add(inner);
+                        unpack = unpackNest.back() - 1; unpackNest.pop_back();
+                    }
+                    if (unpack <= 0) {
+                        stack.pop();
+                        PycRef<ASTNode> seq = stack.top();
+                        stack.pop();
+
+                        if (curblock->blktype() == ASTBlock::BLK_FOR
+                                && !curblock->inited()) {
+                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
+                            if (tuple != NULL)
+                                tuple->setRequireParens(false);
+                            curblock.cast<ASTIterBlock>()->setIndex(tup);
+                        } else if (curblock->blktype() == ASTBlock::BLK_WITH
+                                   && !curblock->inited()) {
+                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
+                            if (tuple != NULL)
+                                tuple->setRequireParens(true);
+                            curblock.cast<ASTWithBlock>()->setExpr(seq);
+                            curblock.cast<ASTWithBlock>()->setVar(tup);
+                        } else if (seq.type() == ASTNode::NODE_CHAINSTORE) {
+                            append_to_chain_store(seq, tup, stack, curblock);
+                        } else {
+                            curblock->append(new ASTStore(seq, tup));
+                        }
+                    }
+                } else {
+                    PycRef<ASTNode> value = stack.top();
+                    stack.pop();
+                    PycRef<ASTNode> name;
+
+                    if (mod->verCompare(1, 3) < 0)
+                        name = new ASTName(code->getName(operand));
+                    else
+                        name = new ASTName(code->getLocal(operand));
+
+                    if (name.cast<ASTName>()->name()->value()[0] == '_'
+                            && name.cast<ASTName>()->name()->value()[1] == '[') {
+                        /* Don't show stores of list comp append objects. */
+                        break;
+                    }
+
+                    if ((curblock->blktype() == ASTBlock::BLK_FOR
+                                || curblock->blktype() == ASTBlock::BLK_ASYNCFOR)
+                            && !curblock->inited()) {
+                        curblock.cast<ASTIterBlock>()->setIndex(name);
+                    } else if (!stack.empty() && stack.top() != nullptr
+                               && stack.top().type() == ASTNode::NODE_IMPORT) {
+                        stack.top().cast<ASTImport>()->add_store(new ASTStore(value, name));
+                    } else if (curblock->blktype() == ASTBlock::BLK_WITH
+                                   && !curblock->inited()) {
+                        if (value != nullptr && value.type() == ASTNode::NODE_COMPREHENSION) {
+                            cleanBuild = false;
+                            return false;
+                        }
+                        curblock.cast<ASTWithBlock>()->setExpr(value);
+                        curblock.cast<ASTWithBlock>()->setVar(name);
+                    } else if (value.type() == ASTNode::NODE_CHAINSTORE) {
+                        append_to_chain_store(value, name, stack, curblock);
+                    } else if (!tryAttachDecorators(curblock, value, name)) {
+                        curblock->append(new ASTStore(value, name));
+                    }
+                }
+            }
+            break;
+        case Pyc::STORE_GLOBAL_A:
+            {
+                inplaceStore = 0;
+                if (walrusStores.count(curpos)) {
+                    PycRef<ASTNode> value = stack.top(); stack.pop();
+                    stack.push(new ASTStore(value, new ASTName(code->getName(operand)), true));
+                    break;
+                }
+                if (tupleStore == 0 && unpack == 0 && tupleAssignStart.count(curpos)
+                        && tupleAssignSafe(tupleAssignStart[curpos]))
+                    tupleStore = tupleAssignStart[curpos];
+                if (tupleStore > 0) {
+                    tupleStoreStep(new ASTName(code->getName(operand)));
+                    break;
+                }
+                PycRef<ASTNode> name = new ASTName(code->getName(operand));
+
+                if (unpack) {
+                    if (unpack == unpackStar)
+                        name = new ASTUnary(name, ASTUnary::UN_STAR);
+                    PycRef<ASTNode> tup = stack.top();
+                    if (tup.type() == ASTNode::NODE_TUPLE)
+                        tup.cast<ASTTuple>()->add(name);
+                    else
+                        fputs("Something TERRIBLE happened!\n", stderr);
+
+                    --unpack;
+                    while (unpack <= 0 && !unpackNest.empty()) {
+                        PycRef<ASTNode> inner = stack.top(); stack.pop();
+                        tup = stack.top();
+                        if (tup.type() == ASTNode::NODE_TUPLE)
+                            tup.cast<ASTTuple>()->add(inner);
+                        unpack = unpackNest.back() - 1; unpackNest.pop_back();
+                    }
+                    if (unpack <= 0) {
+                        stack.pop();
+                        PycRef<ASTNode> seq = stack.top();
+                        stack.pop();
+
+                        if (curblock->blktype() == ASTBlock::BLK_FOR
+                                && !curblock->inited()) {
+                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
+                            if (tuple != NULL)
+                                tuple->setRequireParens(false);
+                            curblock.cast<ASTIterBlock>()->setIndex(tup);
+                        } else if (curblock->blktype() == ASTBlock::BLK_WITH
+                                   && !curblock->inited()) {
+                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
+                            if (tuple != NULL)
+                                tuple->setRequireParens(true);
+                            curblock.cast<ASTWithBlock>()->setExpr(seq);
+                            curblock.cast<ASTWithBlock>()->setVar(tup);
+                        } else if (seq.type() == ASTNode::NODE_CHAINSTORE) {
+                            append_to_chain_store(seq, tup, stack, curblock);
+                        } else {
+                            curblock->append(new ASTStore(seq, tup));
+                        }
+                    }
+                } else {
+                    PycRef<ASTNode> value = stack.top();
+                    stack.pop();
+                    if (!stack.empty() && stack.top() != nullptr
+                            && stack.top().type() == ASTNode::NODE_IMPORT) {
+                        /* `from mod import name` where `name` is declared `global`:
+                           the IMPORT_FROM value binds to the import (mirrors the
+                           STORE_NAME/STORE_FAST path) rather than a bare `name = name`. */
+                        stack.top().cast<ASTImport>()->add_store(new ASTStore(value, name));
+                    } else if (value.type() == ASTNode::NODE_CHAINSTORE) {
+                        append_to_chain_store(value, name, stack, curblock);
+                    } else if (!tryAttachDecorators(curblock, value, name)) {
+                        curblock->append(new ASTStore(value, name));
+                    }
+                }
+
+                /* Mark the global as used */
+                code->markGlobal(name.cast<ASTName>()->name());
+            }
+            break;
+        case Pyc::STORE_NAME_A:
+            {
+                inplaceStore = 0;
+                if (walrusStores.count(curpos)) {
+                    PycRef<ASTNode> value = stack.top(); stack.pop();
+                    stack.push(new ASTStore(value, new ASTName(code->getName(operand)), true));
+                    break;
+                }
+                if (tupleStore == 0 && unpack == 0 && tupleAssignStart.count(curpos)
+                        && tupleAssignSafe(tupleAssignStart[curpos]))
+                    tupleStore = tupleAssignStart[curpos];
+                if (tupleStore > 0) {
+                    tupleStoreStep(new ASTName(code->getName(operand)));
+                    break;
+                }
+                if (unpack) {
+                    PycRef<ASTNode> name = new ASTName(code->getName(operand));
+                    if (unpack == unpackStar)
+                        name = new ASTUnary(name, ASTUnary::UN_STAR);
+
+                    PycRef<ASTNode> tup = stack.top();
+                    if (tup.type() == ASTNode::NODE_TUPLE)
+                        tup.cast<ASTTuple>()->add(name);
+                    else
+                        fputs("Something TERRIBLE happened!\n", stderr);
+
+                    --unpack;
+                    while (unpack <= 0 && !unpackNest.empty()) {
+                        PycRef<ASTNode> inner = stack.top(); stack.pop();
+                        tup = stack.top();
+                        if (tup.type() == ASTNode::NODE_TUPLE)
+                            tup.cast<ASTTuple>()->add(inner);
+                        unpack = unpackNest.back() - 1; unpackNest.pop_back();
+                    }
+                    if (unpack <= 0) {
+                        stack.pop();
+                        PycRef<ASTNode> seq = stack.top();
+                        stack.pop();
+
+                        if (curblock->blktype() == ASTBlock::BLK_FOR
+                                && !curblock->inited()) {
+                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
+                            if (tuple != NULL)
+                                tuple->setRequireParens(false);
+                            curblock.cast<ASTIterBlock>()->setIndex(tup);
+                        } else if (curblock->blktype() == ASTBlock::BLK_WITH
+                                   && !curblock->inited()) {
+                            PycRef<ASTTuple> tuple = tup.try_cast<ASTTuple>();
+                            if (tuple != NULL)
+                                tuple->setRequireParens(true);
+                            curblock.cast<ASTWithBlock>()->setExpr(seq);
+                            curblock.cast<ASTWithBlock>()->setVar(tup);
+                        } else if (seq.type() == ASTNode::NODE_CHAINSTORE) {
+                            append_to_chain_store(seq, tup, stack, curblock);
+                        } else {
+                            curblock->append(new ASTStore(seq, tup));
+                        }
+                    }
+                } else {
+                    PycRef<ASTNode> value = stack.top();
+                    stack.pop();
+
+                    PycRef<PycString> varname = code->getName(operand);
+                    if (varname->length() >= 2 && varname->value()[0] == '_'
+                            && varname->value()[1] == '[') {
+                        /* Don't show stores of list comp append objects. */
+                        break;
+                    }
+                    if (varname->isEqual("__classcell__"))
+                        break;
+
+                    // Return private names back to their original name
+                    const std::string class_prefix = std::string("_") + code->name()->strValue();
+                    if (varname->startsWith(class_prefix + std::string("__")))
+                        varname->setValue(varname->strValue().substr(class_prefix.size()));
+
+                    PycRef<ASTNode> name = new ASTName(varname);
+
+                    if ((curblock->blktype() == ASTBlock::BLK_FOR
+                                || curblock->blktype() == ASTBlock::BLK_ASYNCFOR)
+                            && !curblock->inited()) {
+                        curblock.cast<ASTIterBlock>()->setIndex(name);
+                    } else if (stack.top().type() == ASTNode::NODE_IMPORT) {
+                        PycRef<ASTImport> import = stack.top().cast<ASTImport>();
+
+                        import->add_store(new ASTStore(value, name));
+                    } else if (curblock->blktype() == ASTBlock::BLK_WITH
+                               && !curblock->inited()) {
+                        if (value != nullptr && value.type() == ASTNode::NODE_COMPREHENSION) {
+                            cleanBuild = false;
+                            return false;
+                        }
+                        curblock.cast<ASTWithBlock>()->setExpr(value);
+                        curblock.cast<ASTWithBlock>()->setVar(name);
+                    } else if (value.type() == ASTNode::NODE_CHAINSTORE) {
+                        append_to_chain_store(value, name, stack, curblock);
+                    } else if (!tryAttachDecorators(curblock, value, name)) {
+                        curblock->append(new ASTStore(value, name));
+
+                        if (value.type() == ASTNode::NODE_INVALID)
+                            break;
+                    }
+                }
+            }
+            break;
+    }
+    return true;
 }
 
 /* The UNARY_* opcodes each pop one operand and push one result node.
