@@ -474,6 +474,7 @@ private:
     /* Per-opcode-group handlers lifted out of build()'s dispatch switch. */
     void handleUnaryOp(int opcode);
     void handleBinaryOp(int opcode, int operand);
+    void handleIsContainsOp(int opcode, int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -485,6 +486,10 @@ private:
     /* Set to 1 by an in-place binary op so the STORE that follows renders as an
        augmented assignment (`x += y`) rather than `x = x + y`. */
     int inplaceStore = 0;
+    /* Armed just before a comparison whose left operand continues a chained
+       comparison (`a < b < c`), so the compare builds/extends an ASTChainCompare
+       instead of a plain ASTCompare. Cleared after each comparison consumes it. */
+    int chainCmp = 0;
 };
 
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
@@ -537,7 +542,6 @@ PycRef<ASTNode> CodeBuilder::build()
     int tupleStore = 0;
     std::vector<PycRef<ASTNode> > tupleStoreTargets;
     std::vector<PycRef<ASTNode> > tupleStoreValues;
-    int chainCmp = 0;
     struct BoolShortCircuit { PycRef<ASTNode> left; bool isOr; int target; int off; };
     std::vector<BoolShortCircuit> boolPending;
     bool else_pop = false;
@@ -11103,23 +11107,7 @@ PycRef<ASTNode> CodeBuilder::build()
             }
             break;
         case Pyc::CONTAINS_OP_A:
-            {
-                PycRef<ASTNode> right = stack.top();
-                stack.pop();
-                PycRef<ASTNode> left = stack.top();
-                stack.pop();
-                // The operand will be 0 for 'in' and 1 for 'not in'.
-                int cmpop = operand ? ASTCompare::CMP_NOT_IN : ASTCompare::CMP_IN;
-                if (left != nullptr && left.type() == ASTNode::NODE_CHAINCOMPARE) {
-                    left.cast<ASTChainCompare>()->extend(cmpop, right);
-                    stack.push(left);
-                } else if (chainCmp) {
-                    stack.push(new ASTChainCompare(left, right, cmpop));
-                } else {
-                    stack.push(new ASTCompare(left, right, cmpop));
-                }
-                chainCmp = 0;
-            }
+            handleIsContainsOp(opcode, operand);
             break;
         case Pyc::DELETE_ATTR_A:
             {
@@ -11572,23 +11560,7 @@ PycRef<ASTNode> CodeBuilder::build()
             }
             break;
         case Pyc::IS_OP_A:
-            {
-                PycRef<ASTNode> right = stack.top();
-                stack.pop();
-                PycRef<ASTNode> left = stack.top();
-                stack.pop();
-                // The operand will be 0 for 'is' and 1 for 'is not'.
-                int cmpop = operand ? ASTCompare::CMP_IS_NOT : ASTCompare::CMP_IS;
-                if (left != nullptr && left.type() == ASTNode::NODE_CHAINCOMPARE) {
-                    left.cast<ASTChainCompare>()->extend(cmpop, right);
-                    stack.push(left);
-                } else if (chainCmp) {
-                    stack.push(new ASTChainCompare(left, right, cmpop));
-                } else {
-                    stack.push(new ASTCompare(left, right, cmpop));
-                }
-                chainCmp = 0;
-            }
+            handleIsContainsOp(opcode, operand);
             break;
         case Pyc::POP_JUMP_BACKWARD_IF_FALSE_A:
         case Pyc::POP_JUMP_BACKWARD_IF_TRUE_A:
@@ -16378,6 +16350,32 @@ void CodeBuilder::handleBinaryOp(int opcode, int operand)
     if (op >= ASTBinary::BIN_IP_ADD && op < ASTBinary::BIN_INVALID)
         inplaceStore = 1;
     stack.push(new ASTBinary(left, right, op));
+}
+
+/* The identity (`is` / `is not`) and membership (`in` / `not in`) tests. Both
+ * pop the right then the left operand and, like COMPARE_OP, either extend an
+ * in-progress chained comparison, start one (when chainCmp is armed), or build
+ * a plain ASTCompare. The operand's low bit selects the negated form. */
+void CodeBuilder::handleIsContainsOp(int opcode, int operand)
+{
+    PycRef<ASTNode> right = stack.top();
+    stack.pop();
+    PycRef<ASTNode> left = stack.top();
+    stack.pop();
+    int cmpop;
+    if (opcode == Pyc::CONTAINS_OP_A)
+        cmpop = operand ? ASTCompare::CMP_NOT_IN : ASTCompare::CMP_IN;
+    else // IS_OP_A
+        cmpop = operand ? ASTCompare::CMP_IS_NOT : ASTCompare::CMP_IS;
+    if (left != nullptr && left.type() == ASTNode::NODE_CHAINCOMPARE) {
+        left.cast<ASTChainCompare>()->extend(cmpop, right);
+        stack.push(left);
+    } else if (chainCmp) {
+        stack.push(new ASTChainCompare(left, right, cmpop));
+    } else {
+        stack.push(new ASTCompare(left, right, cmpop));
+    }
+    chainCmp = 0;
 }
 
 static void append_to_chain_store(const PycRef<ASTNode> &chainStore,
