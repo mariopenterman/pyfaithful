@@ -498,6 +498,7 @@ private:
     void handlePopBlock();
     /* Returns false to signal a bail-out (the caller returns the partial tree). */
     bool handlePopTop();
+    void handleReraise();
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -569,6 +570,11 @@ private:
        yet passed, advanced as `pos` moves forward. */
     std::vector<PycExceptionTableEntry> exception_entries;
     size_t next_exception_entry = 0;
+    /* --- control-flow prescan maps (offset-keyed decisions the main loop acts
+       on later); promoted from build() locals as their handlers are extracted. */
+    /* At a RERAISE offset, the resume target of the enclosing try/except so the
+       reconstructed handler closes and control continues past it. */
+    std::unordered_map<int, int> finExcReraise;
 };
 
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
@@ -1094,7 +1100,6 @@ PycRef<ASTNode> CodeBuilder::build()
     std::unordered_map<int, int> ship215ExceptEnd;
     std::unordered_map<int, int> loopTailElseAt;
     std::unordered_map<int, int> loopBodyElseAt;
-    std::unordered_map<int, int> finExcReraise;
     /* SHIP-263: nested loop-bearing try/finally (asyncio Condition.wait). An OUTER
        try/finally whose finally body BEARS A LOOP (the `while True: try: await
        acquire() except CancelledError: …` re-acquire) and which WRAPS an inner
@@ -13941,52 +13946,7 @@ PycRef<ASTNode> CodeBuilder::build()
             break;
         case Pyc::RERAISE:
         case Pyc::RERAISE_A:
-            {
-                auto fer = finExcReraise.find(curpos);
-                if (fer != finExcReraise.end()) {
-                    int X = fer->second;
-                    if (curblock->blktype() == ASTBlock::BLK_TRY) {
-                        if (!stack_hist.empty()) {
-                            stack = stack_hist.top();
-                            stack_hist.pop();
-                        }
-                        PycRef<ASTBlock> prev = curblock;
-                        blocks.pop();
-                        curblock = blocks.top();
-                        curblock->append(prev.cast<ASTNode>());
-                        if (curblock->blktype() == ASTBlock::BLK_CONTAINER
-                                && curblock.cast<ASTContainerBlock>()->hasExcept()) {
-                            stack_hist.push(stack);
-                            PycRef<ASTBlock> except = new ASTCondBlock(ASTBlock::BLK_EXCEPT, X, NULL, false);
-                            except->init();
-                            blocks.push(except);
-                            curblock = blocks.top();
-                        }
-                        break;
-                    } else if (curblock->blktype() == ASTBlock::BLK_EXCEPT) {
-                        if (!stack_hist.empty()) {
-                            stack = stack_hist.top();
-                            stack_hist.pop();
-                        }
-                        PycRef<ASTBlock> exc = curblock;
-                        blocks.pop();
-                        curblock = blocks.top();
-                        curblock->append(exc.cast<ASTNode>());
-                        if (curblock->blktype() == ASTBlock::BLK_CONTAINER) {
-                            PycRef<ASTBlock> cont = curblock;
-                            blocks.pop();
-                            curblock = blocks.top();
-                            curblock->append(cont.cast<ASTNode>());
-                        }
-                        source.setPos(X);
-                        pos = X;
-                        while (next_exception_entry < exception_entries.size()
-                                && exception_entries[next_exception_entry].start_offset < X)
-                            next_exception_entry++;
-                        break;
-                    }
-                }
-            }
+            handleReraise();
             /* Python 3.11 cleanup opcode. */
             break;
         case Pyc::RETURN_VALUE:
@@ -15713,6 +15673,60 @@ bool CodeBuilder::handlePopTop()
         }
     }
     return true;
+}
+
+/* RERAISE re-raises the current exception. For a plain `raise` cleanup this is
+ * a no-op, but when the prescan recorded a resume target for this offset
+ * (finExcReraise) it also closes the reconstructed try/except: a RERAISE inside
+ * the try body opens the recorded except clause, while one inside an except
+ * clause closes the handler (and its container) and jumps control to the
+ * recorded target. */
+void CodeBuilder::handleReraise()
+{
+    auto fer = finExcReraise.find(curpos);
+    if (fer != finExcReraise.end()) {
+        int X = fer->second;
+        if (curblock->blktype() == ASTBlock::BLK_TRY) {
+            if (!stack_hist.empty()) {
+                stack = stack_hist.top();
+                stack_hist.pop();
+            }
+            PycRef<ASTBlock> prev = curblock;
+            blocks.pop();
+            curblock = blocks.top();
+            curblock->append(prev.cast<ASTNode>());
+            if (curblock->blktype() == ASTBlock::BLK_CONTAINER
+                    && curblock.cast<ASTContainerBlock>()->hasExcept()) {
+                stack_hist.push(stack);
+                PycRef<ASTBlock> except = new ASTCondBlock(ASTBlock::BLK_EXCEPT, X, NULL, false);
+                except->init();
+                blocks.push(except);
+                curblock = blocks.top();
+            }
+            return;
+        } else if (curblock->blktype() == ASTBlock::BLK_EXCEPT) {
+            if (!stack_hist.empty()) {
+                stack = stack_hist.top();
+                stack_hist.pop();
+            }
+            PycRef<ASTBlock> exc = curblock;
+            blocks.pop();
+            curblock = blocks.top();
+            curblock->append(exc.cast<ASTNode>());
+            if (curblock->blktype() == ASTBlock::BLK_CONTAINER) {
+                PycRef<ASTBlock> cont = curblock;
+                blocks.pop();
+                curblock = blocks.top();
+                curblock->append(cont.cast<ASTNode>());
+            }
+            source.setPos(X);
+            pos = X;
+            while (next_exception_entry < exception_entries.size()
+                    && exception_entries[next_exception_entry].start_offset < X)
+                next_exception_entry++;
+            return;
+        }
+    }
 }
 
 /* The UNARY_* opcodes each pop one operand and push one result node.
