@@ -481,6 +481,7 @@ private:
     void handleStoreSlice(int opcode);
     void handleSubscript(int opcode);
     void handleStackManip(int opcode, int operand);
+    void handleCollectionUpdate(int opcode);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -13703,147 +13704,13 @@ PycRef<ASTNode> CodeBuilder::build()
             break;
         case Pyc::LIST_APPEND:
         case Pyc::LIST_APPEND_A:
-            {
-                PycRef<ASTNode> value = stack.top();
-                stack.pop();
-
-                PycRef<ASTNode> list = stack.top();
-
-
-                if (curblock->blktype() == ASTBlock::BLK_FOR
-                        && curblock.cast<ASTIterBlock>()->isComprehension()) {
-                    stack.pop();
-                    stack.push(new ASTComprehension(value));
-                } else if (list != nullptr && list.type() == ASTNode::NODE_LIST) {
-                    stack.pop();
-                    ASTList::value_t vals = list.cast<ASTList>()->values();
-                    vals.push_back(value);
-                    stack.push(new ASTList(vals));
-                } else {
-                    stack.push(new ASTSubscr(list, value)); /* Total hack */
-                }
-            }
-            break;
         case Pyc::SET_ADD_A:
-            {
-                PycRef<ASTNode> value = stack.top();
-                stack.pop();
-                PycRef<ASTNode> set = stack.top();
-                if (curblock->blktype() == ASTBlock::BLK_FOR
-                        && curblock.cast<ASTIterBlock>()->isComprehension()) {
-                    stack.pop();
-                    stack.push(new ASTComprehension(value, ASTComprehension::COMP_SET));
-                } else if (set != nullptr && set.type() == ASTNode::NODE_SET) {
-                    stack.pop();
-                    ASTSet::value_t vals = set.cast<ASTSet>()->values();
-                    vals.push_back(value);
-                    stack.push(new ASTSet(vals));
-                } else {
-                    stack.push(new ASTSubscr(set, value));
-                }
-            }
-            break;
         case Pyc::MAP_ADD_A:
-            {
-                PycRef<ASTNode> value = stack.top();
-                stack.pop();
-                PycRef<ASTNode> key = stack.top();
-                stack.pop();
-                PycRef<ASTNode> map = stack.top();
-                if (curblock->blktype() == ASTBlock::BLK_FOR
-                        && curblock.cast<ASTIterBlock>()->isComprehension()) {
-                    stack.pop();
-                    stack.push(new ASTComprehension(value,
-                            ASTComprehension::COMP_DICT, key));
-                } else if (map.type() == ASTNode::NODE_MAP) {
-                    map.cast<ASTMap>()->add(key, value);
-                } else {
-                    stack.push(new ASTSubscr(map, key));
-                }
-            }
-            break;
         case Pyc::SET_UPDATE_A:
-            {
-                PycRef<ASTNode> rhs = stack.top();
-                stack.pop();
-                PycRef<ASTSet> lhs = stack.top().cast<ASTSet>();
-                stack.pop();
-
-                ASTSet::value_t result = lhs->values();
-                if (rhs.type() == ASTNode::NODE_OBJECT
-                        && rhs.cast<ASTObject>()->object()->type() == PycObject::TYPE_FROZENSET) {
-                    for (const auto& it : rhs.cast<ASTObject>()->object().cast<PycSet>()->values())
-                        result.push_back(new ASTObject(it));
-                } else {
-                    result.push_back(new ASTUnary(rhs, ASTUnary::UN_STAR));
-                }
-
-                stack.push(new ASTSet(result));
-            }
-            break;
         case Pyc::LIST_EXTEND_A:
-            {
-                PycRef<ASTNode> rhs = stack.top();
-                stack.pop();
-                PycRef<ASTList> lhs = stack.top().cast<ASTList>();
-                stack.pop();
-
-                ASTList::value_t result = lhs->values();
-                if (rhs.type() == ASTNode::NODE_OBJECT
-                        && (rhs.cast<ASTObject>()->object()->type() == PycObject::TYPE_TUPLE
-                            || rhs.cast<ASTObject>()->object()->type() == PycObject::TYPE_SMALL_TUPLE)) {
-                    for (const auto& it : rhs.cast<ASTObject>()->object().cast<PycTuple>()->values())
-                        result.push_back(new ASTObject(it));
-                } else {
-                    result.push_back(new ASTUnary(rhs, ASTUnary::UN_STAR));
-                }
-
-                stack.push(new ASTList(result));
-            }
-            break;
         case Pyc::DICT_UPDATE_A:
         case Pyc::DICT_MERGE_A:
-            {
-                PycRef<ASTNode> rhs = stack.top();
-                stack.pop();
-                PycRef<ASTMap> target;
-                if (stack.top().type() == ASTNode::NODE_MAP) {
-                    target = stack.top().cast<ASTMap>();
-                } else if (stack.top().type() == ASTNode::NODE_CONST_MAP) {
-                    PycRef<ASTConstMap> cm = stack.top().cast<ASTConstMap>();
-                    stack.pop();
-                    PycTuple::value_t keys = cm->keys().cast<ASTObject>()
-                            ->object().cast<PycTuple>()->values();
-                    ASTConstMap::values_t vals = cm->values();
-                    target = new ASTMap;
-                    for (const auto& key : keys) {
-                        PycRef<ASTNode> value = vals.back();
-                        vals.pop_back();
-                        target->add(new ASTObject(key), value);
-                    }
-                    stack.push(target.cast<ASTNode>());
-                } else {
-                    break;
-                }
-                if (opcode == Pyc::DICT_UPDATE_A
-                        && rhs.type() == ASTNode::NODE_MAP) {
-                    for (const auto& kv : rhs.cast<ASTMap>()->values())
-                        target->add(kv.first, kv.second);
-                } else if (opcode == Pyc::DICT_UPDATE_A
-                        && rhs.type() == ASTNode::NODE_CONST_MAP) {
-                    PycRef<ASTConstMap> rcm = rhs.cast<ASTConstMap>();
-                    PycTuple::value_t rkeys = rcm->keys().cast<ASTObject>()
-                            ->object().cast<PycTuple>()->values();
-                    ASTConstMap::values_t rvals = rcm->values();
-                    for (const auto& key : rkeys) {
-                        PycRef<ASTNode> value = rvals.back();
-                        rvals.pop_back();
-                        target->add(new ASTObject(key), value);
-                    }
-                } else {
-                    target->add(nullptr, rhs);
-                }
-            }
+            handleCollectionUpdate(opcode);
             break;
         case Pyc::LOAD_ATTR_A:
         case Pyc::LOAD_BUILD_CLASS:
@@ -15571,13 +15438,7 @@ PycRef<ASTNode> CodeBuilder::build()
             stack.push(nullptr);
             break;
         case Pyc::LIST_TO_TUPLE:
-            if (!stack.empty() && stack.top() != nullptr
-                    && stack.top().type() == ASTNode::NODE_LIST) {
-                ASTList::value_t lv = stack.top().cast<ASTList>()->values();
-                stack.pop();
-                ASTTuple::value_t tv(lv.begin(), lv.end());
-                stack.push(new ASTTuple(tv));
-            }
+            handleCollectionUpdate(opcode);
             break;
         case Pyc::GEN_START_A:
             stack.pop();
@@ -16548,6 +16409,178 @@ void CodeBuilder::handleStackManip(int opcode, int operand)
             stack.push(four);
             stack.push(three);
             stack.push(two);
+        }
+        break;
+    }
+}
+
+/* The container-update opcodes, which serve double duty. Inside a comprehension
+ * loop (curblock is a comprehension for-block) the accumulate opcodes turn the
+ * running container into the comprehension result node; everywhere else they
+ * grow a literal display in place:
+ *   LIST_APPEND / SET_ADD / MAP_ADD -> append/add to the list/set/dict, or
+ *       start an ASTComprehension (list/set/dict). MAP_ADD carries key+value.
+ *   LIST_EXTEND / SET_UPDATE        -> splice the right-hand side in: a constant
+ *       tuple/frozenset is spread element-by-element, otherwise it renders as a
+ *       `*rhs` unpack inside the display.
+ *   DICT_UPDATE / DICT_MERGE        -> merge a mapping into the dict under
+ *       construction (materialising a const-key map first if needed); a
+ *       non-mapping right-hand side becomes a `**rhs` unpack (null key).
+ *   LIST_TO_TUPLE -> convert a finished list display into a tuple. */
+void CodeBuilder::handleCollectionUpdate(int opcode)
+{
+    switch (opcode) {
+    case Pyc::LIST_APPEND:
+    case Pyc::LIST_APPEND_A:
+        {
+            PycRef<ASTNode> value = stack.top();
+            stack.pop();
+
+            PycRef<ASTNode> list = stack.top();
+
+
+            if (curblock->blktype() == ASTBlock::BLK_FOR
+                    && curblock.cast<ASTIterBlock>()->isComprehension()) {
+                stack.pop();
+                stack.push(new ASTComprehension(value));
+            } else if (list != nullptr && list.type() == ASTNode::NODE_LIST) {
+                stack.pop();
+                ASTList::value_t vals = list.cast<ASTList>()->values();
+                vals.push_back(value);
+                stack.push(new ASTList(vals));
+            } else {
+                stack.push(new ASTSubscr(list, value)); /* Total hack */
+            }
+        }
+        break;
+    case Pyc::SET_ADD_A:
+        {
+            PycRef<ASTNode> value = stack.top();
+            stack.pop();
+            PycRef<ASTNode> set = stack.top();
+            if (curblock->blktype() == ASTBlock::BLK_FOR
+                    && curblock.cast<ASTIterBlock>()->isComprehension()) {
+                stack.pop();
+                stack.push(new ASTComprehension(value, ASTComprehension::COMP_SET));
+            } else if (set != nullptr && set.type() == ASTNode::NODE_SET) {
+                stack.pop();
+                ASTSet::value_t vals = set.cast<ASTSet>()->values();
+                vals.push_back(value);
+                stack.push(new ASTSet(vals));
+            } else {
+                stack.push(new ASTSubscr(set, value));
+            }
+        }
+        break;
+    case Pyc::MAP_ADD_A:
+        {
+            PycRef<ASTNode> value = stack.top();
+            stack.pop();
+            PycRef<ASTNode> key = stack.top();
+            stack.pop();
+            PycRef<ASTNode> map = stack.top();
+            if (curblock->blktype() == ASTBlock::BLK_FOR
+                    && curblock.cast<ASTIterBlock>()->isComprehension()) {
+                stack.pop();
+                stack.push(new ASTComprehension(value,
+                        ASTComprehension::COMP_DICT, key));
+            } else if (map.type() == ASTNode::NODE_MAP) {
+                map.cast<ASTMap>()->add(key, value);
+            } else {
+                stack.push(new ASTSubscr(map, key));
+            }
+        }
+        break;
+    case Pyc::SET_UPDATE_A:
+        {
+            PycRef<ASTNode> rhs = stack.top();
+            stack.pop();
+            PycRef<ASTSet> lhs = stack.top().cast<ASTSet>();
+            stack.pop();
+
+            ASTSet::value_t result = lhs->values();
+            if (rhs.type() == ASTNode::NODE_OBJECT
+                    && rhs.cast<ASTObject>()->object()->type() == PycObject::TYPE_FROZENSET) {
+                for (const auto& it : rhs.cast<ASTObject>()->object().cast<PycSet>()->values())
+                    result.push_back(new ASTObject(it));
+            } else {
+                result.push_back(new ASTUnary(rhs, ASTUnary::UN_STAR));
+            }
+
+            stack.push(new ASTSet(result));
+        }
+        break;
+    case Pyc::LIST_EXTEND_A:
+        {
+            PycRef<ASTNode> rhs = stack.top();
+            stack.pop();
+            PycRef<ASTList> lhs = stack.top().cast<ASTList>();
+            stack.pop();
+
+            ASTList::value_t result = lhs->values();
+            if (rhs.type() == ASTNode::NODE_OBJECT
+                    && (rhs.cast<ASTObject>()->object()->type() == PycObject::TYPE_TUPLE
+                        || rhs.cast<ASTObject>()->object()->type() == PycObject::TYPE_SMALL_TUPLE)) {
+                for (const auto& it : rhs.cast<ASTObject>()->object().cast<PycTuple>()->values())
+                    result.push_back(new ASTObject(it));
+            } else {
+                result.push_back(new ASTUnary(rhs, ASTUnary::UN_STAR));
+            }
+
+            stack.push(new ASTList(result));
+        }
+        break;
+    case Pyc::DICT_UPDATE_A:
+    case Pyc::DICT_MERGE_A:
+        {
+            PycRef<ASTNode> rhs = stack.top();
+            stack.pop();
+            PycRef<ASTMap> target;
+            if (stack.top().type() == ASTNode::NODE_MAP) {
+                target = stack.top().cast<ASTMap>();
+            } else if (stack.top().type() == ASTNode::NODE_CONST_MAP) {
+                PycRef<ASTConstMap> cm = stack.top().cast<ASTConstMap>();
+                stack.pop();
+                PycTuple::value_t keys = cm->keys().cast<ASTObject>()
+                        ->object().cast<PycTuple>()->values();
+                ASTConstMap::values_t vals = cm->values();
+                target = new ASTMap;
+                for (const auto& key : keys) {
+                    PycRef<ASTNode> value = vals.back();
+                    vals.pop_back();
+                    target->add(new ASTObject(key), value);
+                }
+                stack.push(target.cast<ASTNode>());
+            } else {
+                break;
+            }
+            if (opcode == Pyc::DICT_UPDATE_A
+                    && rhs.type() == ASTNode::NODE_MAP) {
+                for (const auto& kv : rhs.cast<ASTMap>()->values())
+                    target->add(kv.first, kv.second);
+            } else if (opcode == Pyc::DICT_UPDATE_A
+                    && rhs.type() == ASTNode::NODE_CONST_MAP) {
+                PycRef<ASTConstMap> rcm = rhs.cast<ASTConstMap>();
+                PycTuple::value_t rkeys = rcm->keys().cast<ASTObject>()
+                        ->object().cast<PycTuple>()->values();
+                ASTConstMap::values_t rvals = rcm->values();
+                for (const auto& key : rkeys) {
+                    PycRef<ASTNode> value = rvals.back();
+                    rvals.pop_back();
+                    target->add(new ASTObject(key), value);
+                }
+            } else {
+                target->add(nullptr, rhs);
+            }
+        }
+        break;
+    case Pyc::LIST_TO_TUPLE:
+        if (!stack.empty() && stack.top() != nullptr
+                && stack.top().type() == ASTNode::NODE_LIST) {
+            ASTList::value_t lv = stack.top().cast<ASTList>()->values();
+            stack.pop();
+            ASTTuple::value_t tv(lv.begin(), lv.end());
+            stack.push(new ASTTuple(tv));
         }
         break;
     }
