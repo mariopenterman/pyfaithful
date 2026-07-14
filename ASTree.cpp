@@ -517,6 +517,7 @@ private:
     void handleEndFor();
     void handleCall(int opcode, int operand);
     void handleMakeFunction(int operand);
+    void handleBuildClassFunc(int opcode);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -10563,22 +10564,8 @@ PycRef<ASTNode> CodeBuilder::build()
             curblock->append(new ASTKeyword(ASTKeyword::KW_BREAK));
             break;
         case Pyc::BUILD_CLASS:
-            {
-                PycRef<ASTNode> class_code = stack.top();
-                stack.pop();
-                PycRef<ASTNode> bases = stack.top();
-                stack.pop();
-                PycRef<ASTNode> name = stack.top();
-                stack.pop();
-                stack.push(new ASTClass(class_code, bases, name));
-            }
-            break;
         case Pyc::BUILD_FUNCTION:
-            {
-                PycRef<ASTNode> fun_code = stack.top();
-                stack.pop();
-                stack.push(new ASTFunction(fun_code, {}, {}));
-            }
+            handleBuildClassFunc(opcode);
             break;
         case Pyc::BUILD_LIST_A:
         case Pyc::BUILD_SET_A:
@@ -14968,6 +14955,26 @@ void CodeBuilder::handleReturnConst(int operand)
 {
     PycRef<ASTObject> value = new ASTObject(code->getConst(operand));
     curblock->append(new ASTReturn(value.cast<ASTNode>()));
+}
+
+/* The Python 1/2 class/function builders. BUILD_CLASS pops the class body code,
+ * bases tuple, and name and pushes an ASTClass; BUILD_FUNCTION wraps the code
+ * object on top in a bare ASTFunction (no defaults). */
+void CodeBuilder::handleBuildClassFunc(int opcode)
+{
+    if (opcode == Pyc::BUILD_CLASS) {
+        PycRef<ASTNode> class_code = stack.top();
+        stack.pop();
+        PycRef<ASTNode> bases = stack.top();
+        stack.pop();
+        PycRef<ASTNode> name = stack.top();
+        stack.pop();
+        stack.push(new ASTClass(class_code, bases, name));
+    } else { // BUILD_FUNCTION
+        PycRef<ASTNode> fun_code = stack.top();
+        stack.pop();
+        stack.push(new ASTFunction(fun_code, {}, {}));
+    }
 }
 
 /* The `with`-statement setup opcodes.
