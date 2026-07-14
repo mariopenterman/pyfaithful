@@ -478,6 +478,7 @@ private:
     void handleBuildCollection(int opcode, int operand);
     void handleLoad(int opcode, int operand);
     void handleDelete(int opcode, int operand);
+    void handleStoreSlice(int opcode);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -15460,52 +15461,10 @@ PycRef<ASTNode> CodeBuilder::build()
             }
             break;
         case Pyc::STORE_SLICE_0:
-            {
-                PycRef<ASTNode> dest = stack.top();
-                stack.pop();
-                PycRef<ASTNode> value = stack.top();
-                stack.pop();
-
-                curblock->append(new ASTStore(value, new ASTSubscr(dest, new ASTSlice(ASTSlice::SLICE0))));
-            }
-            break;
         case Pyc::STORE_SLICE_1:
-            {
-                PycRef<ASTNode> upper = stack.top();
-                stack.pop();
-                PycRef<ASTNode> dest = stack.top();
-                stack.pop();
-                PycRef<ASTNode> value = stack.top();
-                stack.pop();
-
-                curblock->append(new ASTStore(value, new ASTSubscr(dest, new ASTSlice(ASTSlice::SLICE1, upper))));
-            }
-            break;
         case Pyc::STORE_SLICE_2:
-            {
-                PycRef<ASTNode> lower = stack.top();
-                stack.pop();
-                PycRef<ASTNode> dest = stack.top();
-                stack.pop();
-                PycRef<ASTNode> value = stack.top();
-                stack.pop();
-
-                curblock->append(new ASTStore(value, new ASTSubscr(dest, new ASTSlice(ASTSlice::SLICE2, NULL, lower))));
-            }
-            break;
         case Pyc::STORE_SLICE_3:
-            {
-                PycRef<ASTNode> lower = stack.top();
-                stack.pop();
-                PycRef<ASTNode> upper = stack.top();
-                stack.pop();
-                PycRef<ASTNode> dest = stack.top();
-                stack.pop();
-                PycRef<ASTNode> value = stack.top();
-                stack.pop();
-
-                curblock->append(new ASTStore(value, new ASTSubscr(dest, new ASTSlice(ASTSlice::SLICE3, upper, lower))));
-            }
+            handleStoreSlice(opcode);
             break;
         case Pyc::STORE_SUBSCR:
             {
@@ -16476,6 +16435,65 @@ void CodeBuilder::handleDelete(int opcode, int operand)
             stack.pop();
 
             curblock->append(new ASTDelete(new ASTSubscr(name, key)));
+        }
+        break;
+    }
+}
+
+/* The Python 2 dedicated slice stores (`obj[:] = v`, `obj[lo:] = v`,
+ * `obj[:hi] = v`, `obj[lo:hi] = v`). Each pops the bounds, then the target,
+ * then the value, and appends an ASTStore of the value into a subscript of the
+ * matching ASTSlice. (Modern Python routes these through STORE_SUBSCR instead,
+ * which stays inline because it also carries the unpack/annotation paths.) */
+void CodeBuilder::handleStoreSlice(int opcode)
+{
+    switch (opcode) {
+    case Pyc::STORE_SLICE_0:
+        {
+            PycRef<ASTNode> dest = stack.top();
+            stack.pop();
+            PycRef<ASTNode> value = stack.top();
+            stack.pop();
+
+            curblock->append(new ASTStore(value, new ASTSubscr(dest, new ASTSlice(ASTSlice::SLICE0))));
+        }
+        break;
+    case Pyc::STORE_SLICE_1:
+        {
+            PycRef<ASTNode> upper = stack.top();
+            stack.pop();
+            PycRef<ASTNode> dest = stack.top();
+            stack.pop();
+            PycRef<ASTNode> value = stack.top();
+            stack.pop();
+
+            curblock->append(new ASTStore(value, new ASTSubscr(dest, new ASTSlice(ASTSlice::SLICE1, upper))));
+        }
+        break;
+    case Pyc::STORE_SLICE_2:
+        {
+            PycRef<ASTNode> lower = stack.top();
+            stack.pop();
+            PycRef<ASTNode> dest = stack.top();
+            stack.pop();
+            PycRef<ASTNode> value = stack.top();
+            stack.pop();
+
+            curblock->append(new ASTStore(value, new ASTSubscr(dest, new ASTSlice(ASTSlice::SLICE2, NULL, lower))));
+        }
+        break;
+    case Pyc::STORE_SLICE_3:
+        {
+            PycRef<ASTNode> lower = stack.top();
+            stack.pop();
+            PycRef<ASTNode> upper = stack.top();
+            stack.pop();
+            PycRef<ASTNode> dest = stack.top();
+            stack.pop();
+            PycRef<ASTNode> value = stack.top();
+            stack.pop();
+
+            curblock->append(new ASTStore(value, new ASTSubscr(dest, new ASTSlice(ASTSlice::SLICE3, upper, lower))));
         }
         break;
     }
