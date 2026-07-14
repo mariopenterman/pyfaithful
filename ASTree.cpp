@@ -518,6 +518,7 @@ private:
     void handleCall(int opcode, int operand);
     void handleMakeFunction(int operand);
     void handleBuildClassFunc(int opcode);
+    void handleEndFinally();
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -10701,78 +10702,7 @@ PycRef<ASTNode> CodeBuilder::build()
             handleStackManip(opcode, operand);
             break;
         case Pyc::END_FINALLY:
-            {
-                bool isFinally = false;
-                if (curblock->blktype() == ASTBlock::BLK_FINALLY) {
-                    PycRef<ASTBlock> final = curblock;
-                    blocks.pop();
-
-                    stack = stack_hist.top();
-                    stack_hist.pop();
-
-                    curblock = blocks.top();
-                    curblock->append(final.cast<ASTNode>());
-                    isFinally = true;
-                } else if (curblock->blktype() == ASTBlock::BLK_EXCEPT) {
-                    blocks.pop();
-                    PycRef<ASTBlock> prev = curblock;
-
-                    bool isUninitAsyncFor = false;
-                    if (blocks.top()->blktype() == ASTBlock::BLK_CONTAINER) {
-                        auto container = blocks.top();
-                        blocks.pop();
-                        auto asyncForBlock = blocks.top();
-                        isUninitAsyncFor = asyncForBlock->blktype() == ASTBlock::BLK_ASYNCFOR && !asyncForBlock->inited();
-                        if (isUninitAsyncFor) {
-                            auto tryBlock = container->nodes().front().cast<ASTBlock>();
-                            if (!tryBlock->nodes().empty() && tryBlock->blktype() == ASTBlock::BLK_TRY) {
-                                auto store = tryBlock->nodes().front().try_cast<ASTStore>();
-                                if (store) {
-                                    asyncForBlock.cast<ASTIterBlock>()->setIndex(store->dest());
-                                }
-                            }
-                            curblock = blocks.top();
-                            stack = stack_hist.top();
-                            stack_hist.pop();
-                            if (!curblock->inited())
-                                fprintf(stderr, "Error when decompiling 'async for'.\n");
-                        } else {
-                            blocks.push(container);
-                        }
-                    }
-
-                    if (!isUninitAsyncFor) {
-                        if (curblock->size() != 0) {
-                            blocks.top()->append(curblock.cast<ASTNode>());
-                        }
-
-                        curblock = blocks.top();
-
-                        /* Turn it into an else statement. */
-                        if (curblock->end() != pos || curblock.cast<ASTContainerBlock>()->hasFinally()) {
-                            PycRef<ASTBlock> elseblk = new ASTBlock(ASTBlock::BLK_ELSE, prev->end());
-                            elseblk->init();
-                            blocks.push(elseblk);
-                            curblock = blocks.top();
-                        }
-                        else {
-                            stack = stack_hist.top();
-                            stack_hist.pop();
-                        }
-                    }
-                }
-
-                if (curblock->blktype() == ASTBlock::BLK_CONTAINER) {
-                    /* This marks the end of the except block(s). */
-                    PycRef<ASTContainerBlock> cont = curblock.cast<ASTContainerBlock>();
-                    if (!cont->hasFinally() || isFinally) {
-                        /* If there's no finally block, pop the container. */
-                        blocks.pop();
-                        curblock = blocks.top();
-                        curblock->append(cont.cast<ASTNode>());
-                    }
-                }
-            }
+            handleEndFinally();
             break;
         case Pyc::EXEC_STMT:
             {
@@ -14974,6 +14904,86 @@ void CodeBuilder::handleBuildClassFunc(int opcode)
         PycRef<ASTNode> fun_code = stack.top();
         stack.pop();
         stack.push(new ASTFunction(fun_code, {}, {}));
+    }
+}
+
+/* END_FINALLY closes a try's handler region. For a finally suite it restores
+ * the saved stack and folds the finally into its parent. For an except suite it
+ * appends the handler and either opens the try's `else:` clause or (special
+ * case) recovers an uninitialised `async for` target from the guarding try. In
+ * all cases, once the container has no finally left (or the finally just
+ * closed), the whole try container is popped and appended to its parent. */
+void CodeBuilder::handleEndFinally()
+{
+    bool isFinally = false;
+    if (curblock->blktype() == ASTBlock::BLK_FINALLY) {
+        PycRef<ASTBlock> final = curblock;
+        blocks.pop();
+
+        stack = stack_hist.top();
+        stack_hist.pop();
+
+        curblock = blocks.top();
+        curblock->append(final.cast<ASTNode>());
+        isFinally = true;
+    } else if (curblock->blktype() == ASTBlock::BLK_EXCEPT) {
+        blocks.pop();
+        PycRef<ASTBlock> prev = curblock;
+
+        bool isUninitAsyncFor = false;
+        if (blocks.top()->blktype() == ASTBlock::BLK_CONTAINER) {
+            auto container = blocks.top();
+            blocks.pop();
+            auto asyncForBlock = blocks.top();
+            isUninitAsyncFor = asyncForBlock->blktype() == ASTBlock::BLK_ASYNCFOR && !asyncForBlock->inited();
+            if (isUninitAsyncFor) {
+                auto tryBlock = container->nodes().front().cast<ASTBlock>();
+                if (!tryBlock->nodes().empty() && tryBlock->blktype() == ASTBlock::BLK_TRY) {
+                    auto store = tryBlock->nodes().front().try_cast<ASTStore>();
+                    if (store) {
+                        asyncForBlock.cast<ASTIterBlock>()->setIndex(store->dest());
+                    }
+                }
+                curblock = blocks.top();
+                stack = stack_hist.top();
+                stack_hist.pop();
+                if (!curblock->inited())
+                    fprintf(stderr, "Error when decompiling 'async for'.\n");
+            } else {
+                blocks.push(container);
+            }
+        }
+
+        if (!isUninitAsyncFor) {
+            if (curblock->size() != 0) {
+                blocks.top()->append(curblock.cast<ASTNode>());
+            }
+
+            curblock = blocks.top();
+
+            /* Turn it into an else statement. */
+            if (curblock->end() != pos || curblock.cast<ASTContainerBlock>()->hasFinally()) {
+                PycRef<ASTBlock> elseblk = new ASTBlock(ASTBlock::BLK_ELSE, prev->end());
+                elseblk->init();
+                blocks.push(elseblk);
+                curblock = blocks.top();
+            }
+            else {
+                stack = stack_hist.top();
+                stack_hist.pop();
+            }
+        }
+    }
+
+    if (curblock->blktype() == ASTBlock::BLK_CONTAINER) {
+        /* This marks the end of the except block(s). */
+        PycRef<ASTContainerBlock> cont = curblock.cast<ASTContainerBlock>();
+        if (!cont->hasFinally() || isFinally) {
+            /* If there's no finally block, pop the container. */
+            blocks.pop();
+            curblock = blocks.top();
+            curblock->append(cont.cast<ASTNode>());
+        }
     }
 }
 
