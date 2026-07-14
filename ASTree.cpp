@@ -480,6 +480,7 @@ private:
     void handleDelete(int opcode, int operand);
     void handleStoreSlice(int opcode);
     void handleSubscript(int opcode);
+    void handleStackManip(int opcode, int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -10977,54 +10978,9 @@ PycRef<ASTNode> CodeBuilder::build()
             handleDelete(opcode, operand);
             break;
         case Pyc::DUP_TOP:
-            {
-                if (stack.top().type() == PycObject::TYPE_NULL) {
-                    stack.push(stack.top());
-                } else if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
-                    auto chainstore = stack.top();
-                    stack.pop();
-                    stack.push(stack.top());
-                    stack.push(chainstore);
-                } else {
-                    stack.push(stack.top());
-                    ASTNodeList::list_t targets;
-                    stack.push(new ASTChainStore(targets, stack.top()));
-                }
-            }
-            break;
         case Pyc::DUP_TOP_TWO:
-            {
-                PycRef<ASTNode> first = stack.top();
-                stack.pop();
-                PycRef<ASTNode> second = stack.top();
-
-                stack.push(first);
-                stack.push(second);
-                stack.push(first);
-            }
-            break;
         case Pyc::DUP_TOPX_A:
-            {
-                std::stack<PycRef<ASTNode> > first;
-                std::stack<PycRef<ASTNode> > second;
-
-                for (int i = 0; i < operand; i++) {
-                    PycRef<ASTNode> node = stack.top();
-                    stack.pop();
-                    first.push(node);
-                    second.push(node);
-                }
-
-                while (first.size()) {
-                    stack.push(first.top());
-                    first.pop();
-                }
-
-                while (second.size()) {
-                    stack.push(second.top());
-                    second.pop();
-                }
-            }
+            handleStackManip(opcode, operand);
             break;
         case Pyc::END_FINALLY:
             {
@@ -14826,53 +14782,9 @@ PycRef<ASTNode> CodeBuilder::build()
             }
             break;
         case Pyc::ROT_TWO:
-            {
-                PycRef<ASTNode> one = stack.top();
-                stack.pop();
-                if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
-                    stack.pop();
-                }
-                PycRef<ASTNode> two = stack.top();
-                stack.pop();
-
-                stack.push(one);
-                stack.push(two);
-            }
-            break;
         case Pyc::ROT_THREE:
-            {
-                PycRef<ASTNode> one = stack.top();
-                stack.pop();
-                PycRef<ASTNode> two = stack.top();
-                stack.pop();
-                if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
-                    stack.pop();
-                }
-                PycRef<ASTNode> three = stack.top();
-                stack.pop();
-                stack.push(one);
-                stack.push(three);
-                stack.push(two);
-            }
-            break;
         case Pyc::ROT_FOUR:
-            {
-                PycRef<ASTNode> one = stack.top();
-                stack.pop();
-                PycRef<ASTNode> two = stack.top();
-                stack.pop();
-                PycRef<ASTNode> three = stack.top();
-                stack.pop();
-                if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
-                    stack.pop();
-                }
-                PycRef<ASTNode> four = stack.top();
-                stack.pop();
-                stack.push(one);
-                stack.push(four);
-                stack.push(three);
-                stack.push(two);
-            }
+            handleStackManip(opcode, operand);
             break;
         case Pyc::SET_LINENO_A:
             // Ignore
@@ -16521,6 +16433,121 @@ void CodeBuilder::handleSubscript(int opcode)
                 slice = new ASTSlice(ASTSlice::SLICE3, start, end);
             }
             stack.push(new ASTSubscr(dest, slice));
+        }
+        break;
+    }
+}
+
+/* Pure operand-stack shuffles that carry no source syntax of their own.
+ *   DUP_TOP      -> duplicate TOS. On a real value this also opens an
+ *                   ASTChainStore so a following `a = b = ...` renders as a
+ *                   chained assignment; a NULL or an existing chain store is
+ *                   duplicated as-is.
+ *   DUP_TOP_TWO  -> duplicate the top two entries (used for `x[i] op= y`).
+ *   DUP_TOPX     -> duplicate the top `operand` entries, order preserved.
+ *   ROT_TWO/THREE/FOUR -> rotate the top 2/3/4 entries; a chain-store marker
+ *                   sitting among them is dropped so the rotation lines up with
+ *                   the real values. */
+void CodeBuilder::handleStackManip(int opcode, int operand)
+{
+    switch (opcode) {
+    case Pyc::DUP_TOP:
+        {
+            if (stack.top().type() == PycObject::TYPE_NULL) {
+                stack.push(stack.top());
+            } else if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
+                auto chainstore = stack.top();
+                stack.pop();
+                stack.push(stack.top());
+                stack.push(chainstore);
+            } else {
+                stack.push(stack.top());
+                ASTNodeList::list_t targets;
+                stack.push(new ASTChainStore(targets, stack.top()));
+            }
+        }
+        break;
+    case Pyc::DUP_TOP_TWO:
+        {
+            PycRef<ASTNode> first = stack.top();
+            stack.pop();
+            PycRef<ASTNode> second = stack.top();
+
+            stack.push(first);
+            stack.push(second);
+            stack.push(first);
+        }
+        break;
+    case Pyc::DUP_TOPX_A:
+        {
+            std::stack<PycRef<ASTNode> > first;
+            std::stack<PycRef<ASTNode> > second;
+
+            for (int i = 0; i < operand; i++) {
+                PycRef<ASTNode> node = stack.top();
+                stack.pop();
+                first.push(node);
+                second.push(node);
+            }
+
+            while (first.size()) {
+                stack.push(first.top());
+                first.pop();
+            }
+
+            while (second.size()) {
+                stack.push(second.top());
+                second.pop();
+            }
+        }
+        break;
+    case Pyc::ROT_TWO:
+        {
+            PycRef<ASTNode> one = stack.top();
+            stack.pop();
+            if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
+                stack.pop();
+            }
+            PycRef<ASTNode> two = stack.top();
+            stack.pop();
+
+            stack.push(one);
+            stack.push(two);
+        }
+        break;
+    case Pyc::ROT_THREE:
+        {
+            PycRef<ASTNode> one = stack.top();
+            stack.pop();
+            PycRef<ASTNode> two = stack.top();
+            stack.pop();
+            if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
+                stack.pop();
+            }
+            PycRef<ASTNode> three = stack.top();
+            stack.pop();
+            stack.push(one);
+            stack.push(three);
+            stack.push(two);
+        }
+        break;
+    case Pyc::ROT_FOUR:
+        {
+            PycRef<ASTNode> one = stack.top();
+            stack.pop();
+            PycRef<ASTNode> two = stack.top();
+            stack.pop();
+            PycRef<ASTNode> three = stack.top();
+            stack.pop();
+            if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
+                stack.pop();
+            }
+            PycRef<ASTNode> four = stack.top();
+            stack.pop();
+            stack.push(one);
+            stack.push(four);
+            stack.push(three);
+            stack.push(two);
         }
         break;
     }
