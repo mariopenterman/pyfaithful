@@ -515,6 +515,7 @@ private:
     void handleWithCleanup();
     void handleCheckExcMatch();
     void handleEndFor();
+    void handleCall(int opcode, int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -594,6 +595,9 @@ private:
     /* Set by SETUP_FINALLY and cleared by SETUP_EXCEPT: whether the container
        block just opened is a bare try/finally (no except clause). */
     bool need_try = false;
+    /* The last non-CACHE/non-PRECALL opcode dispatched (loop epilogue updates
+       it); CALL reads it to detect a comprehension called right after GET_ITER. */
+    int lastSubstantialOp = Pyc::PYC_INVALID_OPCODE;
     /* Loop/branch prescan sets and maps consulted by the JUMP handlers to
        reconstruct for/while bodies, else clauses, breaks, and continues. */
     std::set<int> forBreakBeyondExit;
@@ -680,7 +684,6 @@ PycRef<ASTNode> CodeBuilder::build()
     struct BoolShortCircuit { PycRef<ASTNode> left; bool isOr; int target; int off; };
     std::vector<BoolShortCircuit> boolPending;
     bool else_pop = false;
-    int lastSubstantialOp = Pyc::PYC_INVALID_OPCODE;
     std::unordered_map<int,int> dupHandlerEnd;
     std::unordered_set<int> dupActiveSkip;
     std::unordered_map<int, int> finallyReturnExit;
@@ -10613,329 +10616,12 @@ PycRef<ASTNode> CodeBuilder::build()
         case Pyc::CALL_A:
         case Pyc::CALL_FUNCTION_A:
         case Pyc::INSTRUMENTED_CALL_A:
-            {
-                if ((operand & 0xFFFF) == 0 && lastSubstantialOp == Pyc::GET_ITER) {
-                    PycRef<ASTNode> mfunc = stack.top(2);
-                    if (mfunc != nullptr && mfunc.type() == ASTNode::NODE_FUNCTION) {
-                        PycRef<PycCode> cc = mfunc.cast<ASTFunction>()->code()
-                                .cast<ASTObject>()->object().cast<PycCode>();
-                        const char* nm = cc->name()->value();
-                        if (strcmp(nm, "<listcomp>") == 0 || strcmp(nm, "<setcomp>") == 0
-                                || strcmp(nm, "<dictcomp>") == 0
-                                || strcmp(nm, "<genexpr>") == 0) {
-                            PycRef<ASTNode> inlined =
-                                    InlineComprehension(cc, mod, stack.top(1));
-                            if (inlined != nullptr) {
-                                stack.pop();
-                                stack.pop();
-                                stack.push(inlined);
-                                break;
-                            }
-                        }
-                    }
-                }
-
-                int kwparams = (operand & 0xFF00) >> 8;
-                int pparams = (operand & 0xFF);
-                ASTCall::kwparam_t kwparamList;
-                ASTCall::pparam_t pparamList;
-
-                stack_hist.push(stack);
-                PycRef<ASTNode> classKwMap = nullptr;
-                if (mod->verCompare(3, 11) >= 0 && !stack.empty()
-                        && stack.top() != nullptr
-                        && stack.top().type() == ASTNode::NODE_KW_NAMES_MAP) {
-                    classKwMap = stack.top();
-                    stack.pop();
-                }
-                std::vector<PycRef<ASTNode>> aboveFunc;
-                while (!stack.empty() && stack.top() != nullptr
-                        && stack.top().type() != ASTNode::NODE_FUNCTION) {
-                    aboveFunc.push_back(stack.top());
-                    stack.pop();
-                }
-                PycRef<ASTNode> function = (!stack.empty()) ? stack.top() : nullptr;
-                if (function != nullptr)
-                    stack.pop();
-                PycRef<ASTNode> loadbuild = (!stack.empty()) ? stack.top() : nullptr;
-                if (loadbuild != nullptr)
-                    stack.pop();
-                if (loadbuild != nullptr
-                        && loadbuild.type() == ASTNode::NODE_LOADBUILDCLASS
-                        && function != nullptr && !aboveFunc.empty()) {
-                    if (!stack.empty() && stack.top() == nullptr)
-                        stack.pop();
-                    PycRef<ASTNode> name = aboveFunc.back();
-                    ASTTuple::value_t bases;
-                    for (size_t i = aboveFunc.size() - 1; i-- > 0; )
-                        bases.push_back(aboveFunc[i]);
-                    PycRef<ASTNode> call = new ASTCall(function, pparamList, kwparamList);
-                    stack.push(new ASTClass(call, new ASTTuple(bases), name, classKwMap));
-                    stack_hist.pop();
-                    break;
-                }
-                else
-                {
-                    stack = stack_hist.top();
-                    stack_hist.pop();
-                }
-
-                /*
-                KW_NAMES(i)
-                    Stores a reference to co_consts[consti] into an internal variable for use by CALL.
-                    co_consts[consti] must be a tuple of strings.
-                    New in version 3.11.
-                */
-                if (mod->verCompare(3, 11) >= 0) {
-                    PycRef<ASTNode> object_or_map = stack.top();
-                    if (object_or_map.type() == ASTNode::NODE_KW_NAMES_MAP) {
-                        stack.pop();
-                        PycRef<ASTKwNamesMap> kwparams_map = object_or_map.cast<ASTKwNamesMap>();
-                        for (ASTKwNamesMap::map_t::const_iterator it = kwparams_map->values().begin(); it != kwparams_map->values().end(); it++) {
-                            kwparamList.push_front(std::make_pair(it->first, it->second));
-                            pparams -= 1;
-                        }
-                    }
-                }
-                else {
-                    for (int i = 0; i < kwparams; i++) {
-                        PycRef<ASTNode> val = stack.top();
-                        stack.pop();
-                        PycRef<ASTNode> key = stack.top();
-                        stack.pop();
-                        kwparamList.push_front(std::make_pair(key, val));
-                    }
-                }
-                for (int i=0; i<pparams; i++) {
-                    PycRef<ASTNode> param = stack.top();
-                    stack.pop();
-                    if (param.type() == ASTNode::NODE_FUNCTION) {
-                        PycRef<ASTNode> fun_code = param.cast<ASTFunction>()->code();
-                        PycRef<PycCode> code_src = fun_code.cast<ASTObject>()->object().cast<PycCode>();
-                        PycRef<PycString> function_name = code_src->name();
-                        if (function_name->isEqual("<lambda>")) {
-                            pparamList.push_front(param);
-                        } else {
-                            // Decorator used
-                            PycRef<ASTNode> decor_name = new ASTName(function_name);
-                            curblock->append(new ASTStore(param, decor_name));
-
-                            pparamList.push_front(decor_name);
-                        }
-                    } else {
-                        pparamList.push_front(param);
-                    }
-                }
-                PycRef<ASTNode> func = stack.top();
-                stack.pop();
-
-                if ((opcode == Pyc::CALL_A || opcode == Pyc::INSTRUMENTED_CALL_A)
-                        && pparams == 0 && kwparams == 0
-                        && !stack.empty() && stack.top() != nullptr) {
-                    PycRef<ASTNode> decorated = func;
-                    bool is_decorator = false;
-                    if (decorated.type() == ASTNode::NODE_FUNCTION) {
-                        PycRef<PycCode> code_src = decorated.cast<ASTFunction>()
-                                ->code().cast<ASTObject>()->object().cast<PycCode>();
-                        if (!code_src->name()->isEqual("<lambda>")) {
-                            PycRef<ASTNode> decor_name = new ASTName(code_src->name());
-                            curblock->append(new ASTStore(decorated, decor_name));
-                            decorated = decor_name;
-                            is_decorator = true;
-                        }
-                    } else if (decorated.type() == ASTNode::NODE_CLASS) {
-                        PycRef<ASTNode> nm = decorated.cast<ASTClass>()->name();
-                        PycRef<PycString> cn = (nm != nullptr
-                                && nm.type() == ASTNode::NODE_OBJECT)
-                            ? nm.cast<ASTObject>()->object().try_cast<PycString>()
-                            : nullptr;
-                        if (cn != nullptr) {
-                            PycRef<ASTNode> decor_name = new ASTName(cn);
-                            curblock->append(new ASTStore(decorated, decor_name));
-                            decorated = decor_name;
-                            is_decorator = true;
-                        }
-                    } else if (decorated.type() == ASTNode::NODE_CALL) {
-                        is_decorator = true;
-                    }
-                    if (is_decorator) {
-                        PycRef<ASTNode> decorator = stack.top();
-                        stack.pop();
-                        ASTCall::pparam_t decParams;
-                        decParams.push_front(decorated);
-                        stack.push(new ASTCall(decorator, decParams,
-                                               ASTCall::kwparam_t()));
-                        break;
-                    }
-                }
-
-                if ((opcode == Pyc::CALL_A || opcode == Pyc::INSTRUMENTED_CALL_A) &&
-                        stack.top() == nullptr) {
-                    stack.pop();
-                }
-
-                stack.push(new ASTCall(func, pparamList, kwparamList));
-            }
-            break;
         case Pyc::CALL_FUNCTION_VAR_A:
-            {
-                PycRef<ASTNode> var = stack.top();
-                stack.pop();
-                int kwparams = (operand & 0xFF00) >> 8;
-                int pparams = (operand & 0xFF);
-                ASTCall::kwparam_t kwparamList;
-                ASTCall::pparam_t pparamList;
-                for (int i=0; i<kwparams; i++) {
-                    PycRef<ASTNode> val = stack.top();
-                    stack.pop();
-                    PycRef<ASTNode> key = stack.top();
-                    stack.pop();
-                    kwparamList.push_front(std::make_pair(key, val));
-                }
-                for (int i=0; i<pparams; i++) {
-                    pparamList.push_front(stack.top());
-                    stack.pop();
-                }
-                PycRef<ASTNode> func = stack.top();
-                stack.pop();
-
-                PycRef<ASTNode> call = new ASTCall(func, pparamList, kwparamList);
-                call.cast<ASTCall>()->setVar(var);
-                stack.push(call);
-            }
-            break;
         case Pyc::CALL_FUNCTION_KW_A:
-            {
-                PycRef<ASTNode> kw = stack.top();
-                stack.pop();
-                int kwparams = (operand & 0xFF00) >> 8;
-                int pparams = (operand & 0xFF);
-                ASTCall::kwparam_t kwparamList;
-                ASTCall::pparam_t pparamList;
-                for (int i=0; i<kwparams; i++) {
-                    PycRef<ASTNode> val = stack.top();
-                    stack.pop();
-                    PycRef<ASTNode> key = stack.top();
-                    stack.pop();
-                    kwparamList.push_front(std::make_pair(key, val));
-                }
-                for (int i=0; i<pparams; i++) {
-                    pparamList.push_front(stack.top());
-                    stack.pop();
-                }
-                PycRef<ASTNode> func = stack.top();
-                stack.pop();
-
-                PycRef<ASTNode> call = new ASTCall(func, pparamList, kwparamList);
-                call.cast<ASTCall>()->setKW(kw);
-                stack.push(call);
-            }
-            break;
         case Pyc::CALL_FUNCTION_VAR_KW_A:
-            {
-                PycRef<ASTNode> kw = stack.top();
-                stack.pop();
-                PycRef<ASTNode> var = stack.top();
-                stack.pop();
-                int kwparams = (operand & 0xFF00) >> 8;
-                int pparams = (operand & 0xFF);
-                ASTCall::kwparam_t kwparamList;
-                ASTCall::pparam_t pparamList;
-                for (int i=0; i<kwparams; i++) {
-                    PycRef<ASTNode> val = stack.top();
-                    stack.pop();
-                    PycRef<ASTNode> key = stack.top();
-                    stack.pop();
-                    kwparamList.push_front(std::make_pair(key, val));
-                }
-                for (int i=0; i<pparams; i++) {
-                    pparamList.push_front(stack.top());
-                    stack.pop();
-                }
-                PycRef<ASTNode> func = stack.top();
-                stack.pop();
-
-                PycRef<ASTNode> call = new ASTCall(func, pparamList, kwparamList);
-                call.cast<ASTCall>()->setKW(kw);
-                call.cast<ASTCall>()->setVar(var);
-                stack.push(call);
-            }
-            break;
         case Pyc::CALL_FUNCTION_EX_A:
-            {
-                PycRef<ASTNode> kw = nullptr;
-                if (operand & 0x01) {
-                    kw = stack.top();
-                    stack.pop();
-                }
-                PycRef<ASTNode> var = stack.top();
-                stack.pop();
-                PycRef<ASTNode> func = stack.top();
-                stack.pop();
-                if (!stack.empty() && stack.top() == nullptr)
-                    stack.pop();
-                /* `class X(*bases):` — dynamic/star-unpacked bases compile the
-                   __build_class__ call through CALL_FUNCTION_EX: the args
-                   (classbody fn, name, *bases) are assembled as a list
-                   (BUILD_LIST [fn, name]; LIST_EXTEND bases; LIST_TO_TUPLE) and
-                   star-called. The fixed-arg build_class path (CALL) never sees it,
-                   leaving a raw NODE_LOADBUILDCLASS. Recover the class: fn = var[0],
-                   name = var[1], bases = var[2:] (a `*bases` spread renders via its
-                   ASTUnary UN_STAR element). */
-                if (func != nullptr && func.type() == ASTNode::NODE_LOADBUILDCLASS
-                        && kw == nullptr && var != nullptr
-                        && var.type() == ASTNode::NODE_TUPLE) {
-                    const ASTTuple::value_t& tv = var.cast<ASTTuple>()->values();
-                    if (tv.size() >= 2 && tv[0] != nullptr
-                            && tv[0].type() == ASTNode::NODE_FUNCTION) {
-                        ASTTuple::value_t bases(tv.begin() + 2, tv.end());
-                        PycRef<ASTNode> classcall = new ASTCall(tv[0],
-                                ASTCall::pparam_t(), ASTCall::kwparam_t());
-                        stack.push(new ASTClass(classcall,
-                                new ASTTuple(bases), tv[1]));
-                        break;
-                    }
-                }
-                if (func == nullptr) {
-                    func = var;
-                    var = nullptr;
-                }
-                PycRef<ASTCall> call = new ASTCall(func, ASTCall::pparam_t(),
-                                                   ASTCall::kwparam_t());
-                if (var != nullptr)
-                    call->setVar(var);
-                if (kw != nullptr)
-                    call->setKW(kw);
-                stack.push(call.cast<ASTNode>());
-            }
-            break;
         case Pyc::CALL_METHOD_A:
-            {
-                ASTCall::pparam_t pparamList;
-                for (int i = 0; i < operand; i++) {
-                    PycRef<ASTNode> param = stack.top();
-                    stack.pop();
-                    if (param.type() == ASTNode::NODE_FUNCTION) {
-                        PycRef<ASTNode> fun_code = param.cast<ASTFunction>()->code();
-                        PycRef<PycCode> code_src = fun_code.cast<ASTObject>()->object().cast<PycCode>();
-                        PycRef<PycString> function_name = code_src->name();
-                        if (function_name->isEqual("<lambda>")) {
-                            pparamList.push_front(param);
-                        } else {
-                            // Decorator used
-                            PycRef<ASTNode> decor_name = new ASTName(function_name);
-                            curblock->append(new ASTStore(param, decor_name));
-
-                            pparamList.push_front(decor_name);
-                        }
-                    } else {
-                        pparamList.push_front(param);
-                    }
-                }
-                PycRef<ASTNode> func = stack.top();
-                stack.pop();
-                stack.push(new ASTCall(func, pparamList, ASTCall::kwparam_t()));
-            }
+            handleCall(opcode, operand);
             break;
         case Pyc::CONTINUE_LOOP_A:
             curblock->append(new ASTKeyword(ASTKeyword::KW_CONTINUE));
@@ -15547,6 +15233,347 @@ void CodeBuilder::handleEndFor()
     }
     else {
         fprintf(stderr, "Wrong block type %i for END_FOR\n", curblock->blktype());
+    }
+}
+
+/* The call opcodes, which all pop the callable and its arguments and push an
+ * ASTCall. The main CALL/CALL_FUNCTION path also: inlines a comprehension when a
+ * bare generator is immediately called after GET_ITER; reconstructs a
+ * `class X(...):` from the __build_class__ helper on the stack; folds 3.11
+ * KW_NAMES keyword names; and recognises the `@decorator` shape (a no-arg call
+ * of a freshly-defined function/class). The VAR/KW/VAR_KW/EX variants attach
+ * `*args` / `**kwargs`, and EX additionally recovers `class X(*bases)` built via
+ * a star-call; CALL_METHOD is the LOAD_METHOD fast path. */
+void CodeBuilder::handleCall(int opcode, int operand)
+{
+    switch (opcode) {
+        case Pyc::CALL_A:
+        case Pyc::CALL_FUNCTION_A:
+        case Pyc::INSTRUMENTED_CALL_A:
+            {
+                if ((operand & 0xFFFF) == 0 && lastSubstantialOp == Pyc::GET_ITER) {
+                    PycRef<ASTNode> mfunc = stack.top(2);
+                    if (mfunc != nullptr && mfunc.type() == ASTNode::NODE_FUNCTION) {
+                        PycRef<PycCode> cc = mfunc.cast<ASTFunction>()->code()
+                                .cast<ASTObject>()->object().cast<PycCode>();
+                        const char* nm = cc->name()->value();
+                        if (strcmp(nm, "<listcomp>") == 0 || strcmp(nm, "<setcomp>") == 0
+                                || strcmp(nm, "<dictcomp>") == 0
+                                || strcmp(nm, "<genexpr>") == 0) {
+                            PycRef<ASTNode> inlined =
+                                    InlineComprehension(cc, mod, stack.top(1));
+                            if (inlined != nullptr) {
+                                stack.pop();
+                                stack.pop();
+                                stack.push(inlined);
+                                break;
+                            }
+                        }
+                    }
+                }
+
+                int kwparams = (operand & 0xFF00) >> 8;
+                int pparams = (operand & 0xFF);
+                ASTCall::kwparam_t kwparamList;
+                ASTCall::pparam_t pparamList;
+
+                stack_hist.push(stack);
+                PycRef<ASTNode> classKwMap = nullptr;
+                if (mod->verCompare(3, 11) >= 0 && !stack.empty()
+                        && stack.top() != nullptr
+                        && stack.top().type() == ASTNode::NODE_KW_NAMES_MAP) {
+                    classKwMap = stack.top();
+                    stack.pop();
+                }
+                std::vector<PycRef<ASTNode>> aboveFunc;
+                while (!stack.empty() && stack.top() != nullptr
+                        && stack.top().type() != ASTNode::NODE_FUNCTION) {
+                    aboveFunc.push_back(stack.top());
+                    stack.pop();
+                }
+                PycRef<ASTNode> function = (!stack.empty()) ? stack.top() : nullptr;
+                if (function != nullptr)
+                    stack.pop();
+                PycRef<ASTNode> loadbuild = (!stack.empty()) ? stack.top() : nullptr;
+                if (loadbuild != nullptr)
+                    stack.pop();
+                if (loadbuild != nullptr
+                        && loadbuild.type() == ASTNode::NODE_LOADBUILDCLASS
+                        && function != nullptr && !aboveFunc.empty()) {
+                    if (!stack.empty() && stack.top() == nullptr)
+                        stack.pop();
+                    PycRef<ASTNode> name = aboveFunc.back();
+                    ASTTuple::value_t bases;
+                    for (size_t i = aboveFunc.size() - 1; i-- > 0; )
+                        bases.push_back(aboveFunc[i]);
+                    PycRef<ASTNode> call = new ASTCall(function, pparamList, kwparamList);
+                    stack.push(new ASTClass(call, new ASTTuple(bases), name, classKwMap));
+                    stack_hist.pop();
+                    break;
+                }
+                else
+                {
+                    stack = stack_hist.top();
+                    stack_hist.pop();
+                }
+
+                /*
+                KW_NAMES(i)
+                    Stores a reference to co_consts[consti] into an internal variable for use by CALL.
+                    co_consts[consti] must be a tuple of strings.
+                    New in version 3.11.
+                */
+                if (mod->verCompare(3, 11) >= 0) {
+                    PycRef<ASTNode> object_or_map = stack.top();
+                    if (object_or_map.type() == ASTNode::NODE_KW_NAMES_MAP) {
+                        stack.pop();
+                        PycRef<ASTKwNamesMap> kwparams_map = object_or_map.cast<ASTKwNamesMap>();
+                        for (ASTKwNamesMap::map_t::const_iterator it = kwparams_map->values().begin(); it != kwparams_map->values().end(); it++) {
+                            kwparamList.push_front(std::make_pair(it->first, it->second));
+                            pparams -= 1;
+                        }
+                    }
+                }
+                else {
+                    for (int i = 0; i < kwparams; i++) {
+                        PycRef<ASTNode> val = stack.top();
+                        stack.pop();
+                        PycRef<ASTNode> key = stack.top();
+                        stack.pop();
+                        kwparamList.push_front(std::make_pair(key, val));
+                    }
+                }
+                for (int i=0; i<pparams; i++) {
+                    PycRef<ASTNode> param = stack.top();
+                    stack.pop();
+                    if (param.type() == ASTNode::NODE_FUNCTION) {
+                        PycRef<ASTNode> fun_code = param.cast<ASTFunction>()->code();
+                        PycRef<PycCode> code_src = fun_code.cast<ASTObject>()->object().cast<PycCode>();
+                        PycRef<PycString> function_name = code_src->name();
+                        if (function_name->isEqual("<lambda>")) {
+                            pparamList.push_front(param);
+                        } else {
+                            // Decorator used
+                            PycRef<ASTNode> decor_name = new ASTName(function_name);
+                            curblock->append(new ASTStore(param, decor_name));
+
+                            pparamList.push_front(decor_name);
+                        }
+                    } else {
+                        pparamList.push_front(param);
+                    }
+                }
+                PycRef<ASTNode> func = stack.top();
+                stack.pop();
+
+                if ((opcode == Pyc::CALL_A || opcode == Pyc::INSTRUMENTED_CALL_A)
+                        && pparams == 0 && kwparams == 0
+                        && !stack.empty() && stack.top() != nullptr) {
+                    PycRef<ASTNode> decorated = func;
+                    bool is_decorator = false;
+                    if (decorated.type() == ASTNode::NODE_FUNCTION) {
+                        PycRef<PycCode> code_src = decorated.cast<ASTFunction>()
+                                ->code().cast<ASTObject>()->object().cast<PycCode>();
+                        if (!code_src->name()->isEqual("<lambda>")) {
+                            PycRef<ASTNode> decor_name = new ASTName(code_src->name());
+                            curblock->append(new ASTStore(decorated, decor_name));
+                            decorated = decor_name;
+                            is_decorator = true;
+                        }
+                    } else if (decorated.type() == ASTNode::NODE_CLASS) {
+                        PycRef<ASTNode> nm = decorated.cast<ASTClass>()->name();
+                        PycRef<PycString> cn = (nm != nullptr
+                                && nm.type() == ASTNode::NODE_OBJECT)
+                            ? nm.cast<ASTObject>()->object().try_cast<PycString>()
+                            : nullptr;
+                        if (cn != nullptr) {
+                            PycRef<ASTNode> decor_name = new ASTName(cn);
+                            curblock->append(new ASTStore(decorated, decor_name));
+                            decorated = decor_name;
+                            is_decorator = true;
+                        }
+                    } else if (decorated.type() == ASTNode::NODE_CALL) {
+                        is_decorator = true;
+                    }
+                    if (is_decorator) {
+                        PycRef<ASTNode> decorator = stack.top();
+                        stack.pop();
+                        ASTCall::pparam_t decParams;
+                        decParams.push_front(decorated);
+                        stack.push(new ASTCall(decorator, decParams,
+                                               ASTCall::kwparam_t()));
+                        break;
+                    }
+                }
+
+                if ((opcode == Pyc::CALL_A || opcode == Pyc::INSTRUMENTED_CALL_A) &&
+                        stack.top() == nullptr) {
+                    stack.pop();
+                }
+
+                stack.push(new ASTCall(func, pparamList, kwparamList));
+            }
+            break;
+        case Pyc::CALL_FUNCTION_VAR_A:
+            {
+                PycRef<ASTNode> var = stack.top();
+                stack.pop();
+                int kwparams = (operand & 0xFF00) >> 8;
+                int pparams = (operand & 0xFF);
+                ASTCall::kwparam_t kwparamList;
+                ASTCall::pparam_t pparamList;
+                for (int i=0; i<kwparams; i++) {
+                    PycRef<ASTNode> val = stack.top();
+                    stack.pop();
+                    PycRef<ASTNode> key = stack.top();
+                    stack.pop();
+                    kwparamList.push_front(std::make_pair(key, val));
+                }
+                for (int i=0; i<pparams; i++) {
+                    pparamList.push_front(stack.top());
+                    stack.pop();
+                }
+                PycRef<ASTNode> func = stack.top();
+                stack.pop();
+
+                PycRef<ASTNode> call = new ASTCall(func, pparamList, kwparamList);
+                call.cast<ASTCall>()->setVar(var);
+                stack.push(call);
+            }
+            break;
+        case Pyc::CALL_FUNCTION_KW_A:
+            {
+                PycRef<ASTNode> kw = stack.top();
+                stack.pop();
+                int kwparams = (operand & 0xFF00) >> 8;
+                int pparams = (operand & 0xFF);
+                ASTCall::kwparam_t kwparamList;
+                ASTCall::pparam_t pparamList;
+                for (int i=0; i<kwparams; i++) {
+                    PycRef<ASTNode> val = stack.top();
+                    stack.pop();
+                    PycRef<ASTNode> key = stack.top();
+                    stack.pop();
+                    kwparamList.push_front(std::make_pair(key, val));
+                }
+                for (int i=0; i<pparams; i++) {
+                    pparamList.push_front(stack.top());
+                    stack.pop();
+                }
+                PycRef<ASTNode> func = stack.top();
+                stack.pop();
+
+                PycRef<ASTNode> call = new ASTCall(func, pparamList, kwparamList);
+                call.cast<ASTCall>()->setKW(kw);
+                stack.push(call);
+            }
+            break;
+        case Pyc::CALL_FUNCTION_VAR_KW_A:
+            {
+                PycRef<ASTNode> kw = stack.top();
+                stack.pop();
+                PycRef<ASTNode> var = stack.top();
+                stack.pop();
+                int kwparams = (operand & 0xFF00) >> 8;
+                int pparams = (operand & 0xFF);
+                ASTCall::kwparam_t kwparamList;
+                ASTCall::pparam_t pparamList;
+                for (int i=0; i<kwparams; i++) {
+                    PycRef<ASTNode> val = stack.top();
+                    stack.pop();
+                    PycRef<ASTNode> key = stack.top();
+                    stack.pop();
+                    kwparamList.push_front(std::make_pair(key, val));
+                }
+                for (int i=0; i<pparams; i++) {
+                    pparamList.push_front(stack.top());
+                    stack.pop();
+                }
+                PycRef<ASTNode> func = stack.top();
+                stack.pop();
+
+                PycRef<ASTNode> call = new ASTCall(func, pparamList, kwparamList);
+                call.cast<ASTCall>()->setKW(kw);
+                call.cast<ASTCall>()->setVar(var);
+                stack.push(call);
+            }
+            break;
+        case Pyc::CALL_FUNCTION_EX_A:
+            {
+                PycRef<ASTNode> kw = nullptr;
+                if (operand & 0x01) {
+                    kw = stack.top();
+                    stack.pop();
+                }
+                PycRef<ASTNode> var = stack.top();
+                stack.pop();
+                PycRef<ASTNode> func = stack.top();
+                stack.pop();
+                if (!stack.empty() && stack.top() == nullptr)
+                    stack.pop();
+                /* `class X(*bases):` — dynamic/star-unpacked bases compile the
+                   __build_class__ call through CALL_FUNCTION_EX: the args
+                   (classbody fn, name, *bases) are assembled as a list
+                   (BUILD_LIST [fn, name]; LIST_EXTEND bases; LIST_TO_TUPLE) and
+                   star-called. The fixed-arg build_class path (CALL) never sees it,
+                   leaving a raw NODE_LOADBUILDCLASS. Recover the class: fn = var[0],
+                   name = var[1], bases = var[2:] (a `*bases` spread renders via its
+                   ASTUnary UN_STAR element). */
+                if (func != nullptr && func.type() == ASTNode::NODE_LOADBUILDCLASS
+                        && kw == nullptr && var != nullptr
+                        && var.type() == ASTNode::NODE_TUPLE) {
+                    const ASTTuple::value_t& tv = var.cast<ASTTuple>()->values();
+                    if (tv.size() >= 2 && tv[0] != nullptr
+                            && tv[0].type() == ASTNode::NODE_FUNCTION) {
+                        ASTTuple::value_t bases(tv.begin() + 2, tv.end());
+                        PycRef<ASTNode> classcall = new ASTCall(tv[0],
+                                ASTCall::pparam_t(), ASTCall::kwparam_t());
+                        stack.push(new ASTClass(classcall,
+                                new ASTTuple(bases), tv[1]));
+                        break;
+                    }
+                }
+                if (func == nullptr) {
+                    func = var;
+                    var = nullptr;
+                }
+                PycRef<ASTCall> call = new ASTCall(func, ASTCall::pparam_t(),
+                                                   ASTCall::kwparam_t());
+                if (var != nullptr)
+                    call->setVar(var);
+                if (kw != nullptr)
+                    call->setKW(kw);
+                stack.push(call.cast<ASTNode>());
+            }
+            break;
+        case Pyc::CALL_METHOD_A:
+            {
+                ASTCall::pparam_t pparamList;
+                for (int i = 0; i < operand; i++) {
+                    PycRef<ASTNode> param = stack.top();
+                    stack.pop();
+                    if (param.type() == ASTNode::NODE_FUNCTION) {
+                        PycRef<ASTNode> fun_code = param.cast<ASTFunction>()->code();
+                        PycRef<PycCode> code_src = fun_code.cast<ASTObject>()->object().cast<PycCode>();
+                        PycRef<PycString> function_name = code_src->name();
+                        if (function_name->isEqual("<lambda>")) {
+                            pparamList.push_front(param);
+                        } else {
+                            // Decorator used
+                            PycRef<ASTNode> decor_name = new ASTName(function_name);
+                            curblock->append(new ASTStore(param, decor_name));
+
+                            pparamList.push_front(decor_name);
+                        }
+                    } else {
+                        pparamList.push_front(param);
+                    }
+                }
+                PycRef<ASTNode> func = stack.top();
+                stack.pop();
+                stack.push(new ASTCall(func, pparamList, ASTCall::kwparam_t()));
+            }
+            break;
     }
 }
 
