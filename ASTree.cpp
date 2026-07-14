@@ -494,6 +494,7 @@ private:
     /* Returns false to signal a bail-out (the caller returns the partial tree). */
     bool handleStore(int opcode, int operand);
     void handleUnpack(int opcode, int operand);
+    void handleYield(int opcode);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -14708,49 +14709,9 @@ PycRef<ASTNode> CodeBuilder::build()
             }
             break;
         case Pyc::YIELD_FROM:
-            {
-                PycRef<ASTNode> dest = stack.top();
-                stack.pop();
-                // TODO: Support yielding into a non-null destination
-                PycRef<ASTNode> value = stack.top();
-                if (value) {
-                    value->setProcessed();
-                    curblock->append(new ASTReturn(value, ASTReturn::YIELD_FROM));
-                }
-            }
-            break;
         case Pyc::YIELD_VALUE:
         case Pyc::INSTRUMENTED_YIELD_VALUE_A:
-            {
-                PycRef<ASTNode> value = stack.top();
-                stack.pop();
-                if (curblock->blktype() == ASTBlock::BLK_FOR
-                        && curblock.cast<ASTIterBlock>()->isComprehension()) {
-                    stack.push(new ASTComprehension(value,
-                            ASTComprehension::COMP_GENERATOR));
-                } else {
-                    bool resultUsed = false;
-                    /* `yield` as an expression (its sent-value result consumed) only
-                       exists from Python 2.5 (PEP 342); before that a yield leaves no
-                       usable value, so it is always a statement. */
-                    if (mod->verCompare(2, 5) >= 0) {
-                        PycBuffer pk(code->code()->value(), code->code()->length());
-                        pk.setPos(pos);
-                        int po = -1, pa, pp = pos, steps = 0;
-                        while (!pk.atEof() && steps++ < 4) {
-                            bc_next(pk, mod, po, pa, pp);
-                            if (po == Pyc::RESUME_A || po == Pyc::CACHE
-                                    || po == Pyc::INSTRUMENTED_RESUME_A) continue;
-                            break;
-                        }
-                        resultUsed = (po != Pyc::POP_TOP && po != -1);
-                    }
-                    if (resultUsed)
-                        stack.push(new ASTReturn(value, ASTReturn::YIELD_EXPR));
-                    else
-                        curblock->append(new ASTReturn(value, ASTReturn::YIELD));
-                }
-            }
+            handleYield(opcode);
             break;
         case Pyc::SETUP_ANNOTATIONS:
             variable_annotations = true;
@@ -15658,6 +15619,65 @@ void CodeBuilder::handleUnpack(int opcode, int operand)
             unpackStar = countAfter + 1;
             ASTTuple::value_t vals;
             stack.push(new ASTTuple(vals));
+        }
+        break;
+    }
+}
+
+/* The yield opcodes, which all build an ASTReturn tagged with a yield flavour.
+ *   YIELD_FROM  -> `yield from <iter>`; pops the exhausted sub-iterator and
+ *       emits the yield-from of the value beneath it (a non-null send target is
+ *       not yet supported).
+ *   YIELD_VALUE -> inside a generator comprehension it becomes the
+ *       COMP_GENERATOR result; otherwise it is a `yield`. A yield whose sent
+ *       value is consumed (not immediately POP_TOP'd, Python 2.5+ PEP 342) is a
+ *       yield EXPRESSION left on the stack; otherwise it is a yield statement. */
+void CodeBuilder::handleYield(int opcode)
+{
+    switch (opcode) {
+    case Pyc::YIELD_FROM:
+        {
+            PycRef<ASTNode> dest = stack.top();
+            stack.pop();
+            // TODO: Support yielding into a non-null destination
+            PycRef<ASTNode> value = stack.top();
+            if (value) {
+                value->setProcessed();
+                curblock->append(new ASTReturn(value, ASTReturn::YIELD_FROM));
+            }
+        }
+        break;
+    case Pyc::YIELD_VALUE:
+    case Pyc::INSTRUMENTED_YIELD_VALUE_A:
+        {
+            PycRef<ASTNode> value = stack.top();
+            stack.pop();
+            if (curblock->blktype() == ASTBlock::BLK_FOR
+                    && curblock.cast<ASTIterBlock>()->isComprehension()) {
+                stack.push(new ASTComprehension(value,
+                        ASTComprehension::COMP_GENERATOR));
+            } else {
+                bool resultUsed = false;
+                /* `yield` as an expression (its sent-value result consumed) only
+                   exists from Python 2.5 (PEP 342); before that a yield leaves no
+                   usable value, so it is always a statement. */
+                if (mod->verCompare(2, 5) >= 0) {
+                    PycBuffer pk(code->code()->value(), code->code()->length());
+                    pk.setPos(pos);
+                    int po = -1, pa, pp = pos, steps = 0;
+                    while (!pk.atEof() && steps++ < 4) {
+                        bc_next(pk, mod, po, pa, pp);
+                        if (po == Pyc::RESUME_A || po == Pyc::CACHE
+                                || po == Pyc::INSTRUMENTED_RESUME_A) continue;
+                        break;
+                    }
+                    resultUsed = (po != Pyc::POP_TOP && po != -1);
+                }
+                if (resultUsed)
+                    stack.push(new ASTReturn(value, ASTReturn::YIELD_EXPR));
+                else
+                    curblock->append(new ASTReturn(value, ASTReturn::YIELD));
+            }
         }
         break;
     }
