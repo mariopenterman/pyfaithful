@@ -522,6 +522,7 @@ private:
     void handleSwap(int operand);
     void handleCopy(int operand);
     void handleReturnValue();
+    void handleLoadConst(int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -607,6 +608,9 @@ private:
     /* Maps a const-tuple LOAD offset to the anchor NOP offsets before it, so
        MAKE_FUNCTION can recover a multi-line signature's defaults layout. */
     std::unordered_map<int, std::vector<int> > sigTupleNopOffs;
+    /* The run of anchor NOP offsets ending just before the current instruction,
+       captured each dispatch iteration and consumed by handleLoadConst. */
+    std::vector<int> nopsBeforeCur;
     /* Chained-assignment COPY offsets (a = b = ...; from the prescan) and the
        SWAP offsets that begin a chained comparison (`a < b < c`). */
     std::unordered_set<int> chainCopyOffsets;
@@ -10298,7 +10302,7 @@ PycRef<ASTNode> CodeBuilder::build()
 
         /* Track the run of NOP offsets ending just before this instruction (used to
            recover multi-line const-default signature anchors at MAKE_FUNCTION). */
-        std::vector<int> nopsBeforeCur = pendingNopOffs;
+        nopsBeforeCur = pendingNopOffs;
         if (opcode == Pyc::NOP)
             pendingNopOffs.push_back(curpos);
         else
@@ -12886,29 +12890,7 @@ PycRef<ASTNode> CodeBuilder::build()
             handleLoad(opcode, operand);
             break;
         case Pyc::LOAD_CONST_A:
-            {
-                PycRef<ASTObject> t_ob = new ASTObject(code->getConst(operand));
-
-                if ((t_ob->object().type() == PycObject::TYPE_TUPLE ||
-                        t_ob->object().type() == PycObject::TYPE_SMALL_TUPLE)
-                        && t_ob->object().cast<PycTuple>()->values().size()
-                        && !nopsBeforeCur.empty()) {
-                    /* A non-empty const tuple preceded by anchor NOPs: remember their
-                       offsets in case this is a multi-line signature's defaults tuple. */
-                    sigTupleNopOffs[curpos] = nopsBeforeCur;
-                }
-
-                if ((t_ob->object().type() == PycObject::TYPE_TUPLE ||
-                        t_ob->object().type() == PycObject::TYPE_SMALL_TUPLE) &&
-                        !t_ob->object().cast<PycTuple>()->values().size()) {
-                    ASTTuple::value_t values;
-                    stack.push(new ASTTuple(values));
-                } else if (t_ob->object().type() == PycObject::TYPE_NONE) {
-                    stack.push(NULL);
-                } else {
-                    stack.push(t_ob.cast<ASTNode>());
-                }
-            }
+            handleLoadConst(operand);
             break;
         case Pyc::LOAD_DEREF_A:
         case Pyc::LOAD_CLASSDEREF_A:
@@ -17063,6 +17045,36 @@ void CodeBuilder::handleReturnValue()
                         pos = sv_pos;
                     }
                 }
+}
+
+/* LOAD_CONST — push a constant from the code object's const pool. A non-empty
+   const tuple preceded by a run of anchor NOPs is recorded (sigTupleNopOffs)
+   in case it is the defaults tuple of a multi-line function signature. An
+   empty tuple becomes an ASTTuple literal, None pushes NULL (rendered as the
+   implicit None), and everything else pushes the object node directly. */
+void CodeBuilder::handleLoadConst(int operand)
+{
+    PycRef<ASTObject> t_ob = new ASTObject(code->getConst(operand));
+
+    if ((t_ob->object().type() == PycObject::TYPE_TUPLE ||
+            t_ob->object().type() == PycObject::TYPE_SMALL_TUPLE)
+            && t_ob->object().cast<PycTuple>()->values().size()
+            && !nopsBeforeCur.empty()) {
+        /* A non-empty const tuple preceded by anchor NOPs: remember their
+           offsets in case this is a multi-line signature's defaults tuple. */
+        sigTupleNopOffs[curpos] = nopsBeforeCur;
+    }
+
+    if ((t_ob->object().type() == PycObject::TYPE_TUPLE ||
+            t_ob->object().type() == PycObject::TYPE_SMALL_TUPLE) &&
+            !t_ob->object().cast<PycTuple>()->values().size()) {
+        ASTTuple::value_t values;
+        stack.push(new ASTTuple(values));
+    } else if (t_ob->object().type() == PycObject::TYPE_NONE) {
+        stack.push(NULL);
+    } else {
+        stack.push(t_ob.cast<ASTNode>());
+    }
 }
 
 /* Arithmetic/bitwise precedence LEVEL of a binary op (higher binds tighter).
