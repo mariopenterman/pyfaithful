@@ -487,6 +487,10 @@ private:
     void handleExprWrap(int opcode, int operand);
     void handleRaiseVarargs(int operand);
 
+    /* Simultaneous tuple-assignment helpers (see the tupleAssignStart prescan). */
+    bool tupleAssignSafe(int K);
+    void tupleStoreStep(PycRef<ASTNode> tname);
+
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
     PycModule* mod;
@@ -6888,47 +6892,6 @@ PycRef<ASTNode> CodeBuilder::build()
         }
     }
     PycRef<ASTNode> ternCondBlk, ternThenVal;
-    /* Helpers for simultaneous tuple assignment (see tupleAssignStart prescan).
-       tupleAssignSafe validates the N stack values are genuine, independent RHS
-       values (not a chained-store / import node) and that we are not filling a
-       for/with target; tupleStoreStep folds one store of the active run and, on
-       the last one, emits a single `t1, ..., tN = v1, ..., vN` statement (both
-       tuples reversed back into source order). */
-    auto tupleAssignSafe = [&](int K) -> bool {
-        if (!curblock->inited()
-                && (curblock->blktype() == ASTBlock::BLK_FOR
-                    || curblock->blktype() == ASTBlock::BLK_ASYNCFOR
-                    || curblock->blktype() == ASTBlock::BLK_WITH))
-            return false;
-        for (int i = 1; i <= K; i++) {
-            PycRef<ASTNode> v = stack.top(i);
-            if (v == nullptr
-                    || v.type() == ASTNode::NODE_CHAINSTORE
-                    || v.type() == ASTNode::NODE_IMPORT)
-                return false;
-        }
-        return true;
-    };
-    auto tupleStoreStep = [&](PycRef<ASTNode> tname) {
-        PycRef<ASTNode> tval = stack.top();
-        stack.pop();
-        tupleStoreTargets.push_back(tname);
-        tupleStoreValues.push_back(tval);
-        if (--tupleStore == 0) {
-            ASTTuple::value_t tgs, vls;
-            for (auto it = tupleStoreTargets.rbegin(); it != tupleStoreTargets.rend(); ++it)
-                tgs.push_back(*it);
-            for (auto it = tupleStoreValues.rbegin(); it != tupleStoreValues.rend(); ++it)
-                vls.push_back(*it);
-            PycRef<ASTTuple> tgt = new ASTTuple(tgs);
-            tgt->setRequireParens(false);
-            PycRef<ASTTuple> val = new ASTTuple(vls);
-            val->setRequireParens(false);
-            curblock->append(new ASTStore(val.cast<ASTNode>(), tgt.cast<ASTNode>()));
-            tupleStoreTargets.clear();
-            tupleStoreValues.clear();
-        }
-    };
     try {
     while (!source.atEof()) {
 #if defined(BLOCK_DEBUG) || defined(STACK_DEBUG)
@@ -15571,6 +15534,54 @@ PycRef<ASTNode> CodeBuilder::build()
      * that decompilation reached the end without bailing. */
     cleanBuild = true;
     return new ASTNodeList(defblock->nodes());
+}
+
+/* Simultaneous tuple assignment (`t1, ..., tN = v1, ..., vN`) helpers.
+ * tupleAssignSafe checks that the N values on top of the stack are genuine,
+ * independent right-hand-side values (not a chained-store or import node) and
+ * that we are not in the middle of filling a for/with target -- i.e. that the
+ * run of stores really is one parallel assignment and safe to fold. */
+bool CodeBuilder::tupleAssignSafe(int K)
+{
+    if (!curblock->inited()
+            && (curblock->blktype() == ASTBlock::BLK_FOR
+                || curblock->blktype() == ASTBlock::BLK_ASYNCFOR
+                || curblock->blktype() == ASTBlock::BLK_WITH))
+        return false;
+    for (int i = 1; i <= K; i++) {
+        PycRef<ASTNode> v = stack.top(i);
+        if (v == nullptr
+                || v.type() == ASTNode::NODE_CHAINSTORE
+                || v.type() == ASTNode::NODE_IMPORT)
+            return false;
+    }
+    return true;
+}
+
+/* Fold one store of the active tuple-assignment run. Each call records one
+ * target/value pair (they arrive in bytecode/pop order); on the final store
+ * (tupleStore reaches 0) it reverses both back into source order and appends a
+ * single `t1, ..., tN = v1, ..., vN` statement. */
+void CodeBuilder::tupleStoreStep(PycRef<ASTNode> tname)
+{
+    PycRef<ASTNode> tval = stack.top();
+    stack.pop();
+    tupleStoreTargets.push_back(tname);
+    tupleStoreValues.push_back(tval);
+    if (--tupleStore == 0) {
+        ASTTuple::value_t tgs, vls;
+        for (auto it = tupleStoreTargets.rbegin(); it != tupleStoreTargets.rend(); ++it)
+            tgs.push_back(*it);
+        for (auto it = tupleStoreValues.rbegin(); it != tupleStoreValues.rend(); ++it)
+            vls.push_back(*it);
+        PycRef<ASTTuple> tgt = new ASTTuple(tgs);
+        tgt->setRequireParens(false);
+        PycRef<ASTTuple> val = new ASTTuple(vls);
+        val->setRequireParens(false);
+        curblock->append(new ASTStore(val.cast<ASTNode>(), tgt.cast<ASTNode>()));
+        tupleStoreTargets.clear();
+        tupleStoreValues.clear();
+    }
 }
 
 /* The UNARY_* opcodes each pop one operand and push one result node.
