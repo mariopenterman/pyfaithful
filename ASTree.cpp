@@ -516,6 +516,7 @@ private:
     void handleCheckExcMatch();
     void handleEndFor();
     void handleCall(int opcode, int operand);
+    void handleMakeFunction(int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -598,6 +599,9 @@ private:
     /* The last non-CACHE/non-PRECALL opcode dispatched (loop epilogue updates
        it); CALL reads it to detect a comprehension called right after GET_ITER. */
     int lastSubstantialOp = Pyc::PYC_INVALID_OPCODE;
+    /* Maps a const-tuple LOAD offset to the anchor NOP offsets before it, so
+       MAKE_FUNCTION can recover a multi-line signature's defaults layout. */
+    std::unordered_map<int, std::vector<int> > sigTupleNopOffs;
     /* Loop/branch prescan sets and maps consulted by the JUMP handlers to
        reconstruct for/while bodies, else clauses, breaks, and continues. */
     std::set<int> forBreakBeyondExit;
@@ -716,7 +720,6 @@ PycRef<ASTNode> CodeBuilder::build()
        signature. sigTupleNopOffs maps a const-tuple LOAD_CONST's offset to those
        NOP offsets so MAKE_FUNCTION can recover a signature's anchor NOPs. */
     std::vector<int> pendingNopOffs;
-    std::unordered_map<int, std::vector<int> > sigTupleNopOffs;
     /* Byte offsets of the anchor NOPs consumed by one-per-line const-default
        signatures (see g_sigAnchorNopOffs): excluded from the stripped-statement
        placeholder passes so the signature render (not a placeholder) reproduces
@@ -13008,157 +13011,7 @@ PycRef<ASTNode> CodeBuilder::build()
             break;
         case Pyc::MAKE_CLOSURE_A:
         case Pyc::MAKE_FUNCTION_A:
-            {
-                PycRef<ASTNode> fun_code = stack.top();
-                stack.pop();
-
-                /* Test for the qualified name of the function (at TOS) */
-                int tos_type = fun_code.cast<ASTObject>()->object().type();
-                if (tos_type != PycObject::TYPE_CODE &&
-                    tos_type != PycObject::TYPE_CODE2) {
-                    fun_code = stack.top();
-                    stack.pop();
-                }
-
-                ASTFunction::defarg_t defArgs, kwDefArgs;
-                ASTFunction::annot_t funcAnnots;
-                int constDefTupleOff = -1;
-                if (mod->verCompare(3, 6) >= 0) {
-                    if (operand & 0x08)
-                        stack.pop();
-                    if (operand & 0x04) {
-                        PycRef<ASTNode> ann = stack.top();
-                        stack.pop();
-                        std::vector<PycRef<ASTNode>> flat;
-                        if (ann != nullptr && ann.type() == ASTNode::NODE_TUPLE) {
-                            for (const auto& v : ann.cast<ASTTuple>()->values())
-                                flat.push_back(v);
-                        } else if (ann != nullptr && ann.type() == ASTNode::NODE_OBJECT
-                                   && (ann.cast<ASTObject>()->object()->type() == PycObject::TYPE_TUPLE
-                                       || ann.cast<ASTObject>()->object()->type() == PycObject::TYPE_SMALL_TUPLE)) {
-                            for (const auto& v : ann.cast<ASTObject>()->object()
-                                                    .cast<PycTuple>()->values())
-                                flat.push_back(new ASTObject(v));
-                        }
-                        for (size_t k = 0; k + 1 < flat.size(); k += 2) {
-                            PycRef<ASTNode> key = flat[k];
-                            if (key != nullptr && key.type() == ASTNode::NODE_OBJECT) {
-                                PycRef<PycObject> ko = key.cast<ASTObject>()->object();
-                                if (ko->type() == PycObject::TYPE_STRING
-                                        || ko->type() == PycObject::TYPE_UNICODE
-                                        || ko->type() == PycObject::TYPE_INTERNED
-                                        || ko->type() == PycObject::TYPE_ASCII
-                                        || ko->type() == PycObject::TYPE_ASCII_INTERNED
-                                        || ko->type() == PycObject::TYPE_SHORT_ASCII
-                                        || ko->type() == PycObject::TYPE_SHORT_ASCII_INTERNED) {
-                                    PycRef<ASTNode> aval = flat[k + 1];
-                                    if (aval == nullptr)
-                                        aval = new ASTObject(Pyc_None);
-                                    funcAnnots.push_back({ ko.cast<PycString>()->value(), aval });
-                                }
-                            }
-                        }
-                        if (ann != nullptr && ann.type() == ASTNode::NODE_CONST_MAP) {
-                            const auto& mv = ann.cast<ASTConstMap>();
-                            PycTuple::value_t keys = mv->keys().cast<ASTObject>()
-                                    ->object().cast<PycTuple>()->values();
-                            ASTConstMap::values_t vals = mv->values();
-                            size_t vi = 0;
-                            for (const auto& key : keys) {
-                                if (vi < vals.size() && key->type() == PycObject::TYPE_STRING)
-                                    funcAnnots.push_back({ key.cast<PycString>()->value(),
-                                                           vals[vi] });
-                                ++vi;
-                            }
-                        }
-                    }
-                    if (operand & 0x02) {
-                        PycRef<ASTNode> kwd = stack.top();
-                        stack.pop();
-                        if (kwd != nullptr && kwd.type() == ASTNode::NODE_CONST_MAP) {
-                            const auto& vals = kwd.cast<ASTConstMap>()->values();
-                            for (auto it = vals.rbegin(); it != vals.rend(); ++it)
-                                kwDefArgs.push_back(*it);
-                        } else if (kwd != nullptr && kwd.type() == ASTNode::NODE_MAP) {
-                            for (const auto& kv : kwd.cast<ASTMap>()->values())
-                                kwDefArgs.push_back(kv.second);
-                        } else if (kwd != nullptr && kwd.type() == ASTNode::NODE_OBJECT
-                                   && kwd.cast<ASTObject>()->object()->type() == PycObject::TYPE_DICT) {
-                            for (const auto& kv : kwd.cast<ASTObject>()->object()
-                                                     .cast<PycDict>()->values())
-                                kwDefArgs.push_back(new ASTObject(std::get<1>(kv)));
-                        } else if (kwd != nullptr) {
-                            kwDefArgs.push_back(kwd);
-                        }
-                    }
-                    if (operand & 0x01) {
-                        PycRef<ASTNode> defs = stack.top();
-                        stack.pop();
-                        if (defs != nullptr && defs.type() == ASTNode::NODE_TUPLE) {
-                            for (const auto& v : defs.cast<ASTTuple>()->values())
-                                defArgs.push_back(v);
-                        } else if (defs != nullptr && defs.type() == ASTNode::NODE_OBJECT
-                                   && (defs.cast<ASTObject>()->object()->type() == PycObject::TYPE_TUPLE
-                                       || defs.cast<ASTObject>()->object()->type() == PycObject::TYPE_SMALL_TUPLE)) {
-                            for (const auto& v : defs.cast<ASTObject>()->object()
-                                                     .cast<PycTuple>()->values())
-                                defArgs.push_back(new ASTObject(v));
-                            constDefTupleOff = defs->srcOff();
-                        } else if (defs != nullptr) {
-                            defArgs.push_back(defs);
-                        }
-                    }
-                } else {
-                    const int defCount = operand & 0xFF;
-                    const int kwDefCount = (operand >> 8) & 0xFF;
-                    for (int i = 0; i < defCount; ++i) {
-                        defArgs.push_front(stack.top());
-                        stack.pop();
-                    }
-                    for (int i = 0; i < kwDefCount; ++i) {
-                        kwDefArgs.push_front(stack.top());
-                        stack.pop();
-                    }
-                }
-                PycRef<ASTNode> fn = new ASTFunction(fun_code, defArgs, kwDefArgs);
-                if (!funcAnnots.empty())
-                    fn.cast<ASTFunction>()->setAnnotations(std::move(funcAnnots));
-                /* If the positional defaults came from a const tuple preceded by a
-                   run of K anchor NOPs (with no keyword-only defaults), the
-                   signature wrapped across K source lines each carrying a constant
-                   default: record K so it renders over K lines and the recompile
-                   regenerates those K NOPs. Annotations are fine -- they emit real
-                   code carrying their own positions and add no anchor NOPs, so the
-                   count still depends only on the constant-default lines. */
-                if (constDefTupleOff >= 0 && kwDefArgs.empty()
-                        && fun_code.type() == ASTNode::NODE_OBJECT) {
-                    auto it = sigTupleNopOffs.find(constDefTupleOff);
-                    int K = (it != sigTupleNopOffs.end()) ? (int)it->second.size() : 0;
-                    /* Accept the run of NOPs immediately before the defaults tuple as
-                       multi-line signature anchors (one per source line carrying a
-                       constant default) when there are at most as many as there are
-                       defaults and EVERY NOP lies on the signature (line >= the
-                       function's first line): a stripped statement before the `def`
-                       also leaves a preceding NOP, but on an earlier line, and must
-                       not trigger multi-line rendering. K == #defaults is the
-                       one-per-line case; K < #defaults is a soft-wrapped signature
-                       (some lines carry several defaults) reproduced by distributing
-                       the defaults across K lines. */
-                    if (K > 0 && K <= (int)defArgs.size()) {
-                        int dl = fun_code.cast<ASTObject>()->object()
-                                     .cast<PycCode>()->firstLine();
-                        bool allInSig = true;
-                        for (int noff : it->second)
-                            if (code->lineForOffset(noff) < dl) { allInSig = false; break; }
-                        if (allInSig) {
-                            fn.cast<ASTFunction>()->setSigNopAnchors(K);
-                            for (int noff : it->second)
-                                g_sigAnchorNopOffs.insert(noff);
-                        }
-                    }
-                }
-                stack.push(fn);
-            }
+            handleMakeFunction(operand);
             break;
         case Pyc::NOP:
             break;
@@ -15575,6 +15428,168 @@ void CodeBuilder::handleCall(int opcode, int operand)
             }
             break;
     }
+}
+
+/* MAKE_FUNCTION / MAKE_CLOSURE build an ASTFunction from the code object on the
+ * stack. From 3.6 the operand's low bits say which extras precede it (closure
+ * cells 0x08, annotations 0x04, keyword-only defaults 0x02, positional defaults
+ * 0x01); older versions carry the default/kw-default counts in the operand.
+ * Annotations are flattened (tuple or const-map) onto the function. When the
+ * positional defaults are a constant tuple preceded by a run of K anchor NOPs
+ * (and there are no kw-defaults), the signature spanned K source lines, so K is
+ * recorded (setSigNopAnchors) and those NOP offsets are marked, provided every
+ * NOP lies on the signature (not a stripped statement before the def). */
+void CodeBuilder::handleMakeFunction(int operand)
+{
+    PycRef<ASTNode> fun_code = stack.top();
+    stack.pop();
+
+    /* Test for the qualified name of the function (at TOS) */
+    int tos_type = fun_code.cast<ASTObject>()->object().type();
+    if (tos_type != PycObject::TYPE_CODE &&
+        tos_type != PycObject::TYPE_CODE2) {
+        fun_code = stack.top();
+        stack.pop();
+    }
+
+    ASTFunction::defarg_t defArgs, kwDefArgs;
+    ASTFunction::annot_t funcAnnots;
+    int constDefTupleOff = -1;
+    if (mod->verCompare(3, 6) >= 0) {
+        if (operand & 0x08)
+            stack.pop();
+        if (operand & 0x04) {
+            PycRef<ASTNode> ann = stack.top();
+            stack.pop();
+            std::vector<PycRef<ASTNode>> flat;
+            if (ann != nullptr && ann.type() == ASTNode::NODE_TUPLE) {
+                for (const auto& v : ann.cast<ASTTuple>()->values())
+                    flat.push_back(v);
+            } else if (ann != nullptr && ann.type() == ASTNode::NODE_OBJECT
+                       && (ann.cast<ASTObject>()->object()->type() == PycObject::TYPE_TUPLE
+                           || ann.cast<ASTObject>()->object()->type() == PycObject::TYPE_SMALL_TUPLE)) {
+                for (const auto& v : ann.cast<ASTObject>()->object()
+                                        .cast<PycTuple>()->values())
+                    flat.push_back(new ASTObject(v));
+            }
+            for (size_t k = 0; k + 1 < flat.size(); k += 2) {
+                PycRef<ASTNode> key = flat[k];
+                if (key != nullptr && key.type() == ASTNode::NODE_OBJECT) {
+                    PycRef<PycObject> ko = key.cast<ASTObject>()->object();
+                    if (ko->type() == PycObject::TYPE_STRING
+                            || ko->type() == PycObject::TYPE_UNICODE
+                            || ko->type() == PycObject::TYPE_INTERNED
+                            || ko->type() == PycObject::TYPE_ASCII
+                            || ko->type() == PycObject::TYPE_ASCII_INTERNED
+                            || ko->type() == PycObject::TYPE_SHORT_ASCII
+                            || ko->type() == PycObject::TYPE_SHORT_ASCII_INTERNED) {
+                        PycRef<ASTNode> aval = flat[k + 1];
+                        if (aval == nullptr)
+                            aval = new ASTObject(Pyc_None);
+                        funcAnnots.push_back({ ko.cast<PycString>()->value(), aval });
+                    }
+                }
+            }
+            if (ann != nullptr && ann.type() == ASTNode::NODE_CONST_MAP) {
+                const auto& mv = ann.cast<ASTConstMap>();
+                PycTuple::value_t keys = mv->keys().cast<ASTObject>()
+                        ->object().cast<PycTuple>()->values();
+                ASTConstMap::values_t vals = mv->values();
+                size_t vi = 0;
+                for (const auto& key : keys) {
+                    if (vi < vals.size() && key->type() == PycObject::TYPE_STRING)
+                        funcAnnots.push_back({ key.cast<PycString>()->value(),
+                                               vals[vi] });
+                    ++vi;
+                }
+            }
+        }
+        if (operand & 0x02) {
+            PycRef<ASTNode> kwd = stack.top();
+            stack.pop();
+            if (kwd != nullptr && kwd.type() == ASTNode::NODE_CONST_MAP) {
+                const auto& vals = kwd.cast<ASTConstMap>()->values();
+                for (auto it = vals.rbegin(); it != vals.rend(); ++it)
+                    kwDefArgs.push_back(*it);
+            } else if (kwd != nullptr && kwd.type() == ASTNode::NODE_MAP) {
+                for (const auto& kv : kwd.cast<ASTMap>()->values())
+                    kwDefArgs.push_back(kv.second);
+            } else if (kwd != nullptr && kwd.type() == ASTNode::NODE_OBJECT
+                       && kwd.cast<ASTObject>()->object()->type() == PycObject::TYPE_DICT) {
+                for (const auto& kv : kwd.cast<ASTObject>()->object()
+                                         .cast<PycDict>()->values())
+                    kwDefArgs.push_back(new ASTObject(std::get<1>(kv)));
+            } else if (kwd != nullptr) {
+                kwDefArgs.push_back(kwd);
+            }
+        }
+        if (operand & 0x01) {
+            PycRef<ASTNode> defs = stack.top();
+            stack.pop();
+            if (defs != nullptr && defs.type() == ASTNode::NODE_TUPLE) {
+                for (const auto& v : defs.cast<ASTTuple>()->values())
+                    defArgs.push_back(v);
+            } else if (defs != nullptr && defs.type() == ASTNode::NODE_OBJECT
+                       && (defs.cast<ASTObject>()->object()->type() == PycObject::TYPE_TUPLE
+                           || defs.cast<ASTObject>()->object()->type() == PycObject::TYPE_SMALL_TUPLE)) {
+                for (const auto& v : defs.cast<ASTObject>()->object()
+                                         .cast<PycTuple>()->values())
+                    defArgs.push_back(new ASTObject(v));
+                constDefTupleOff = defs->srcOff();
+            } else if (defs != nullptr) {
+                defArgs.push_back(defs);
+            }
+        }
+    } else {
+        const int defCount = operand & 0xFF;
+        const int kwDefCount = (operand >> 8) & 0xFF;
+        for (int i = 0; i < defCount; ++i) {
+            defArgs.push_front(stack.top());
+            stack.pop();
+        }
+        for (int i = 0; i < kwDefCount; ++i) {
+            kwDefArgs.push_front(stack.top());
+            stack.pop();
+        }
+    }
+    PycRef<ASTNode> fn = new ASTFunction(fun_code, defArgs, kwDefArgs);
+    if (!funcAnnots.empty())
+        fn.cast<ASTFunction>()->setAnnotations(std::move(funcAnnots));
+    /* If the positional defaults came from a const tuple preceded by a
+       run of K anchor NOPs (with no keyword-only defaults), the
+       signature wrapped across K source lines each carrying a constant
+       default: record K so it renders over K lines and the recompile
+       regenerates those K NOPs. Annotations are fine -- they emit real
+       code carrying their own positions and add no anchor NOPs, so the
+       count still depends only on the constant-default lines. */
+    if (constDefTupleOff >= 0 && kwDefArgs.empty()
+            && fun_code.type() == ASTNode::NODE_OBJECT) {
+        auto it = sigTupleNopOffs.find(constDefTupleOff);
+        int K = (it != sigTupleNopOffs.end()) ? (int)it->second.size() : 0;
+        /* Accept the run of NOPs immediately before the defaults tuple as
+           multi-line signature anchors (one per source line carrying a
+           constant default) when there are at most as many as there are
+           defaults and EVERY NOP lies on the signature (line >= the
+           function's first line): a stripped statement before the `def`
+           also leaves a preceding NOP, but on an earlier line, and must
+           not trigger multi-line rendering. K == #defaults is the
+           one-per-line case; K < #defaults is a soft-wrapped signature
+           (some lines carry several defaults) reproduced by distributing
+           the defaults across K lines. */
+        if (K > 0 && K <= (int)defArgs.size()) {
+            int dl = fun_code.cast<ASTObject>()->object()
+                         .cast<PycCode>()->firstLine();
+            bool allInSig = true;
+            for (int noff : it->second)
+                if (code->lineForOffset(noff) < dl) { allInSig = false; break; }
+            if (allInSig) {
+                fn.cast<ASTFunction>()->setSigNopAnchors(K);
+                for (int noff : it->second)
+                    g_sigAnchorNopOffs.insert(noff);
+            }
+        }
+    }
+    stack.push(fn);
 }
 
 /* The backward/absolute jumps -- loop back-edges and the compiler's branch
