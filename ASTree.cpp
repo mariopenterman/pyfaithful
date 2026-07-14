@@ -479,6 +479,7 @@ private:
     void handleLoad(int opcode, int operand);
     void handleDelete(int opcode, int operand);
     void handleStoreSlice(int opcode);
+    void handleSubscript(int opcode);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -10507,13 +10508,7 @@ PycRef<ASTNode> CodeBuilder::build()
             handleBinaryOp(opcode, operand);
             break;
         case Pyc::BINARY_SUBSCR:
-            {
-                PycRef<ASTNode> subscr = stack.top();
-                stack.pop();
-                PycRef<ASTNode> src = stack.top();
-                stack.pop();
-                stack.push(new ASTSubscr(src, subscr));
-            }
+            handleSubscript(opcode);
             break;
         case Pyc::BREAK_LOOP:
             curblock->append(new ASTKeyword(ASTKeyword::KW_BREAK));
@@ -14988,48 +14983,10 @@ PycRef<ASTNode> CodeBuilder::build()
             }
             break;
         case Pyc::SLICE_0:
-            {
-                PycRef<ASTNode> name = stack.top();
-                stack.pop();
-
-                PycRef<ASTNode> slice = new ASTSlice(ASTSlice::SLICE0);
-                stack.push(new ASTSubscr(name, slice));
-            }
-            break;
         case Pyc::SLICE_1:
-            {
-                PycRef<ASTNode> lower = stack.top();
-                stack.pop();
-                PycRef<ASTNode> name = stack.top();
-                stack.pop();
-
-                PycRef<ASTNode> slice = new ASTSlice(ASTSlice::SLICE1, lower);
-                stack.push(new ASTSubscr(name, slice));
-            }
-            break;
         case Pyc::SLICE_2:
-            {
-                PycRef<ASTNode> upper = stack.top();
-                stack.pop();
-                PycRef<ASTNode> name = stack.top();
-                stack.pop();
-
-                PycRef<ASTNode> slice = new ASTSlice(ASTSlice::SLICE2, NULL, upper);
-                stack.push(new ASTSubscr(name, slice));
-            }
-            break;
         case Pyc::SLICE_3:
-            {
-                PycRef<ASTNode> upper = stack.top();
-                stack.pop();
-                PycRef<ASTNode> lower = stack.top();
-                stack.pop();
-                PycRef<ASTNode> name = stack.top();
-                stack.pop();
-
-                PycRef<ASTNode> slice = new ASTSlice(ASTSlice::SLICE3, lower, upper);
-                stack.push(new ASTSubscr(name, slice));
-            }
+            handleSubscript(opcode);
             break;
         case Pyc::STORE_ATTR_A:
             {
@@ -15823,36 +15780,7 @@ PycRef<ASTNode> CodeBuilder::build()
             }
             break;
         case Pyc::BINARY_SLICE:
-            {
-                PycRef<ASTNode> end = stack.top();
-                stack.pop();
-                PycRef<ASTNode> start = stack.top();
-                stack.pop();
-                PycRef<ASTNode> dest = stack.top();
-                stack.pop();
-
-                if (start.type() == ASTNode::NODE_OBJECT
-                        && start.cast<ASTObject>()->object() == Pyc_None) {
-                    start = NULL;
-                }
-
-                if (end.type() == ASTNode::NODE_OBJECT
-                        && end.cast<ASTObject>()->object() == Pyc_None) {
-                    end = NULL;
-                }
-
-                PycRef<ASTNode> slice;
-                if (start == NULL && end == NULL) {
-                    slice = new ASTSlice(ASTSlice::SLICE0);
-                } else if (start == NULL) {
-                    slice = new ASTSlice(ASTSlice::SLICE2, start, end);
-                } else if (end == NULL) {
-                    slice = new ASTSlice(ASTSlice::SLICE1, start, end);
-                } else {
-                    slice = new ASTSlice(ASTSlice::SLICE3, start, end);
-                }
-                stack.push(new ASTSubscr(dest, slice));
-            }
+            handleSubscript(opcode);
             break;
         case Pyc::STORE_SLICE:
             {
@@ -16494,6 +16422,105 @@ void CodeBuilder::handleStoreSlice(int opcode)
             stack.pop();
 
             curblock->append(new ASTStore(value, new ASTSubscr(dest, new ASTSlice(ASTSlice::SLICE3, upper, lower))));
+        }
+        break;
+    }
+}
+
+/* Subscript reads: pop the index/bounds and the container and push an
+ * ASTSubscr (`obj[...]`).
+ *   BINARY_SUBSCR         -> obj[key].
+ *   BINARY_SLICE (3.12)   -> obj[start:end]; a None bound is dropped so the
+ *                            slice renders with that field omitted.
+ *   SLICE_0..3 (Python 2) -> the old dedicated forms obj[:], obj[lo:],
+ *                            obj[:hi], obj[lo:hi] rebuilt as a subscript of the
+ *                            matching ASTSlice. */
+void CodeBuilder::handleSubscript(int opcode)
+{
+    switch (opcode) {
+    case Pyc::BINARY_SUBSCR:
+        {
+            PycRef<ASTNode> subscr = stack.top();
+            stack.pop();
+            PycRef<ASTNode> src = stack.top();
+            stack.pop();
+            stack.push(new ASTSubscr(src, subscr));
+        }
+        break;
+    case Pyc::SLICE_0:
+        {
+            PycRef<ASTNode> name = stack.top();
+            stack.pop();
+
+            PycRef<ASTNode> slice = new ASTSlice(ASTSlice::SLICE0);
+            stack.push(new ASTSubscr(name, slice));
+        }
+        break;
+    case Pyc::SLICE_1:
+        {
+            PycRef<ASTNode> lower = stack.top();
+            stack.pop();
+            PycRef<ASTNode> name = stack.top();
+            stack.pop();
+
+            PycRef<ASTNode> slice = new ASTSlice(ASTSlice::SLICE1, lower);
+            stack.push(new ASTSubscr(name, slice));
+        }
+        break;
+    case Pyc::SLICE_2:
+        {
+            PycRef<ASTNode> upper = stack.top();
+            stack.pop();
+            PycRef<ASTNode> name = stack.top();
+            stack.pop();
+
+            PycRef<ASTNode> slice = new ASTSlice(ASTSlice::SLICE2, NULL, upper);
+            stack.push(new ASTSubscr(name, slice));
+        }
+        break;
+    case Pyc::SLICE_3:
+        {
+            PycRef<ASTNode> upper = stack.top();
+            stack.pop();
+            PycRef<ASTNode> lower = stack.top();
+            stack.pop();
+            PycRef<ASTNode> name = stack.top();
+            stack.pop();
+
+            PycRef<ASTNode> slice = new ASTSlice(ASTSlice::SLICE3, lower, upper);
+            stack.push(new ASTSubscr(name, slice));
+        }
+        break;
+    case Pyc::BINARY_SLICE:
+        {
+            PycRef<ASTNode> end = stack.top();
+            stack.pop();
+            PycRef<ASTNode> start = stack.top();
+            stack.pop();
+            PycRef<ASTNode> dest = stack.top();
+            stack.pop();
+
+            if (start.type() == ASTNode::NODE_OBJECT
+                    && start.cast<ASTObject>()->object() == Pyc_None) {
+                start = NULL;
+            }
+
+            if (end.type() == ASTNode::NODE_OBJECT
+                    && end.cast<ASTObject>()->object() == Pyc_None) {
+                end = NULL;
+            }
+
+            PycRef<ASTNode> slice;
+            if (start == NULL && end == NULL) {
+                slice = new ASTSlice(ASTSlice::SLICE0);
+            } else if (start == NULL) {
+                slice = new ASTSlice(ASTSlice::SLICE2, start, end);
+            } else if (end == NULL) {
+                slice = new ASTSlice(ASTSlice::SLICE1, start, end);
+            } else {
+                slice = new ASTSlice(ASTSlice::SLICE3, start, end);
+            }
+            stack.push(new ASTSubscr(dest, slice));
         }
         break;
     }
