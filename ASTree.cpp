@@ -604,6 +604,10 @@ private:
     /* Maps a const-tuple LOAD offset to the anchor NOP offsets before it, so
        MAKE_FUNCTION can recover a multi-line signature's defaults layout. */
     std::unordered_map<int, std::vector<int> > sigTupleNopOffs;
+    /* Chained-assignment COPY offsets (a = b = ...; from the prescan) and the
+       SWAP offsets that begin a chained comparison (`a < b < c`). */
+    std::unordered_set<int> chainCopyOffsets;
+    std::unordered_set<int> chainIfSwap;
     /* Loop/branch prescan sets and maps consulted by the JUMP handlers to
        reconstruct for/while bodies, else clauses, breaks, and continues. */
     std::set<int> forBreakBeyondExit;
@@ -937,7 +941,7 @@ PycRef<ASTNode> CodeBuilder::build()
         }
     }
 
-    std::unordered_set<int> chainCopyOffsets = scanChainAssignCopies(code, mod);
+    chainCopyOffsets = scanChainAssignCopies(code, mod);
 
     {
         PycBuffer ws(code->code()->value(), code->code()->length());
@@ -5318,7 +5322,6 @@ PycRef<ASTNode> CodeBuilder::build()
         }
     }
 
-    std::unordered_set<int> chainIfSwap;
     std::unordered_set<int> chainIfGlue;
     /* Offsets of the dup-cleanup POP_TOP a chained comparison emits at each link's
        false-landing (`SWAP;COPY;COMPARE;IF_FALSE->Lc; …; Lc: POP_TOP`). It discards
