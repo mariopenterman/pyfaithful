@@ -505,6 +505,7 @@ private:
     void handleReraise();
     void handleSetupBlock(int opcode, int operand);
     void handleForIter(int opcode, int operand);
+    bool handleSend();
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -11133,48 +11134,8 @@ PycRef<ASTNode> CodeBuilder::build()
             handleExprWrap(opcode, operand);
             break;
         case Pyc::SEND_A:
-            {
-                PycRef<ASTNode> below = stack.top(2);
-                int target = pos + operand * sizeof(uint16_t);
-                bool validTarget = (target > pos
-                        && target <= (int)code->code()->length());
-                if (validTarget && below != nullptr
-                        && below.type() == ASTNode::NODE_AWAITABLE) {
-                    stack.pop();
-                    source.setPos(target);
-                    pos = target;
-                    break;
-                }
-                int targetOp = -1;
-                if (validTarget) {
-                    PycBuffer peek(code->code()->value(), code->code()->length());
-                    peek.setPos(target);
-                    int po, pa, pp = target;
-                    if (!peek.atEof()) { bc_next(peek, mod, po, pa, pp); targetOp = po; }
-                }
-                if (validTarget && below != nullptr && targetOp == Pyc::POP_TOP) {
-                    stack.pop();
-                    PycRef<ASTNode> value = stack.top();
-                    value->setProcessed();
-                    curblock->append(new ASTReturn(value, ASTReturn::YIELD_FROM));
-                    source.setPos(target);
-                    pos = target;
-                    break;
-                }
-                if (validTarget && below != nullptr) {
-                    stack.pop();
-                    PycRef<ASTNode> iter = stack.top();
-                    stack.pop();
-                    stack.push(new ASTReturn(iter, ASTReturn::YIELD_FROM_EXPR));
-                    source.setPos(target);
-                    pos = target;
-                    break;
-                }
-                fprintf(stderr, "Unsupported opcode: %s (%d)\n",
-                        Pyc::OpcodeName(opcode), opcode);
-                cleanBuild = false;
+            if (!handleSend())
                 return new ASTNodeList(defblock->nodes());
-            }
             break;
         case Pyc::GET_ITER:
         case Pyc::GET_YIELD_FROM_ITER:
@@ -15768,6 +15729,56 @@ void CodeBuilder::handleForIter(int opcode, int operand)
         compFilterFwd = false;
 
     stack.push(NULL);
+}
+
+/* SEND drives a generator/await sub-iterator (`yield from` / `await`). The
+ * operand is the offset resumed when the sub-iterator is exhausted. When the
+ * value below TOS is the awaitable/iterator being driven, this emits the
+ * yield-from as a statement (its result is POP_TOP'd at the target) or as an
+ * expression, then jumps past the send loop to the target. Returns false (bail)
+ * for an unrecognised SEND shape. */
+bool CodeBuilder::handleSend()
+{
+    PycRef<ASTNode> below = stack.top(2);
+    int target = pos + operand * sizeof(uint16_t);
+    bool validTarget = (target > pos
+            && target <= (int)code->code()->length());
+    if (validTarget && below != nullptr
+            && below.type() == ASTNode::NODE_AWAITABLE) {
+        stack.pop();
+        source.setPos(target);
+        pos = target;
+        return true;
+    }
+    int targetOp = -1;
+    if (validTarget) {
+        PycBuffer peek(code->code()->value(), code->code()->length());
+        peek.setPos(target);
+        int po, pa, pp = target;
+        if (!peek.atEof()) { bc_next(peek, mod, po, pa, pp); targetOp = po; }
+    }
+    if (validTarget && below != nullptr && targetOp == Pyc::POP_TOP) {
+        stack.pop();
+        PycRef<ASTNode> value = stack.top();
+        value->setProcessed();
+        curblock->append(new ASTReturn(value, ASTReturn::YIELD_FROM));
+        source.setPos(target);
+        pos = target;
+        return true;
+    }
+    if (validTarget && below != nullptr) {
+        stack.pop();
+        PycRef<ASTNode> iter = stack.top();
+        stack.pop();
+        stack.push(new ASTReturn(iter, ASTReturn::YIELD_FROM_EXPR));
+        source.setPos(target);
+        pos = target;
+        return true;
+    }
+    fprintf(stderr, "Unsupported opcode: %s (%d)\n",
+            Pyc::OpcodeName(opcode), opcode);
+    cleanBuild = false;
+    return false;
 }
 
 /* The UNARY_* opcodes each pop one operand and push one result node.
