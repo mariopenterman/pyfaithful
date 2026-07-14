@@ -482,6 +482,7 @@ private:
     void handleSubscript(int opcode);
     void handleStackManip(int opcode, int operand);
     void handleCollectionUpdate(int opcode);
+    void handlePrint(int opcode);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -14121,62 +14122,10 @@ PycRef<ASTNode> CodeBuilder::build()
             }
             break;
         case Pyc::PRINT_ITEM:
-            {
-                PycRef<ASTPrint> printNode;
-                if (curblock->size() > 0 && curblock->nodes().back().type() == ASTNode::NODE_PRINT)
-                    printNode = curblock->nodes().back().try_cast<ASTPrint>();
-                if (printNode && printNode->stream() == nullptr && !printNode->eol())
-                    printNode->add(stack.top());
-                else
-                    curblock->append(new ASTPrint(stack.top()));
-                stack.pop();
-            }
-            break;
         case Pyc::PRINT_ITEM_TO:
-            {
-                PycRef<ASTNode> stream = stack.top();
-                stack.pop();
-
-                PycRef<ASTPrint> printNode;
-                if (curblock->size() > 0 && curblock->nodes().back().type() == ASTNode::NODE_PRINT)
-                    printNode = curblock->nodes().back().try_cast<ASTPrint>();
-                if (printNode && printNode->stream() == stream && !printNode->eol())
-                    printNode->add(stack.top());
-                else
-                    curblock->append(new ASTPrint(stack.top(), stream));
-                stack.pop();
-                if (stream)
-                    stream->setProcessed();
-            }
-            break;
         case Pyc::PRINT_NEWLINE:
-            {
-                PycRef<ASTPrint> printNode;
-                if (curblock->size() > 0 && curblock->nodes().back().type() == ASTNode::NODE_PRINT)
-                    printNode = curblock->nodes().back().try_cast<ASTPrint>();
-                if (printNode && printNode->stream() == nullptr && !printNode->eol())
-                    printNode->setEol(true);
-                else
-                    curblock->append(new ASTPrint(nullptr));
-                stack.pop();
-            }
-            break;
         case Pyc::PRINT_NEWLINE_TO:
-            {
-                PycRef<ASTNode> stream = stack.top();
-                stack.pop();
-
-                PycRef<ASTPrint> printNode;
-                if (curblock->size() > 0 && curblock->nodes().back().type() == ASTNode::NODE_PRINT)
-                    printNode = curblock->nodes().back().try_cast<ASTPrint>();
-                if (printNode && printNode->stream() == stream && !printNode->eol())
-                    printNode->setEol(true);
-                else
-                    curblock->append(new ASTPrint(nullptr, stream));
-                stack.pop();
-                if (stream)
-                    stream->setProcessed();
-            }
+            handlePrint(opcode);
             break;
         case Pyc::RAISE_VARARGS_A:
             {
@@ -16581,6 +16530,76 @@ void CodeBuilder::handleCollectionUpdate(int opcode)
             stack.pop();
             ASTTuple::value_t tv(lv.begin(), lv.end());
             stack.push(new ASTTuple(tv));
+        }
+        break;
+    }
+}
+
+/* The Python 2 `print` statement opcodes. The compiler emits one PRINT_ITEM per
+ * argument and a trailing PRINT_NEWLINE; the *_TO variants take an explicit
+ * stream (`print >> f, ...`). Consecutive items on the same statement are
+ * merged into a single ASTPrint (matching stream, not yet terminated by a
+ * newline); PRINT_NEWLINE marks that node's end of line, or emits a bare
+ * `print` when none is open. */
+void CodeBuilder::handlePrint(int opcode)
+{
+    switch (opcode) {
+    case Pyc::PRINT_ITEM:
+        {
+            PycRef<ASTPrint> printNode;
+            if (curblock->size() > 0 && curblock->nodes().back().type() == ASTNode::NODE_PRINT)
+                printNode = curblock->nodes().back().try_cast<ASTPrint>();
+            if (printNode && printNode->stream() == nullptr && !printNode->eol())
+                printNode->add(stack.top());
+            else
+                curblock->append(new ASTPrint(stack.top()));
+            stack.pop();
+        }
+        break;
+    case Pyc::PRINT_ITEM_TO:
+        {
+            PycRef<ASTNode> stream = stack.top();
+            stack.pop();
+
+            PycRef<ASTPrint> printNode;
+            if (curblock->size() > 0 && curblock->nodes().back().type() == ASTNode::NODE_PRINT)
+                printNode = curblock->nodes().back().try_cast<ASTPrint>();
+            if (printNode && printNode->stream() == stream && !printNode->eol())
+                printNode->add(stack.top());
+            else
+                curblock->append(new ASTPrint(stack.top(), stream));
+            stack.pop();
+            if (stream)
+                stream->setProcessed();
+        }
+        break;
+    case Pyc::PRINT_NEWLINE:
+        {
+            PycRef<ASTPrint> printNode;
+            if (curblock->size() > 0 && curblock->nodes().back().type() == ASTNode::NODE_PRINT)
+                printNode = curblock->nodes().back().try_cast<ASTPrint>();
+            if (printNode && printNode->stream() == nullptr && !printNode->eol())
+                printNode->setEol(true);
+            else
+                curblock->append(new ASTPrint(nullptr));
+            stack.pop();
+        }
+        break;
+    case Pyc::PRINT_NEWLINE_TO:
+        {
+            PycRef<ASTNode> stream = stack.top();
+            stack.pop();
+
+            PycRef<ASTPrint> printNode;
+            if (curblock->size() > 0 && curblock->nodes().back().type() == ASTNode::NODE_PRINT)
+                printNode = curblock->nodes().back().try_cast<ASTPrint>();
+            if (printNode && printNode->stream() == stream && !printNode->eol())
+                printNode->setEol(true);
+            else
+                curblock->append(new ASTPrint(nullptr, stream));
+            stack.pop();
+            if (stream)
+                stream->setProcessed();
         }
         break;
     }
