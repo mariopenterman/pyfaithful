@@ -451,7 +451,34 @@ static PycRef<ASTNode> recoverFoldedAndOperand(PycRef<ASTNode> left, bool isOr,
  * single emitted byte. See ASTree_priv.h for the split between this builder,
  * the renderer (ASTRender.cpp), and the faithfulness passes (ASTFaithful.cpp).
  * ========================================================================== */
+/* ---------------------------------------------------------------------------
+ * CodeBuilder owns the Phase-1 reconstruction of a SINGLE code object. Today it
+ * holds only the code object and its module and runs the entire pass in build();
+ * the ~150 pieces of pass state (the two stacks, curblock, and the offset-keyed
+ * bookkeeping maps) currently live as locals inside build(). They will migrate
+ * onto this class member-by-member as cohesive opcode groups are lifted out of
+ * the switch into documented handler methods -- because unqualified name lookup
+ * and `[&]` capture inside a member function both resolve to members, promoting
+ * a local to a member is a no-op at its use-sites and inside the lambdas.
+ * BuildFromCode() stays the public entry point (one CodeBuilder per code object,
+ * so recursion into nested code objects just constructs another builder).
+ * ------------------------------------------------------------------------- */
+class CodeBuilder {
+public:
+    CodeBuilder(PycRef<PycCode> code, PycModule* mod) : code(code), mod(mod) {}
+    PycRef<ASTNode> build();
+
+private:
+    PycRef<PycCode> code;
+    PycModule* mod;
+};
+
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
+{
+    return CodeBuilder(code, mod).build();
+}
+
+PycRef<ASTNode> CodeBuilder::build()
 {
     PycBuffer source(code->code()->value(), code->code()->length());
 
