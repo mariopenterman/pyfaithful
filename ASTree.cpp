@@ -13493,39 +13493,7 @@ PycRef<ASTNode> CodeBuilder::build()
             handleSubscript(opcode);
             break;
         case Pyc::STORE_SLICE:
-            {
-                PycRef<ASTNode> end = stack.top();
-                stack.pop();
-                PycRef<ASTNode> start = stack.top();
-                stack.pop();
-                PycRef<ASTNode> dest = stack.top();
-                stack.pop();
-                PycRef<ASTNode> values = stack.top();
-                stack.pop();
-
-                if (start.type() == ASTNode::NODE_OBJECT
-                        && start.cast<ASTObject>()->object() == Pyc_None) {
-                    start = NULL;
-                }
-
-                if (end.type() == ASTNode::NODE_OBJECT
-                        && end.cast<ASTObject>()->object() == Pyc_None) {
-                    end = NULL;
-                }
-
-                PycRef<ASTNode> slice;
-                if (start == NULL && end == NULL) {
-                    slice = new ASTSlice(ASTSlice::SLICE0);
-                } else if (start == NULL) {
-                    slice = new ASTSlice(ASTSlice::SLICE2, start, end);
-                } else if (end == NULL) {
-                    slice = new ASTSlice(ASTSlice::SLICE1, start, end);
-                } else {
-                    slice = new ASTSlice(ASTSlice::SLICE3, start, end);
-                }
-
-                curblock->append(new ASTStore(values, new ASTSubscr(dest, slice)));
-            }
+            handleStoreSlice(opcode);
             break;
         case Pyc::COPY_A:
             handleCopy(operand);
@@ -16466,6 +16434,43 @@ void CodeBuilder::handleStoreSlice(int opcode)
             stack.pop();
 
             curblock->append(new ASTStore(value, new ASTSubscr(dest, new ASTSlice(ASTSlice::SLICE3, upper, lower))));
+        }
+        break;
+    case Pyc::STORE_SLICE:
+        {
+            /* Python 3.12: `obj[start:end] = values`. Pops end, start, dest,
+               values; a None bound is dropped so the slice field is omitted. */
+            PycRef<ASTNode> end = stack.top();
+            stack.pop();
+            PycRef<ASTNode> start = stack.top();
+            stack.pop();
+            PycRef<ASTNode> dest = stack.top();
+            stack.pop();
+            PycRef<ASTNode> values = stack.top();
+            stack.pop();
+
+            if (start.type() == ASTNode::NODE_OBJECT
+                    && start.cast<ASTObject>()->object() == Pyc_None) {
+                start = NULL;
+            }
+
+            if (end.type() == ASTNode::NODE_OBJECT
+                    && end.cast<ASTObject>()->object() == Pyc_None) {
+                end = NULL;
+            }
+
+            PycRef<ASTNode> slice;
+            if (start == NULL && end == NULL) {
+                slice = new ASTSlice(ASTSlice::SLICE0);
+            } else if (start == NULL) {
+                slice = new ASTSlice(ASTSlice::SLICE2, start, end);
+            } else if (end == NULL) {
+                slice = new ASTSlice(ASTSlice::SLICE1, start, end);
+            } else {
+                slice = new ASTSlice(ASTSlice::SLICE3, start, end);
+            }
+
+            curblock->append(new ASTStore(values, new ASTSubscr(dest, slice)));
         }
         break;
     }
