@@ -499,6 +499,7 @@ private:
     /* Returns false to signal a bail-out (the caller returns the partial tree). */
     bool handlePopTop();
     void handleReraise();
+    void handleSetupBlock(int opcode, int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -575,6 +576,9 @@ private:
     /* At a RERAISE offset, the resume target of the enclosing try/except so the
        reconstructed handler closes and control continues past it. */
     std::unordered_map<int, int> finExcReraise;
+    /* Set by SETUP_FINALLY and cleared by SETUP_EXCEPT: whether the container
+       block just opened is a bare try/finally (no except clause). */
+    bool need_try = false;
 };
 
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
@@ -611,7 +615,6 @@ PycRef<ASTNode> CodeBuilder::build()
     struct BoolShortCircuit { PycRef<ASTNode> left; bool isOr; int target; int off; };
     std::vector<BoolShortCircuit> boolPending;
     bool else_pop = false;
-    bool need_try = false;
     bool compFilterFwd = false;
     int lastSubstantialOp = Pyc::PYC_INVALID_OPCODE;
     std::unordered_map<int,int> dupHandlerEnd;
@@ -14425,38 +14428,9 @@ PycRef<ASTNode> CodeBuilder::build()
             /* Ignore this */
             break;
         case Pyc::SETUP_EXCEPT_A:
-            {
-                if (curblock->blktype() == ASTBlock::BLK_CONTAINER) {
-                    curblock.cast<ASTContainerBlock>()->setExcept(pos+operand);
-                } else {
-                    PycRef<ASTBlock> next = new ASTContainerBlock(0, pos+operand);
-                    blocks.push(next.cast<ASTBlock>());
-                }
-
-                /* Store the current stack for the except/finally statement(s) */
-                stack_hist.push(stack);
-                PycRef<ASTBlock> tryblock = new ASTBlock(ASTBlock::BLK_TRY, pos+operand, true);
-                blocks.push(tryblock.cast<ASTBlock>());
-                curblock = blocks.top();
-
-                need_try = false;
-            }
-            break;
         case Pyc::SETUP_FINALLY_A:
-            {
-                PycRef<ASTBlock> next = new ASTContainerBlock(pos+operand);
-                blocks.push(next.cast<ASTBlock>());
-                curblock = blocks.top();
-
-                need_try = true;
-            }
-            break;
         case Pyc::SETUP_LOOP_A:
-            {
-                PycRef<ASTBlock> next = new ASTCondBlock(ASTBlock::BLK_WHILE, pos+operand, NULL, false);
-                blocks.push(next.cast<ASTBlock>());
-                curblock = blocks.top();
-            }
+            handleSetupBlock(opcode, operand);
             break;
         case Pyc::SLICE_0:
         case Pyc::SLICE_1:
@@ -15726,6 +15700,52 @@ void CodeBuilder::handleReraise()
                 next_exception_entry++;
             return;
         }
+    }
+}
+
+/* The pre-3.11 explicit block-setup opcodes, which open a block covering the
+ * range up to pos+operand:
+ *   SETUP_EXCEPT   -> a try/except: reuse or open the container, save the stack,
+ *       and push the BLK_TRY body (need_try cleared: it has an except clause).
+ *   SETUP_FINALLY  -> a try/finally: push a bare container and set need_try.
+ *   SETUP_LOOP     -> a `while` loop: push the BLK_WHILE block. */
+void CodeBuilder::handleSetupBlock(int opcode, int operand)
+{
+    switch (opcode) {
+    case Pyc::SETUP_EXCEPT_A:
+        {
+            if (curblock->blktype() == ASTBlock::BLK_CONTAINER) {
+                curblock.cast<ASTContainerBlock>()->setExcept(pos+operand);
+            } else {
+                PycRef<ASTBlock> next = new ASTContainerBlock(0, pos+operand);
+                blocks.push(next.cast<ASTBlock>());
+            }
+
+            /* Store the current stack for the except/finally statement(s) */
+            stack_hist.push(stack);
+            PycRef<ASTBlock> tryblock = new ASTBlock(ASTBlock::BLK_TRY, pos+operand, true);
+            blocks.push(tryblock.cast<ASTBlock>());
+            curblock = blocks.top();
+
+            need_try = false;
+        }
+        break;
+    case Pyc::SETUP_FINALLY_A:
+        {
+            PycRef<ASTBlock> next = new ASTContainerBlock(pos+operand);
+            blocks.push(next.cast<ASTBlock>());
+            curblock = blocks.top();
+
+            need_try = true;
+        }
+        break;
+    case Pyc::SETUP_LOOP_A:
+        {
+            PycRef<ASTBlock> next = new ASTCondBlock(ASTBlock::BLK_WHILE, pos+operand, NULL, false);
+            blocks.push(next.cast<ASTBlock>());
+            curblock = blocks.top();
+        }
+        break;
     }
 }
 
