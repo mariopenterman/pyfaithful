@@ -504,6 +504,7 @@ private:
     bool handlePopTop();
     void handleReraise();
     void handleSetupBlock(int opcode, int operand);
+    void handleForIter(int opcode, int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -11091,90 +11092,8 @@ PycRef<ASTNode> CodeBuilder::build()
             break;
         case Pyc::FOR_ITER_A:
         case Pyc::INSTRUMENTED_FOR_ITER_A:
-            {
-                PycRef<ASTNode> iter = stack.top(); // Iterable
-                if (mod->verCompare(3, 12) < 0) {
-                    // Do not pop the iterator for py 3.12+
-                    stack.pop();
-                }
-                /* Pop it? Don't pop it? */
-
-                int end;
-                bool comprehension = false;
-
-                // before 3.8, there is a SETUP_LOOP instruction with block start and end position,
-                //    the operand is usually a jump to a POP_BLOCK instruction
-                // after 3.8, block extent has to be inferred implicitly; the operand is a jump to a position after the for block
-                if (mod->majorVer() == 3 && mod->minorVer() >= 8) {
-                    end = operand;
-                    if (mod->verCompare(3, 10) >= 0)
-                        end *= sizeof(uint16_t); // // BPO-27129
-                    end += pos;
-                    const char* cn = code->name()->value();
-                    comprehension = strcmp(cn, "<listcomp>") == 0
-                            || strcmp(cn, "<setcomp>") == 0
-                            || strcmp(cn, "<dictcomp>") == 0
-                            || strcmp(cn, "<genexpr>") == 0;
-                } else {
-                    PycRef<ASTBlock> top = blocks.top();
-                    end = top->end(); // block end position from SETUP_LOOP
-                    if (top->blktype() == ASTBlock::BLK_WHILE) {
-                        blocks.pop();
-                    } else {
-                        comprehension = true;
-                    }
-                }
-
-                if (!comprehension && !blocks.empty()
-                        && blocks.top()->end() > 0 && end > blocks.top()->end()) {
-                    int lastBE = -1;
-                    for (const auto& lr : loopRanges)
-                        if (lr.start == curpos && lr.end > lastBE) lastBE = lr.end;
-                    if (lastBE > curpos && lastBE < end) {
-                        PycBuffer bb(code->code()->value(), code->code()->length());
-                        bb.setPos(lastBE);
-                        int bo, ba, bp = lastBE;
-                        if (!bb.atEof()) { bc_next(bb, mod, bo, ba, bp);
-                            if (bp > lastBE && bp < end) forEarlyClose[curpos] = bp; }
-                    }
-                }
-
-                PycRef<ASTIterBlock> forblk = new ASTIterBlock(ASTBlock::BLK_FOR, curpos, end, iter);
-                forblk->setComprehension(comprehension);
-                blocks.push(forblk.cast<ASTBlock>());
-                curblock = blocks.top();
-                if (comprehension)
-                    compFilterFwd = false;
-
-                stack.push(NULL);
-            }
-            break;
         case Pyc::FOR_LOOP_A:
-            {
-                PycRef<ASTNode> curidx = stack.top(); // Current index
-                stack.pop();
-                PycRef<ASTNode> iter = stack.top(); // Iterable
-                stack.pop();
-
-                bool comprehension = false;
-                PycRef<ASTBlock> top = blocks.top();
-                if (top->blktype() == ASTBlock::BLK_WHILE) {
-                    blocks.pop();
-                } else {
-                    comprehension = true;
-                }
-                PycRef<ASTIterBlock> forblk = new ASTIterBlock(ASTBlock::BLK_FOR, curpos, top->end(), iter);
-                forblk->setComprehension(comprehension);
-                blocks.push(forblk.cast<ASTBlock>());
-                curblock = blocks.top();
-
-                /* Python Docs say:
-                      "push the sequence, the incremented counter,
-                       and the current item onto the stack." */
-                stack.push(iter);
-                stack.push(curidx);
-                stack.push(NULL); // We can totally hack this >_>
-            }
+            handleForIter(opcode, operand);
             break;
         case Pyc::GET_AITER:
             {
@@ -15755,6 +15674,100 @@ void CodeBuilder::handleSetupBlock(int opcode, int operand)
         }
         break;
     }
+}
+
+/* Enter a `for` loop, pushing a BLK_FOR whose range covers the loop body.
+ * FOR_ITER (3.x): the block end comes from the jump operand (3.8+) or the
+ * enclosing SETUP_LOOP block (pre-3.8); a `<listcomp>`/`<setcomp>`/etc. code
+ * object marks a comprehension. When the recorded end runs past the enclosing
+ * block, the prescan loop ranges are consulted to record an early close. The
+ * iterator is kept on the stack (popped pre-3.12) and a NULL placeholder is
+ * pushed. FOR_LOOP is the Python 1/2 form, which also re-pushes the sequence
+ * and counter the interpreter expects. */
+void CodeBuilder::handleForIter(int opcode, int operand)
+{
+    if (opcode == Pyc::FOR_LOOP_A) {
+        PycRef<ASTNode> curidx = stack.top(); // Current index
+        stack.pop();
+        PycRef<ASTNode> iter = stack.top(); // Iterable
+        stack.pop();
+
+        bool comprehension = false;
+        PycRef<ASTBlock> top = blocks.top();
+        if (top->blktype() == ASTBlock::BLK_WHILE) {
+            blocks.pop();
+        } else {
+            comprehension = true;
+        }
+        PycRef<ASTIterBlock> forblk = new ASTIterBlock(ASTBlock::BLK_FOR, curpos, top->end(), iter);
+        forblk->setComprehension(comprehension);
+        blocks.push(forblk.cast<ASTBlock>());
+        curblock = blocks.top();
+
+        /* Python Docs say:
+              "push the sequence, the incremented counter,
+               and the current item onto the stack." */
+        stack.push(iter);
+        stack.push(curidx);
+        stack.push(NULL); // We can totally hack this >_>
+        return;
+    }
+
+    PycRef<ASTNode> iter = stack.top(); // Iterable
+    if (mod->verCompare(3, 12) < 0) {
+        // Do not pop the iterator for py 3.12+
+        stack.pop();
+    }
+    /* Pop it? Don't pop it? */
+
+    int end;
+    bool comprehension = false;
+
+    // before 3.8, there is a SETUP_LOOP instruction with block start and end position,
+    //    the operand is usually a jump to a POP_BLOCK instruction
+    // after 3.8, block extent has to be inferred implicitly; the operand is a jump to a position after the for block
+    if (mod->majorVer() == 3 && mod->minorVer() >= 8) {
+        end = operand;
+        if (mod->verCompare(3, 10) >= 0)
+            end *= sizeof(uint16_t); // // BPO-27129
+        end += pos;
+        const char* cn = code->name()->value();
+        comprehension = strcmp(cn, "<listcomp>") == 0
+                || strcmp(cn, "<setcomp>") == 0
+                || strcmp(cn, "<dictcomp>") == 0
+                || strcmp(cn, "<genexpr>") == 0;
+    } else {
+        PycRef<ASTBlock> top = blocks.top();
+        end = top->end(); // block end position from SETUP_LOOP
+        if (top->blktype() == ASTBlock::BLK_WHILE) {
+            blocks.pop();
+        } else {
+            comprehension = true;
+        }
+    }
+
+    if (!comprehension && !blocks.empty()
+            && blocks.top()->end() > 0 && end > blocks.top()->end()) {
+        int lastBE = -1;
+        for (const auto& lr : loopRanges)
+            if (lr.start == curpos && lr.end > lastBE) lastBE = lr.end;
+        if (lastBE > curpos && lastBE < end) {
+            PycBuffer bb(code->code()->value(), code->code()->length());
+            bb.setPos(lastBE);
+            int bo, ba, bp = lastBE;
+            if (!bb.atEof()) { bc_next(bb, mod, bo, ba, bp);
+                if (bp > lastBE && bp < end) forEarlyClose[curpos] = bp; }
+        }
+    }
+
+    PycRef<ASTIterBlock> forblk = new ASTIterBlock(ASTBlock::BLK_FOR, curpos, end, iter);
+    forblk->setComprehension(comprehension);
+    blocks.push(forblk.cast<ASTBlock>());
+    curblock = blocks.top();
+    if (comprehension)
+        compFilterFwd = false;
+
+    stack.push(NULL);
 }
 
 /* The UNARY_* opcodes each pop one operand and push one result node.
