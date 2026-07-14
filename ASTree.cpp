@@ -506,6 +506,7 @@ private:
     void handleSetupBlock(int opcode, int operand);
     void handleForIter(int opcode, int operand);
     bool handleSend();
+    void handleJumpAbsolute();
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -601,6 +602,12 @@ private:
     std::unordered_set<int> topTestWhileFallContinue;
     std::unordered_set<int> whileContMerge;
     std::unordered_map<int, int> whileTrueHdr;
+    /* Forward-jump (offset,target) pairs and per-loop-header back-edge counts
+       from the prescan; recoverThisExcept carries a cross-instruction request to
+       recover an except clause that a loop-continue would otherwise strand. */
+    std::vector<std::pair<int,int>> fwdJumps;
+    std::unordered_map<int, int> backedgeCount;
+    bool recoverThisExcept = false;
     /* Prescan-collected [start,end,exit) ranges of every loop, and a map from a
        FOR_ITER offset to an early loop-close offset when the loop body ends
        before the recorded block end. */
@@ -3868,7 +3875,6 @@ PycRef<ASTNode> CodeBuilder::build()
         }
     }
 
-    std::vector<std::pair<int,int>> fwdJumps;
     std::unordered_map<int, int> opEndingBefore;
     {
         PycBuffer scan(code->code()->value(), code->code()->length());
@@ -4399,7 +4405,6 @@ PycRef<ASTNode> CodeBuilder::build()
                 forElseMerge[E] = M;
         }
     }
-    std::unordered_map<int, int> backedgeCount;
     for (const auto& lr : loopRanges)
         backedgeCount[lr.start]++;
     std::unordered_map<int, int> chainedBareExcept;
@@ -4525,7 +4530,6 @@ PycRef<ASTNode> CodeBuilder::build()
         loopCloseAtExit.insert(E);
         forElseBreakLoop.insert(s);
     }
-    bool recoverThisExcept = false;
 
     std::unordered_map<int, int> retPadCanon;
     {
@@ -12431,305 +12435,7 @@ PycRef<ASTNode> CodeBuilder::build()
         // bpo-47120: Replaced JUMP_ABSOLUTE by the relative jump JUMP_BACKWARD.
         case Pyc::JUMP_BACKWARD_A:
         case Pyc::JUMP_BACKWARD_NO_INTERRUPT_A:
-            {
-                int offs = operand;
-                if (mod->verCompare(3, 10) >= 0)
-                    offs *= sizeof(uint16_t);
-                if (opcode == Pyc::JUMP_BACKWARD_A
-                        || opcode == Pyc::JUMP_BACKWARD_NO_INTERRUPT_A)
-                    offs = pos - offs;
-
-                if (offs < pos) {
-                    if (opcode == Pyc::JUMP_BACKWARD_A
-                            && whileTrueHdr.count(offs)
-                            && pos == whileTrueHdr[offs]
-                            && curblock->blktype() == ASTBlock::BLK_WHILE) {
-                        PycRef<ASTBlock> whb = curblock;
-                        if (topTestWhileFallContinue.count(pos))
-                            whb->append(new ASTKeyword(ASTKeyword::KW_CONTINUE));
-                        blocks.pop();
-                        curblock = blocks.top();
-                        curblock->append(whb.cast<ASTNode>());
-                        break;
-                    }
-                    while (curblock->blktype() == ASTBlock::BLK_FOR
-                            && curblock->end() == curpos
-                            && curblock.cast<ASTIterBlock>()->start() != offs
-                            && curblock.cast<ASTIterBlock>()->start() > offs
-                            && blocks.size() > 1) {
-                        PycRef<ASTBlock> innerLoop = curblock;
-                        blocks.pop();
-                        curblock = blocks.top();
-                        curblock->append(innerLoop.cast<ASTNode>());
-                    }
-                    if (curblock->blktype() == ASTBlock::BLK_FOR
-                            || curblock->blktype() == ASTBlock::BLK_ASYNCFOR) {
-                        bool is_jump_to_start = offs == curblock.cast<ASTIterBlock>()->start();
-                        bool should_pop_for_block = curblock.cast<ASTIterBlock>()->isComprehension();
-                        // in v3.8, SETUP_LOOP is deprecated and for blocks aren't terminated by POP_BLOCK, so we add them here
-                        bool should_add_for_block = mod->majorVer() == 3 && mod->minorVer() >= 8 && is_jump_to_start && !curblock.cast<ASTIterBlock>()->isComprehension();
-
-                        if (should_pop_for_block || should_add_for_block) {
-                            PycRef<ASTNode> top = stack.top();
-
-                            if (top.type() == ASTNode::NODE_COMPREHENSION) {
-                                PycRef<ASTComprehension> comp = top.cast<ASTComprehension>();
-
-                                comp->addGenerator(curblock.cast<ASTIterBlock>());
-                            }
-
-                            PycRef<ASTBlock> tmp = curblock;
-                            int forEnd = tmp->end();
-                            bool forTrailCont = false;
-                            if (should_add_for_block) {
-                                int forH = tmp.cast<ASTIterBlock>()->start();
-                                for (const auto& fj : fwdJumps) {
-                                    if (fj.second != curpos) continue;
-                                    int O = fj.first;
-                                    if (O <= forH || O >= curpos) continue;
-                                    bool inNested = false;
-                                    for (const auto& fe : forStartToExit)
-                                        if (fe.first > forH && O >= fe.first
-                                                && O < fe.second) { inNested = true; break; }
-                                    for (const auto& lr : loopRanges)
-                                        if (!inNested && lr.start > forH && O >= lr.start
-                                                && O < lr.end) { inNested = true; break; }
-                                    if (!inNested) { forTrailCont = true; break; }
-                                }
-                            }
-                            if (forTrailCont)
-                                tmp->append(new ASTKeyword(ASTKeyword::KW_CONTINUE));
-                            blocks.pop();
-                            curblock = blocks.top();
-                            if (should_add_for_block) {
-                                curblock->append(tmp.cast<ASTNode>());
-                            }
-                            if (should_add_for_block
-                                    && forElseMerge.count(forEnd)) {
-                                stack_hist.push(stack);
-                                PycRef<ASTBlock> elseblk = new ASTBlock(
-                                        ASTBlock::BLK_ELSE, forElseMerge[forEnd]);
-                                elseblk->init();
-                                loopElseBlocks.insert((ASTBlock *)elseblk);
-                                blocks.push(elseblk);
-                                curblock = blocks.top();
-                            }
-                        }
-                    } else if (curblock->blktype() == ASTBlock::BLK_ELSE) {
-                        bool isContinueBE = false;
-                        for (const auto& lr : loopRanges)
-                            if (lr.start == offs && lr.end > pos) { isContinueBE = true; break; }
-                        {
-                            auto fe = forStartToExit.find(offs);
-                            if (fe == forStartToExit.end()
-                                    || curblock->end() >= fe->second)
-                                isContinueBE = false;
-                        }
-                        if (!isContinueBE && whileTrueHdr.count(offs)
-                                && loopElseBlocks.count((ASTBlock *)curblock)) {
-                            isContinueBE = true;
-                            topTestWhileExit.insert(whileTrueHdr[offs]);
-                            topTestWhileFallBreak.insert(whileTrueHdr[offs]);
-                        }
-                        if (!isContinueBE
-                                && loopElseBlocks.count((ASTBlock *)curblock)
-                                && !forBreakBeyondExit.count(offs)) {
-                            auto fe = forStartToExit.find(offs);
-                            if (fe != forStartToExit.end()
-                                    && curblock->end() < fe->second)
-                                isContinueBE = true;
-                        }
-                        if (!isContinueBE
-                                && forStartToExit.find(offs) == forStartToExit.end()
-                                && !loopElseBlocks.count((ASTBlock *)curblock)) {
-                            for (const auto& lr : loopRanges) {
-                                if (whileTrueHdr.count(lr.start)
-                                        && offs <= lr.start && lr.start - offs <= 4
-                                        && lr.start <= pos && pos < lr.end) {
-                                    isContinueBE = true;
-                                    break;
-                                }
-                            }
-                        }
-                        /* Plain `while <cond>:` (top-test, NOT while-True) else-continue:
-                           the `else:` body ends in `continue` — a JUMP_BACKWARD to the
-                           while header `offs`. whileTrueHdr doesn't cover a conditional
-                           while and the for-scoping cleared isContinueBE (offs is not a
-                           FOR_ITER start), so the continue was dropped (aiohttp/multipart
-                           parse_content_disposition). Fire when `offs` is a loop header
-                           with a LATER back-edge to it (strictly after pos = a live
-                           iteration edge, so a real continue not the loop's sole/closing
-                           edge), and pos is inside that range. */
-                        if (!isContinueBE
-                                && forStartToExit.find(offs) == forStartToExit.end()
-                                && !loopElseBlocks.count((ASTBlock *)curblock)
-                                && !whileTrueHdr.count(offs)) {
-                            bool laterBE = false;
-                            for (const auto& lr : loopRanges)
-                                if (lr.start == offs && lr.end > pos
-                                        && offs <= pos) {
-                                    laterBE = true; break;
-                                }
-                            if (laterBE)
-                                isContinueBE = true;
-                        }
-                        /* Rotated `while cond:` CONTINUE whose loop CLOSES via a
-                           CONDITIONAL bottom re-test (not a later unconditional
-                           back-edge): this `else:` body's JUMP_BACKWARD to the header
-                           `offs` is the loop's ONLY unconditional back-edge (a
-                           `continue`), and the natural fall-off-end re-tests the
-                           condition and jumps back to the BODY (targeting the guard's
-                           fall-through, not the header). The laterBE test above finds
-                           no sibling back-edge to `offs` (the bottom re-test targets
-                           the body, a different offset), so the continue was dropped
-                           — leaving the loop with only its bottom re-test on recompile
-                           (character `an observed function`: outermost of three nested
-                           `while x is None:`). Detect via the recorded
-                           continue-exit (rotWhileContinueExit holds the offset right
-                           after this JUMP_BACKWARD, since the bottom re-test follows). */
-                        if (!isContinueBE
-                                && forStartToExit.find(offs) == forStartToExit.end()
-                                && !loopElseBlocks.count((ASTBlock *)curblock)
-                                && rotWhileContinueExit.count(pos)) {
-                            for (const auto& lr : loopRanges)
-                                if (lr.start == offs && lr.exit == pos) {
-                                    isContinueBE = true; break;
-                                }
-                        }
-                        if (!isContinueBE
-                                && loopElseBlocks.count((ASTBlock *)curblock)
-                                && forElseFinBreak.count(offs)) {
-                            isContinueBE = true;
-                        }
-                        /* Nested for-else search-loop idiom: the inner for-else's
-                           `else:` body is `continue` of the ENCLOSING for, which is
-                           itself an armed for-else+break (forElseBreakLoop) — the
-                           back-edge to `offs` IS the enclosing loop's only edge so its
-                           loopRange end == pos and the for-scoping/SHIP-196 paths
-                           exclude it (the outer DOES break past its exit). The outer
-                           for-else is reconstructed (the nested arming above), so its
-                           inner else-continue must emit. Mirrors the forElseFinBreak
-                           gate just above. */
-                        if (!isContinueBE
-                                && loopElseBlocks.count((ASTBlock *)curblock)
-                                && forElseBreakLoop.count(offs)) {
-                            isContinueBE = true;
-                        }
-                        /* Rotated while-True continue-else: the `else:` arm of a
-                           nested if inside the loop ends in `continue` (a
-                           JUMP_BACKWARD to the while-True header `offs`) whose own
-                           back-edge is the loop's LAST edge (loopRange end == pos),
-                           and the arm merges at a whileContMerge point (the offset
-                           right after this back-edge, with loop-body tail beyond).
-                           The laterBE/for-scoping paths all require lr.end > pos, so
-                           the continue was dropped as dead.  Fire when offs is a
-                           while-True header and this else block ends at that
-                           continue-merge. */
-                        if (!isContinueBE
-                                && whileTrueHdr.count(offs)
-                                && whileContMerge.count(curblock->end())
-                                && offs <= curpos && curpos < curblock->end()) {
-                            isContinueBE = true;
-                        }
-                        if (isContinueBE)
-                            curblock->append(new ASTKeyword(ASTKeyword::KW_CONTINUE));
-                        if (stack_hist.empty() || blocks.size() < 2)
-                            throw std::runtime_error("else back-edge stack/block underflow");
-                        stack = stack_hist.top();
-                        stack_hist.pop();
-
-                        blocks.pop();
-                        blocks.top()->append(curblock.cast<ASTNode>());
-                        curblock = blocks.top();
-
-                        if (curblock->blktype() == ASTBlock::BLK_CONTAINER
-                                && !curblock.cast<ASTContainerBlock>()->hasFinally()) {
-                            blocks.pop();
-                            blocks.top()->append(curblock.cast<ASTNode>());
-                            curblock = blocks.top();
-                        }
-                    } else {
-                        curblock->append(new ASTKeyword(ASTKeyword::KW_CONTINUE));
-                        if (curblock->blktype() == ASTBlock::BLK_TRY
-                                && !forHasBreak.count(offs)
-                                && backedgeCount[offs] == 1) {
-                            auto fe = forStartToExit.find(offs);
-                            if (fe != forStartToExit.end()) {
-                                loopCloseAtExit.insert(fe->second);
-                                recoverThisExcept = true;
-                            }
-                        }
-                    }
-
-                    /* We're in a loop, this jumps back to the start */
-                    /* I think we'll just ignore this case... */
-                    break; // Bad idea? Probably!
-                }
-
-                if (curblock->blktype() == ASTBlock::BLK_CONTAINER) {
-                    PycRef<ASTContainerBlock> cont = curblock.cast<ASTContainerBlock>();
-                    if (cont->hasExcept() && pos < cont->except()) {
-                        PycRef<ASTBlock> except = new ASTCondBlock(ASTBlock::BLK_EXCEPT, 0, NULL, false);
-                        except->init();
-                        blocks.push(except);
-                        curblock = blocks.top();
-                    }
-                    break;
-                }
-
-                if (!stack_hist.empty()) {
-                    stack = stack_hist.top();
-                    stack_hist.pop();
-                } else {
-                    fprintf(stderr, "Warning: Stack history is empty, something wrong might have happened\n");
-                }
-
-                PycRef<ASTBlock> prev = curblock;
-                PycRef<ASTBlock> nil;
-                bool push = true;
-
-                do {
-                    blocks.pop();
-
-                    blocks.top()->append(prev.cast<ASTNode>());
-
-                    if (prev->blktype() == ASTBlock::BLK_IF
-                            || prev->blktype() == ASTBlock::BLK_ELIF) {
-                        if (push) {
-                            stack_hist.push(stack);
-                        }
-                        PycRef<ASTBlock> next = new ASTBlock(ASTBlock::BLK_ELSE, blocks.top()->end());
-                        if (prev->inited() == ASTCondBlock::PRE_POPPED) {
-                            next->init(ASTCondBlock::PRE_POPPED);
-                        }
-
-                        blocks.push(next.cast<ASTBlock>());
-                        prev = nil;
-                    } else if (prev->blktype() == ASTBlock::BLK_EXCEPT) {
-                        if (push) {
-                            stack_hist.push(stack);
-                        }
-                        PycRef<ASTBlock> next = new ASTCondBlock(ASTBlock::BLK_EXCEPT, blocks.top()->end(), NULL, false);
-                        next->init();
-
-                        blocks.push(next.cast<ASTBlock>());
-                        prev = nil;
-                    } else if (prev->blktype() == ASTBlock::BLK_ELSE) {
-                        /* Special case */
-                        prev = blocks.top();
-                        if (!push) {
-                            stack = stack_hist.top();
-                            stack_hist.pop();
-                        }
-                        push = false;
-                    } else {
-                        prev = nil;
-                    }
-
-                } while (prev != nil);
-
-                curblock = blocks.top();
-            }
+            handleJumpAbsolute();
             break;
         case Pyc::JUMP_FORWARD_A:
         case Pyc::INSTRUMENTED_JUMP_FORWARD_A:
@@ -15781,6 +15487,316 @@ bool CodeBuilder::handleSend()
             Pyc::OpcodeName(opcode), opcode);
     cleanBuild = false;
     return false;
+}
+
+/* The backward/absolute jumps -- loop back-edges and the compiler's branch
+ * threading. A jump to an earlier offset is a loop edge: it closes a while-True
+ * body, a for/comprehension body (recording the trailing continue and any for-
+ * else), or emits a `continue` for an else/other suite whose back-edge is a live
+ * iteration edge (the long chain of guards distinguishes a real continue from a
+ * loop's sole closing edge across the many rotated-while / for-else shapes). A
+ * forward jump instead unwinds the finished suite: opening the except clause of
+ * a container, or peeling if/elif/except/else blocks and threading the matching
+ * `else:` suite that the branch falls into. */
+void CodeBuilder::handleJumpAbsolute()
+{
+    int offs = operand;
+    if (mod->verCompare(3, 10) >= 0)
+        offs *= sizeof(uint16_t);
+    if (opcode == Pyc::JUMP_BACKWARD_A
+            || opcode == Pyc::JUMP_BACKWARD_NO_INTERRUPT_A)
+        offs = pos - offs;
+
+    if (offs < pos) {
+        if (opcode == Pyc::JUMP_BACKWARD_A
+                && whileTrueHdr.count(offs)
+                && pos == whileTrueHdr[offs]
+                && curblock->blktype() == ASTBlock::BLK_WHILE) {
+            PycRef<ASTBlock> whb = curblock;
+            if (topTestWhileFallContinue.count(pos))
+                whb->append(new ASTKeyword(ASTKeyword::KW_CONTINUE));
+            blocks.pop();
+            curblock = blocks.top();
+            curblock->append(whb.cast<ASTNode>());
+            return;
+        }
+        while (curblock->blktype() == ASTBlock::BLK_FOR
+                && curblock->end() == curpos
+                && curblock.cast<ASTIterBlock>()->start() != offs
+                && curblock.cast<ASTIterBlock>()->start() > offs
+                && blocks.size() > 1) {
+            PycRef<ASTBlock> innerLoop = curblock;
+            blocks.pop();
+            curblock = blocks.top();
+            curblock->append(innerLoop.cast<ASTNode>());
+        }
+        if (curblock->blktype() == ASTBlock::BLK_FOR
+                || curblock->blktype() == ASTBlock::BLK_ASYNCFOR) {
+            bool is_jump_to_start = offs == curblock.cast<ASTIterBlock>()->start();
+            bool should_pop_for_block = curblock.cast<ASTIterBlock>()->isComprehension();
+            // in v3.8, SETUP_LOOP is deprecated and for blocks aren't terminated by POP_BLOCK, so we add them here
+            bool should_add_for_block = mod->majorVer() == 3 && mod->minorVer() >= 8 && is_jump_to_start && !curblock.cast<ASTIterBlock>()->isComprehension();
+
+            if (should_pop_for_block || should_add_for_block) {
+                PycRef<ASTNode> top = stack.top();
+
+                if (top.type() == ASTNode::NODE_COMPREHENSION) {
+                    PycRef<ASTComprehension> comp = top.cast<ASTComprehension>();
+
+                    comp->addGenerator(curblock.cast<ASTIterBlock>());
+                }
+
+                PycRef<ASTBlock> tmp = curblock;
+                int forEnd = tmp->end();
+                bool forTrailCont = false;
+                if (should_add_for_block) {
+                    int forH = tmp.cast<ASTIterBlock>()->start();
+                    for (const auto& fj : fwdJumps) {
+                        if (fj.second != curpos) continue;
+                        int O = fj.first;
+                        if (O <= forH || O >= curpos) continue;
+                        bool inNested = false;
+                        for (const auto& fe : forStartToExit)
+                            if (fe.first > forH && O >= fe.first
+                                    && O < fe.second) { inNested = true; break; }
+                        for (const auto& lr : loopRanges)
+                            if (!inNested && lr.start > forH && O >= lr.start
+                                    && O < lr.end) { inNested = true; break; }
+                        if (!inNested) { forTrailCont = true; break; }
+                    }
+                }
+                if (forTrailCont)
+                    tmp->append(new ASTKeyword(ASTKeyword::KW_CONTINUE));
+                blocks.pop();
+                curblock = blocks.top();
+                if (should_add_for_block) {
+                    curblock->append(tmp.cast<ASTNode>());
+                }
+                if (should_add_for_block
+                        && forElseMerge.count(forEnd)) {
+                    stack_hist.push(stack);
+                    PycRef<ASTBlock> elseblk = new ASTBlock(
+                            ASTBlock::BLK_ELSE, forElseMerge[forEnd]);
+                    elseblk->init();
+                    loopElseBlocks.insert((ASTBlock *)elseblk);
+                    blocks.push(elseblk);
+                    curblock = blocks.top();
+                }
+            }
+        } else if (curblock->blktype() == ASTBlock::BLK_ELSE) {
+            bool isContinueBE = false;
+            for (const auto& lr : loopRanges)
+                if (lr.start == offs && lr.end > pos) { isContinueBE = true; break; }
+            {
+                auto fe = forStartToExit.find(offs);
+                if (fe == forStartToExit.end()
+                        || curblock->end() >= fe->second)
+                    isContinueBE = false;
+            }
+            if (!isContinueBE && whileTrueHdr.count(offs)
+                    && loopElseBlocks.count((ASTBlock *)curblock)) {
+                isContinueBE = true;
+                topTestWhileExit.insert(whileTrueHdr[offs]);
+                topTestWhileFallBreak.insert(whileTrueHdr[offs]);
+            }
+            if (!isContinueBE
+                    && loopElseBlocks.count((ASTBlock *)curblock)
+                    && !forBreakBeyondExit.count(offs)) {
+                auto fe = forStartToExit.find(offs);
+                if (fe != forStartToExit.end()
+                        && curblock->end() < fe->second)
+                    isContinueBE = true;
+            }
+            if (!isContinueBE
+                    && forStartToExit.find(offs) == forStartToExit.end()
+                    && !loopElseBlocks.count((ASTBlock *)curblock)) {
+                for (const auto& lr : loopRanges) {
+                    if (whileTrueHdr.count(lr.start)
+                            && offs <= lr.start && lr.start - offs <= 4
+                            && lr.start <= pos && pos < lr.end) {
+                        isContinueBE = true;
+                        break;
+                    }
+                }
+            }
+            /* Plain `while <cond>:` (top-test, NOT while-True) else-continue:
+               the `else:` body ends in `continue` — a JUMP_BACKWARD to the
+               while header `offs`. whileTrueHdr doesn't cover a conditional
+               while and the for-scoping cleared isContinueBE (offs is not a
+               FOR_ITER start), so the continue was dropped (aiohttp/multipart
+               parse_content_disposition). Fire when `offs` is a loop header
+               with a LATER back-edge to it (strictly after pos = a live
+               iteration edge, so a real continue not the loop's sole/closing
+               edge), and pos is inside that range. */
+            if (!isContinueBE
+                    && forStartToExit.find(offs) == forStartToExit.end()
+                    && !loopElseBlocks.count((ASTBlock *)curblock)
+                    && !whileTrueHdr.count(offs)) {
+                bool laterBE = false;
+                for (const auto& lr : loopRanges)
+                    if (lr.start == offs && lr.end > pos
+                            && offs <= pos) {
+                        laterBE = true; break;
+                    }
+                if (laterBE)
+                    isContinueBE = true;
+            }
+            /* Rotated `while cond:` CONTINUE whose loop CLOSES via a
+               CONDITIONAL bottom re-test (not a later unconditional
+               back-edge): this `else:` body's JUMP_BACKWARD to the header
+               `offs` is the loop's ONLY unconditional back-edge (a
+               `continue`), and the natural fall-off-end re-tests the
+               condition and jumps back to the BODY (targeting the guard's
+               fall-through, not the header). The laterBE test above finds
+               no sibling back-edge to `offs` (the bottom re-test targets
+               the body, a different offset), so the continue was dropped
+               — leaving the loop with only its bottom re-test on recompile
+               (character `an observed function`: outermost of three nested
+               `while x is None:`). Detect via the recorded
+               continue-exit (rotWhileContinueExit holds the offset right
+               after this JUMP_BACKWARD, since the bottom re-test follows). */
+            if (!isContinueBE
+                    && forStartToExit.find(offs) == forStartToExit.end()
+                    && !loopElseBlocks.count((ASTBlock *)curblock)
+                    && rotWhileContinueExit.count(pos)) {
+                for (const auto& lr : loopRanges)
+                    if (lr.start == offs && lr.exit == pos) {
+                        isContinueBE = true; break;
+                    }
+            }
+            if (!isContinueBE
+                    && loopElseBlocks.count((ASTBlock *)curblock)
+                    && forElseFinBreak.count(offs)) {
+                isContinueBE = true;
+            }
+            /* Nested for-else search-loop idiom: the inner for-else's
+               `else:` body is `continue` of the ENCLOSING for, which is
+               itself an armed for-else+break (forElseBreakLoop) — the
+               back-edge to `offs` IS the enclosing loop's only edge so its
+               loopRange end == pos and the for-scoping/SHIP-196 paths
+               exclude it (the outer DOES break past its exit). The outer
+               for-else is reconstructed (the nested arming above), so its
+               inner else-continue must emit. Mirrors the forElseFinBreak
+               gate just above. */
+            if (!isContinueBE
+                    && loopElseBlocks.count((ASTBlock *)curblock)
+                    && forElseBreakLoop.count(offs)) {
+                isContinueBE = true;
+            }
+            /* Rotated while-True continue-else: the `else:` arm of a
+               nested if inside the loop ends in `continue` (a
+               JUMP_BACKWARD to the while-True header `offs`) whose own
+               back-edge is the loop's LAST edge (loopRange end == pos),
+               and the arm merges at a whileContMerge point (the offset
+               right after this back-edge, with loop-body tail beyond).
+               The laterBE/for-scoping paths all require lr.end > pos, so
+               the continue was dropped as dead.  Fire when offs is a
+               while-True header and this else block ends at that
+               continue-merge. */
+            if (!isContinueBE
+                    && whileTrueHdr.count(offs)
+                    && whileContMerge.count(curblock->end())
+                    && offs <= curpos && curpos < curblock->end()) {
+                isContinueBE = true;
+            }
+            if (isContinueBE)
+                curblock->append(new ASTKeyword(ASTKeyword::KW_CONTINUE));
+            if (stack_hist.empty() || blocks.size() < 2)
+                throw std::runtime_error("else back-edge stack/block underflow");
+            stack = stack_hist.top();
+            stack_hist.pop();
+
+            blocks.pop();
+            blocks.top()->append(curblock.cast<ASTNode>());
+            curblock = blocks.top();
+
+            if (curblock->blktype() == ASTBlock::BLK_CONTAINER
+                    && !curblock.cast<ASTContainerBlock>()->hasFinally()) {
+                blocks.pop();
+                blocks.top()->append(curblock.cast<ASTNode>());
+                curblock = blocks.top();
+            }
+        } else {
+            curblock->append(new ASTKeyword(ASTKeyword::KW_CONTINUE));
+            if (curblock->blktype() == ASTBlock::BLK_TRY
+                    && !forHasBreak.count(offs)
+                    && backedgeCount[offs] == 1) {
+                auto fe = forStartToExit.find(offs);
+                if (fe != forStartToExit.end()) {
+                    loopCloseAtExit.insert(fe->second);
+                    recoverThisExcept = true;
+                }
+            }
+        }
+
+        /* We're in a loop, this jumps back to the start */
+        /* I think we'll just ignore this case... */
+        return; // Bad idea? Probably!
+    }
+
+    if (curblock->blktype() == ASTBlock::BLK_CONTAINER) {
+        PycRef<ASTContainerBlock> cont = curblock.cast<ASTContainerBlock>();
+        if (cont->hasExcept() && pos < cont->except()) {
+            PycRef<ASTBlock> except = new ASTCondBlock(ASTBlock::BLK_EXCEPT, 0, NULL, false);
+            except->init();
+            blocks.push(except);
+            curblock = blocks.top();
+        }
+        return;
+    }
+
+    if (!stack_hist.empty()) {
+        stack = stack_hist.top();
+        stack_hist.pop();
+    } else {
+        fprintf(stderr, "Warning: Stack history is empty, something wrong might have happened\n");
+    }
+
+    PycRef<ASTBlock> prev = curblock;
+    PycRef<ASTBlock> nil;
+    bool push = true;
+
+    do {
+        blocks.pop();
+
+        blocks.top()->append(prev.cast<ASTNode>());
+
+        if (prev->blktype() == ASTBlock::BLK_IF
+                || prev->blktype() == ASTBlock::BLK_ELIF) {
+            if (push) {
+                stack_hist.push(stack);
+            }
+            PycRef<ASTBlock> next = new ASTBlock(ASTBlock::BLK_ELSE, blocks.top()->end());
+            if (prev->inited() == ASTCondBlock::PRE_POPPED) {
+                next->init(ASTCondBlock::PRE_POPPED);
+            }
+
+            blocks.push(next.cast<ASTBlock>());
+            prev = nil;
+        } else if (prev->blktype() == ASTBlock::BLK_EXCEPT) {
+            if (push) {
+                stack_hist.push(stack);
+            }
+            PycRef<ASTBlock> next = new ASTCondBlock(ASTBlock::BLK_EXCEPT, blocks.top()->end(), NULL, false);
+            next->init();
+
+            blocks.push(next.cast<ASTBlock>());
+            prev = nil;
+        } else if (prev->blktype() == ASTBlock::BLK_ELSE) {
+            /* Special case */
+            prev = blocks.top();
+            if (!push) {
+                stack = stack_hist.top();
+                stack_hist.pop();
+            }
+            push = false;
+        } else {
+            prev = nil;
+        }
+
+    } while (prev != nil);
+
+    curblock = blocks.top();
 }
 
 /* The UNARY_* opcodes each pop one operand and push one result node.
