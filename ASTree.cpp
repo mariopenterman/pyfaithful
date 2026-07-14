@@ -511,6 +511,7 @@ private:
     void handleJumpAbsolute();
     void handleGetAIter();
     void handleReturnConst(int operand);
+    bool handleSetupWith(int opcode, int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -614,6 +615,10 @@ private:
     bool recoverThisExcept = false;
     /* Prescan info for `async for` loops, keyed by the GET_AITER offset. */
     std::unordered_map<int, AsyncForRec> asyncForInfo;
+    /* `with`-block prescan: withOpen maps a with-body start to its end, and
+       asyncWithBody marks the body offsets of `async with` blocks. */
+    std::unordered_map<int, int> withOpen;
+    std::unordered_set<int> asyncWithBody;
     /* RETURN_VALUE prescan state: offsets whose return is a suppressed
        implicit-epilogue copy (finallyReturnSkip / dupRetNoneSkip), the outer
        finally resume target for a return inside an except (finallyExceptReturnExit),
@@ -4684,13 +4689,11 @@ PycRef<ASTNode> CodeBuilder::build()
     for (const auto& j : fwdJumps)
         fwdJumpTargets.insert(j.second);
 
-    std::unordered_map<int, int> withOpen;
     std::unordered_map<int, int> withResume;
     std::unordered_map<int, int> withHandlerSkip;
     std::unordered_set<int> withInTryResume;
     std::unordered_map<int, int> withExitSkip;
     std::unordered_set<int> withHandlerTargets;
-    std::unordered_set<int> asyncWithBody;
     if (mod->verCompare(3, 11) >= 0) {
         const auto* buf = code->code()->value();
         int len = (int)code->code()->length();
@@ -13936,47 +13939,10 @@ PycRef<ASTNode> CodeBuilder::build()
             break;
         case Pyc::SETUP_WITH_A:
         case Pyc::WITH_EXCEPT_START:
-            {
-                PycRef<ASTBlock> withblock = new ASTWithBlock(pos+operand);
-                blocks.push(withblock);
-                curblock = blocks.top();
-            }
-            break;
         case Pyc::BEFORE_WITH:
-            /* Python 3.11: setup for with block; ignore. */
-            break;
         case Pyc::BEFORE_ASYNC_WITH:
-            {
-                PycBuffer s(code->code()->value(), code->code()->length());
-                s.setPos(pos);
-                int so, sa, sp = pos, tgt = -1;
-                for (int i = 0; i < 6 && !s.atEof(); ++i) {
-                    bc_next(s, mod, so, sa, sp);
-                    if (so == Pyc::SEND_A) {
-                        tgt = sp + sa * (int)sizeof(uint16_t);
-                        break;
-                    }
-                }
-                /* skip a leading NOP at the await landing (try-wrapped async-with),
-                   so tgt aligns with the body / withOpen key (see the asyncWithBody
-                   pre-scan). */
-                if (tgt >= 0) {
-                    PycBuffer ns(code->code()->value(), code->code()->length());
-                    ns.setPos(tgt);
-                    int no, na, np = tgt;
-                    if (!ns.atEof()) { bc_next(ns, mod, no, na, np);
-                        if (no == Pyc::NOP) tgt = np; }
-                }
-                if (tgt >= 0 && asyncWithBody.count(tgt) && withOpen.count(tgt)) {
-                    source.setPos(tgt);
-                    pos = tgt;
-                } else {
-                    fprintf(stderr, "Unsupported opcode: %s (%d)\n",
-                            Pyc::OpcodeName(opcode), opcode);
-                    cleanBuild = false;
-                    return new ASTNodeList(defblock->nodes());
-                }
-            }
+            if (!handleSetupWith(opcode, operand))
+                return new ASTNodeList(defblock->nodes());
             break;
         case Pyc::WITH_CLEANUP:
         case Pyc::WITH_CLEANUP_START:
@@ -15510,6 +15476,58 @@ void CodeBuilder::handleReturnConst(int operand)
 {
     PycRef<ASTObject> value = new ASTObject(code->getConst(operand));
     curblock->append(new ASTReturn(value.cast<ASTNode>()));
+}
+
+/* The `with`-statement setup opcodes.
+ *   SETUP_WITH / WITH_EXCEPT_START -> push a with block covering the body.
+ *   BEFORE_WITH (3.11) -> the body block is opened elsewhere; nothing to do.
+ *   BEFORE_ASYNC_WITH -> `async with`: scan ahead to the SEND that drives
+ *       __aenter__, then jump to the awaited body start (skipping a leading NOP
+ *       landing) so decoding continues inside the with body.
+ * Returns false (bail) when an async-with body cannot be located. */
+bool CodeBuilder::handleSetupWith(int opcode, int operand)
+{
+    if (opcode == Pyc::SETUP_WITH_A || opcode == Pyc::WITH_EXCEPT_START) {
+        PycRef<ASTBlock> withblock = new ASTWithBlock(pos+operand);
+        blocks.push(withblock);
+        curblock = blocks.top();
+        return true;
+    }
+    if (opcode == Pyc::BEFORE_WITH) {
+        /* Python 3.11: setup for with block; ignore. */
+        return true;
+    }
+    // BEFORE_ASYNC_WITH
+    PycBuffer s(code->code()->value(), code->code()->length());
+    s.setPos(pos);
+    int so, sa, sp = pos, tgt = -1;
+    for (int i = 0; i < 6 && !s.atEof(); ++i) {
+        bc_next(s, mod, so, sa, sp);
+        if (so == Pyc::SEND_A) {
+            tgt = sp + sa * (int)sizeof(uint16_t);
+            break;
+        }
+    }
+    /* skip a leading NOP at the await landing (try-wrapped async-with),
+       so tgt aligns with the body / withOpen key (see the asyncWithBody
+       pre-scan). */
+    if (tgt >= 0) {
+        PycBuffer ns(code->code()->value(), code->code()->length());
+        ns.setPos(tgt);
+        int no, na, np = tgt;
+        if (!ns.atEof()) { bc_next(ns, mod, no, na, np);
+            if (no == Pyc::NOP) tgt = np; }
+    }
+    if (tgt >= 0 && asyncWithBody.count(tgt) && withOpen.count(tgt)) {
+        source.setPos(tgt);
+        pos = tgt;
+    } else {
+        fprintf(stderr, "Unsupported opcode: %s (%d)\n",
+                Pyc::OpcodeName(opcode), opcode);
+        cleanBuild = false;
+        return false;
+    }
+    return true;
 }
 
 /* The backward/absolute jumps -- loop back-edges and the compiler's branch
