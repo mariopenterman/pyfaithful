@@ -419,10 +419,37 @@ static PycRef<ASTNode> recoverFoldedAndOperand(PycRef<ASTNode> left, bool isOr,
 
 /* ==========================================================================
  * PHASE 1 -- BuildFromCode: byte-code -> AST
- * Stack-machine walk over the instruction stream. `stack` holds partial
- * expressions; `blocks` holds the open statement blocks (if/for/while/try/...).
- * Most of the size here is 3.11 control-flow reconstruction: matching jumps to
- * their blocks and coalescing try/except/finally, match, and loop shapes.
+ *
+ * A single stack-machine pass over the instruction stream that rebuilds both
+ * expressions and control flow. It is large (one function, ~250 opcode cases)
+ * because CPython 3.11's jump-threaded control flow has to be reconstructed
+ * here; the bulk of the code is not the opcodes themselves but the block
+ * matching/coalescing that turns jumps back into if/elif/else, loops, and
+ * try/except/finally.
+ *
+ * How to read it:
+ *   - Two working stacks drive everything:
+ *       `stack`   -- the operand stack: partial EXPRESSIONS being assembled
+ *                    (an ADD pops two operands and pushes an ASTBinary, etc.).
+ *       `blocks`  -- the block stack: currently-open STATEMENTS/suites, with
+ *                    `curblock` the innermost. Statements are appended to
+ *                    `curblock`; a jump target that matches a block's end pops
+ *                    that block.
+ *   - The prologue (right below) declares that state plus a large set of small
+ *     bookkeeping maps/sets keyed by byte offset. Each map exists to remember a
+ *     control-flow decision made at one offset so a later offset can act on it
+ *     (e.g. "a finally copy starts here", "this jump is a loop continue, not a
+ *     break"). They are grouped and commented at their declarations.
+ *   - The main loop reads one instruction at a time (bc_next) and dispatches on
+ *     `opcode` in a big switch; each case updates the two stacks and/or the
+ *     bookkeeping maps.
+ *   - The epilogue closes any still-open blocks and returns the assembled tree.
+ *
+ * NOTE: because the whole reconstruction shares this state, the function is not
+ * split into per-opcode helpers -- doing so safely would mean promoting all of
+ * the locals (and the ~50 `[&]` lambdas) to a shared object without changing a
+ * single emitted byte. See ASTree_priv.h for the split between this builder,
+ * the renderer (ASTRender.cpp), and the faithfulness passes (ASTFaithful.cpp).
  * ========================================================================== */
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
 {
@@ -10389,6 +10416,11 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
                 whileTopTestPendingExit = whileTrueHdr[curpos];
         }
 
+        /* --- main opcode dispatch ---------------------------------------
+         * One case per byte-code instruction. Each updates the operand stack
+         * `stack` and/or the block stack `blocks`/`curblock`. (Everything above
+         * in this loop iteration is the control-flow matching that opens/closes
+         * blocks before the instruction itself is handled.) */
         switch (opcode) {
         case Pyc::BINARY_OP_A:
             {
@@ -16297,6 +16329,10 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
             defblock->append(top);
     }
 
+    /* --- epilogue: the instruction stream is exhausted. Any blocks still open
+     * were closed as their ends were reached during the loop; return the top
+     * block's statements as the module/function body. cleanBuild=true records
+     * that decompilation reached the end without bailing. */
     cleanBuild = true;
     return new ASTNodeList(defblock->nodes());
 }
