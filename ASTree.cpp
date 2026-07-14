@@ -585,6 +585,22 @@ private:
     /* Set by SETUP_FINALLY and cleared by SETUP_EXCEPT: whether the container
        block just opened is a bare try/finally (no except clause). */
     bool need_try = false;
+    /* Loop/branch prescan sets and maps consulted by the JUMP handlers to
+       reconstruct for/while bodies, else clauses, breaks, and continues. */
+    std::set<int> forBreakBeyondExit;
+    std::set<int> forElseBreakLoop;
+    std::unordered_map<int, std::pair<int,int>> forElseFinBreak;
+    std::unordered_map<int,int> forElseMerge;
+    std::set<int> forHasBreak;
+    std::unordered_map<int, int> forStartToExit;
+    std::set<int> loopCloseAtExit;
+    std::set<ASTBlock*> loopElseBlocks;
+    std::unordered_set<int> rotWhileContinueExit;
+    std::unordered_set<int> topTestWhileExit;
+    std::unordered_set<int> topTestWhileFallBreak;
+    std::unordered_set<int> topTestWhileFallContinue;
+    std::unordered_set<int> whileContMerge;
+    std::unordered_map<int, int> whileTrueHdr;
     /* Prescan-collected [start,end,exit) ranges of every loop, and a map from a
        FOR_ITER offset to an early loop-close offset when the loop body ends
        before the recorded block end. */
@@ -1104,7 +1120,6 @@ PycRef<ASTNode> CodeBuilder::build()
        `break` (the break runs the finally then exits).  Maps copy-start -> skipTo. */
     std::unordered_map<int, int> breakEscCopySkip;
     std::set<int> loopFinBreakExit;
-    std::unordered_map<int, std::pair<int,int>> forElseFinBreak;
     std::unordered_map<int, int> exceptOpenAt;
     /* When two try/except blocks share the same body start offset (an outer try
        whose body begins with another try), exceptOpenAt — keyed by start — can
@@ -3853,7 +3868,6 @@ PycRef<ASTNode> CodeBuilder::build()
         }
     }
 
-    std::unordered_map<int, int> forStartToExit;
     std::vector<std::pair<int,int>> fwdJumps;
     std::unordered_map<int, int> opEndingBefore;
     {
@@ -3904,7 +3918,6 @@ PycRef<ASTNode> CodeBuilder::build()
        re-tests, but the outermost also has a mid-body `continue`, so its bottom
        re-test's continue-range was mis-read as the loop exit and the fall-through
        into it rendered as a spurious `break`, dropping the bottom re-test). */
-    std::unordered_set<int> rotWhileContinueExit;
     {
         const int W = (int)sizeof(uint16_t);
         PycBuffer scan(code->code()->value(), code->code()->length());
@@ -4028,7 +4041,6 @@ PycRef<ASTNode> CodeBuilder::build()
         if (!terminal)
             forExitFallThrough.insert(kv.first);
     }
-    std::set<int> forHasBreak;
     for (const auto& kv : forStartToExit) {
         int s = kv.first, x = kv.second;
         for (const auto& j : fwdJumps) {
@@ -4038,7 +4050,6 @@ PycRef<ASTNode> CodeBuilder::build()
             }
         }
     }
-    std::set<int> forBreakBeyondExit;
     for (const auto& kv : forStartToExit) {
         int s = kv.first, x = kv.second;
         for (const auto& j : fwdJumps) {
@@ -4335,8 +4346,6 @@ PycRef<ASTNode> CodeBuilder::build()
             a1 = sarg;
         }
     }
-    std::unordered_map<int,int> forElseMerge;
-    std::set<ASTBlock*> loopElseBlocks;
     for (const auto& kv : forStartToExit) {
         int s = kv.first, E = kv.second;
         int M = -1; bool ok = true;
@@ -4407,7 +4416,6 @@ PycRef<ASTNode> CodeBuilder::build()
         if (it != opEndingBefore.end() && it->second == Pyc::POP_TOP)
             forUncondBreak.insert(E);
     }
-    std::set<int> loopCloseAtExit;
     std::unordered_map<int,int> dupForBreakJF;
     std::unordered_map<int,int> dupForBreakIfEnd;
     {
@@ -4448,7 +4456,6 @@ PycRef<ASTNode> CodeBuilder::build()
     }
     for (int E : loopFinBreakExit)
         loopCloseAtExit.insert(E);
-    std::set<int> forElseBreakLoop;
     for (const auto& kv : forStartToExit) {
         int s = kv.first, E = kv.second;
         if (!(forElseMerge.count(E) && forBreakBeyondExit.count(s)))
@@ -5945,13 +5952,8 @@ PycRef<ASTNode> CodeBuilder::build()
         }
     }
 
-    std::unordered_map<int, int> whileTrueHdr;
-    std::unordered_set<int> whileContMerge;
     std::unordered_set<int> whileTrueTopTest;
     int whileTopTestPendingExit = -1;
-    std::unordered_set<int> topTestWhileExit;
-    std::unordered_set<int> topTestWhileFallBreak;
-    std::unordered_set<int> topTestWhileFallContinue;
     std::unordered_map<int, int> loopBreakElse;
     {
         struct Back { int instr; int end; int target; };
