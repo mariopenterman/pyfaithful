@@ -509,6 +509,11 @@ private:
        reconstruction rewinds/advances `source`+`pos` to re-read or skip ahead. */
     PycBuffer source;
     int pos = 0;
+    /* The opcode and operand of the instruction currently being dispatched.
+       Members (not build() locals) because some control-flow handlers re-read
+       ahead with bc_next into these, and the loop epilogue reads opcode after
+       the handler returns (to track lastSubstantialOp). */
+    int opcode, operand;
     /* Saved operand-stack snapshots: a copy of `stack` is pushed when a block
        that may consume a fresh stack opens, and restored when a branch/handler
        unwinds back out of it. */
@@ -594,7 +599,6 @@ PycRef<ASTNode> CodeBuilder::build()
     curblock = defblock;
     blocks.push(defblock);
 
-    int opcode, operand;
     struct BoolShortCircuit { PycRef<ASTNode> left; bool isOr; int target; int off; };
     std::vector<BoolShortCircuit> boolPending;
     bool else_pop = false;
