@@ -477,6 +477,7 @@ private:
     void handleIsContainsOp(int opcode, int operand);
     void handleBuildCollection(int opcode, int operand);
     void handleLoad(int opcode, int operand);
+    void handleDelete(int opcode, int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -10969,96 +10970,15 @@ PycRef<ASTNode> CodeBuilder::build()
             handleIsContainsOp(opcode, operand);
             break;
         case Pyc::DELETE_ATTR_A:
-            {
-                PycRef<ASTNode> name = stack.top();
-                stack.pop();
-                curblock->append(new ASTDelete(new ASTBinary(name, new ASTName(code->getName(operand)), ASTBinary::BIN_ATTR)));
-            }
-            break;
         case Pyc::DELETE_GLOBAL_A:
-            code->markGlobal(code->getName(operand));
-            /* Fall through */
         case Pyc::DELETE_NAME_A:
-            {
-                PycRef<PycString> varname = code->getName(operand);
-
-                if (varname->length() >= 2 && varname->value()[0] == '_'
-                        && varname->value()[1] == '[') {
-                    /* Don't show deletes that are a result of list comps. */
-                    break;
-                }
-
-                PycRef<ASTNode> name = new ASTName(varname);
-                curblock->append(new ASTDelete(name));
-            }
-            break;
         case Pyc::DELETE_FAST_A:
-            {
-                PycRef<ASTNode> name;
-
-                if (mod->verCompare(1, 3) < 0)
-                    name = new ASTName(code->getName(operand));
-                else
-                    name = new ASTName(code->getLocal(operand));
-
-                if (name.cast<ASTName>()->name()->value()[0] == '_'
-                        && name.cast<ASTName>()->name()->value()[1] == '[') {
-                    /* Don't show deletes that are a result of list comps. */
-                    break;
-                }
-
-                curblock->append(new ASTDelete(name));
-            }
-            break;
         case Pyc::DELETE_SLICE_0:
-            {
-                PycRef<ASTNode> name = stack.top();
-                stack.pop();
-
-                curblock->append(new ASTDelete(new ASTSubscr(name, new ASTSlice(ASTSlice::SLICE0))));
-            }
-            break;
         case Pyc::DELETE_SLICE_1:
-            {
-                PycRef<ASTNode> upper = stack.top();
-                stack.pop();
-                PycRef<ASTNode> name = stack.top();
-                stack.pop();
-
-                curblock->append(new ASTDelete(new ASTSubscr(name, new ASTSlice(ASTSlice::SLICE1, upper))));
-            }
-            break;
         case Pyc::DELETE_SLICE_2:
-            {
-                PycRef<ASTNode> lower = stack.top();
-                stack.pop();
-                PycRef<ASTNode> name = stack.top();
-                stack.pop();
-
-                curblock->append(new ASTDelete(new ASTSubscr(name, new ASTSlice(ASTSlice::SLICE2, NULL, lower))));
-            }
-            break;
-        case Pyc::DELETE_SLICE_3:
-            {
-                PycRef<ASTNode> lower = stack.top();
-                stack.pop();
-                PycRef<ASTNode> upper = stack.top();
-                stack.pop();
-                PycRef<ASTNode> name = stack.top();
-                stack.pop();
-
-                curblock->append(new ASTDelete(new ASTSubscr(name, new ASTSlice(ASTSlice::SLICE3, upper, lower))));
-            }
-            break;
         case Pyc::DELETE_SUBSCR:
-            {
-                PycRef<ASTNode> key = stack.top();
-                stack.pop();
-                PycRef<ASTNode> name = stack.top();
-                stack.pop();
-
-                curblock->append(new ASTDelete(new ASTSubscr(name, key)));
-            }
+        case Pyc::DELETE_SLICE_3:
+            handleDelete(opcode, operand);
             break;
         case Pyc::DUP_TOP:
             {
@@ -16450,6 +16370,113 @@ void CodeBuilder::handleLoad(int opcode, int operand)
         break;
     case Pyc::LOAD_NAME_A:
         stack.push(new ASTName(code->getName(operand)));
+        break;
+    }
+}
+
+/* The `del` statements: each appends an ASTDelete of the target being removed.
+ *   DELETE_FAST / NAME / GLOBAL  -> del of a local / name / global (GLOBAL also
+ *       records the name as global for the enclosing scope). Names of the form
+ *       `_[...]` are compiler-internal list-comprehension temporaries and are
+ *       not emitted.
+ *   DELETE_ATTR                  -> del obj.attr.
+ *   DELETE_SUBSCR                -> del obj[key].
+ *   DELETE_SLICE_0..3 (Python 2) -> del of the old dedicated slice forms
+ *       ([:], [lo:], [:hi], [lo:hi]) rebuilt as a subscript of an ASTSlice. */
+void CodeBuilder::handleDelete(int opcode, int operand)
+{
+    switch (opcode) {
+    case Pyc::DELETE_ATTR_A:
+        {
+            PycRef<ASTNode> name = stack.top();
+            stack.pop();
+            curblock->append(new ASTDelete(new ASTBinary(name, new ASTName(code->getName(operand)), ASTBinary::BIN_ATTR)));
+        }
+        break;
+    case Pyc::DELETE_GLOBAL_A:
+        code->markGlobal(code->getName(operand));
+        /* Fall through */
+    case Pyc::DELETE_NAME_A:
+        {
+            PycRef<PycString> varname = code->getName(operand);
+
+            if (varname->length() >= 2 && varname->value()[0] == '_'
+                    && varname->value()[1] == '[') {
+                /* Don't show deletes that are a result of list comps. */
+                break;
+            }
+
+            PycRef<ASTNode> name = new ASTName(varname);
+            curblock->append(new ASTDelete(name));
+        }
+        break;
+    case Pyc::DELETE_FAST_A:
+        {
+            PycRef<ASTNode> name;
+
+            if (mod->verCompare(1, 3) < 0)
+                name = new ASTName(code->getName(operand));
+            else
+                name = new ASTName(code->getLocal(operand));
+
+            if (name.cast<ASTName>()->name()->value()[0] == '_'
+                    && name.cast<ASTName>()->name()->value()[1] == '[') {
+                /* Don't show deletes that are a result of list comps. */
+                break;
+            }
+
+            curblock->append(new ASTDelete(name));
+        }
+        break;
+    case Pyc::DELETE_SLICE_0:
+        {
+            PycRef<ASTNode> name = stack.top();
+            stack.pop();
+
+            curblock->append(new ASTDelete(new ASTSubscr(name, new ASTSlice(ASTSlice::SLICE0))));
+        }
+        break;
+    case Pyc::DELETE_SLICE_1:
+        {
+            PycRef<ASTNode> upper = stack.top();
+            stack.pop();
+            PycRef<ASTNode> name = stack.top();
+            stack.pop();
+
+            curblock->append(new ASTDelete(new ASTSubscr(name, new ASTSlice(ASTSlice::SLICE1, upper))));
+        }
+        break;
+    case Pyc::DELETE_SLICE_2:
+        {
+            PycRef<ASTNode> lower = stack.top();
+            stack.pop();
+            PycRef<ASTNode> name = stack.top();
+            stack.pop();
+
+            curblock->append(new ASTDelete(new ASTSubscr(name, new ASTSlice(ASTSlice::SLICE2, NULL, lower))));
+        }
+        break;
+    case Pyc::DELETE_SLICE_3:
+        {
+            PycRef<ASTNode> lower = stack.top();
+            stack.pop();
+            PycRef<ASTNode> upper = stack.top();
+            stack.pop();
+            PycRef<ASTNode> name = stack.top();
+            stack.pop();
+
+            curblock->append(new ASTDelete(new ASTSubscr(name, new ASTSlice(ASTSlice::SLICE3, upper, lower))));
+        }
+        break;
+    case Pyc::DELETE_SUBSCR:
+        {
+            PycRef<ASTNode> key = stack.top();
+            stack.pop();
+            PycRef<ASTNode> name = stack.top();
+            stack.pop();
+
+            curblock->append(new ASTDelete(new ASTSubscr(name, key)));
+        }
         break;
     }
 }
