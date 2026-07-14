@@ -555,6 +555,11 @@ private:
        is recognised as a variable annotation (`name: type`) rather than a dict
        item assignment. */
     bool variable_annotations = false;
+    /* The code object's exception table (3.11+ zero-cost exceptions) and a
+       cursor into it: next_exception_entry is the index of the first entry not
+       yet passed, advanced as `pos` moves forward. */
+    std::vector<PycExceptionTableEntry> exception_entries;
+    size_t next_exception_entry = 0;
 };
 
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
@@ -595,8 +600,6 @@ PycRef<ASTNode> CodeBuilder::build()
     bool need_try = false;
     bool compFilterFwd = false;
     int lastSubstantialOp = Pyc::PYC_INVALID_OPCODE;
-    std::vector<PycExceptionTableEntry> exception_entries;
-    size_t next_exception_entry = 0;
     std::unordered_map<int,int> dupHandlerEnd;
     std::unordered_set<int> dupActiveSkip;
     std::unordered_map<int, int> finallyReturnExit;
