@@ -718,6 +718,9 @@ private:
     void handleCompareOp(int operand);
     bool handleMatchClass();
     bool handleBackwardConditionalJump();
+    void handleStoreMap();
+    void handleKwNames(int operand);
+    void handleExecStmt();
     // --- state promoted for handleBackwardConditionalJump ---
     std::unordered_set<int> compoundAndLeadGuard;
     std::unordered_set<int> chainWhileBwdEnd;
@@ -10556,14 +10559,7 @@ PycRef<ASTNode> CodeBuilder::build()
             handleBuildCollection(opcode, operand);
             break;
         case Pyc::STORE_MAP:
-            {
-                PycRef<ASTNode> key = stack.top();
-                stack.pop();
-                PycRef<ASTNode> value = stack.top();
-                stack.pop();
-                PycRef<ASTMap> map = stack.top().cast<ASTMap>();
-                map->add(key, value);
-            }
+            handleStoreMap();
             break;
         case Pyc::BUILD_SLICE_A:
             handleBuildCollection(opcode, operand);
@@ -10573,17 +10569,7 @@ PycRef<ASTNode> CodeBuilder::build()
             handleBuildCollection(opcode, operand);
             break;
         case Pyc::KW_NAMES_A:
-            {
-
-                int kwparams = code->getConst(operand).cast<PycTuple>()->size();
-                ASTKwNamesMap kwparamList;
-                std::vector<PycRef<PycObject>> keys = code->getConst(operand).cast<PycSimpleSequence>()->values();
-                for (int i = 0; i < kwparams; i++) {
-                    kwparamList.add(new ASTObject(keys[kwparams - i - 1]), stack.top());
-                    stack.pop();
-                }
-                stack.push(new ASTKwNamesMap(kwparamList));
-            }
+            handleKwNames(operand);
             break;
         case Pyc::CALL_A:
         case Pyc::CALL_FUNCTION_A:
@@ -10624,19 +10610,7 @@ PycRef<ASTNode> CodeBuilder::build()
             handleEndFinally();
             break;
         case Pyc::EXEC_STMT:
-            {
-                if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
-                    stack.pop();
-                }
-                PycRef<ASTNode> loc = stack.top();
-                stack.pop();
-                PycRef<ASTNode> glob = stack.top();
-                stack.pop();
-                PycRef<ASTNode> stmt = stack.top();
-                stack.pop();
-
-                curblock->append(new ASTExec(stmt, glob, loc));
-            }
+            handleExecStmt();
             break;
         case Pyc::FOR_ITER_A:
         case Pyc::INSTRUMENTED_FOR_ITER_A:
@@ -17065,6 +17039,51 @@ bool CodeBuilder::handleBackwardConditionalJump()
                 return false;
             }
     return true;
+}
+
+/* STORE_MAP (<3.5) — pop a key and value and add them to the ASTMap already
+   on top of the stack (dict-display element). */
+void CodeBuilder::handleStoreMap()
+{
+                PycRef<ASTNode> key = stack.top();
+                stack.pop();
+                PycRef<ASTNode> value = stack.top();
+                stack.pop();
+                PycRef<ASTMap> map = stack.top().cast<ASTMap>();
+                map->add(key, value);
+}
+
+/* KW_NAMES (3.11+) — the const tuple of keyword-argument names for the CALL
+   that follows. Pop one stack value per name and push an ASTKwNamesMap the
+   call handler consumes. */
+void CodeBuilder::handleKwNames(int operand)
+{
+
+                int kwparams = code->getConst(operand).cast<PycTuple>()->size();
+                ASTKwNamesMap kwparamList;
+                std::vector<PycRef<PycObject>> keys = code->getConst(operand).cast<PycSimpleSequence>()->values();
+                for (int i = 0; i < kwparams; i++) {
+                    kwparamList.add(new ASTObject(keys[kwparams - i - 1]), stack.top());
+                    stack.pop();
+                }
+                stack.push(new ASTKwNamesMap(kwparamList));
+}
+
+/* EXEC_STMT (Python 2 `exec`) — pop the optional locals/globals mappings and
+   the code, and append an ASTExec statement. */
+void CodeBuilder::handleExecStmt()
+{
+                if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
+                    stack.pop();
+                }
+                PycRef<ASTNode> loc = stack.top();
+                stack.pop();
+                PycRef<ASTNode> glob = stack.top();
+                stack.pop();
+                PycRef<ASTNode> stmt = stack.top();
+                stack.pop();
+
+                curblock->append(new ASTExec(stmt, glob, loc));
 }
 
 /* Canonicalize a jump target through the return-pad fold map: a padded
