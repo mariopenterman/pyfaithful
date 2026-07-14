@@ -613,6 +613,20 @@ private:
     bool recoverThisExcept = false;
     /* Prescan info for `async for` loops, keyed by the GET_AITER offset. */
     std::unordered_map<int, AsyncForRec> asyncForInfo;
+    /* RETURN_VALUE prescan state: offsets whose return is a suppressed
+       implicit-epilogue copy (finallyReturnSkip / dupRetNoneSkip), the outer
+       finally resume target for a return inside an except (finallyExceptReturnExit),
+       the terminal module/class if/else split (moduleElseAt), pending-else elif
+       ends (elifPendingElse), and the __classcell__ return bookkeeping
+       (classCellRet set, classCellLastRet, classCellMerge). */
+    std::unordered_set<int> finallyReturnSkip;
+    std::unordered_set<int> dupRetNoneSkip;
+    std::unordered_map<int, int> finallyExceptReturnExit;
+    std::unordered_map<int, int> moduleElseAt;
+    std::unordered_map<int, int> elifPendingElse;
+    std::unordered_set<int> classCellRet;
+    int classCellLastRet = -1;
+    int classCellMerge = -1;
     /* Prescan-collected [start,end,exit) ranges of every loop, and a map from a
        FOR_ITER offset to an early loop-close offset when the loop body ends
        before the recorded block end. */
@@ -681,8 +695,6 @@ PycRef<ASTNode> CodeBuilder::build()
        and its exit `raise` renders post-loop; the tail-level emit at the return
        offset is suppressed via teoElseAbsorbSuppress. */
     std::unordered_map<int, PycRef<ASTNode> > finTryReturnRet;
-    std::unordered_set<int> finallyReturnSkip;
-    std::unordered_set<int> dupRetNoneSkip;
     std::unordered_set<int> raiseFinallyClose;
     std::unordered_set<int> loopTailFinClose;
     std::unordered_set<int> finallyEpilogueCut;
@@ -1003,7 +1015,6 @@ PycRef<ASTNode> CodeBuilder::build()
        the false-jump target offset -> the else-block end (the epilogue return-None).
        Restricted to module/class scope; at function scope the inline return-None is
        indistinguishable from a real trailing `return`. */
-    std::unordered_map<int, int> moduleElseAt;
     {
         bool topScope = code->name() != nullptr && code->name()->isEqual("<module>");
         if (!topScope) {
@@ -1120,7 +1131,6 @@ PycRef<ASTNode> CodeBuilder::build()
        `pass`. */
     std::unordered_set<int> raiseFinallyTargets;
     std::unordered_map<int, int> returnInFinallyAfter;
-    std::unordered_map<int, int> finallyExceptReturnExit;
     /* break-escape finally: the finBodyEnd offset of a coalesced finally whose body
        ends in a terminal `else: break` whose recorded end OVERSHOOTS finBodyEnd (it
        is the loop bottom-test).  At finBodyEnd we drain that terminal branch into the
@@ -4330,9 +4340,6 @@ PycRef<ASTNode> CodeBuilder::build()
         if (terminal && straight)
             forStuckExit.insert(E);
     }
-    std::unordered_set<int> classCellRet;
-    int classCellLastRet = -1;
-    int classCellMerge = -1;
     {
         PycBuffer scan(code->code()->value(), code->code()->length());
         int sop, sarg, spos = 0;
@@ -6337,7 +6344,6 @@ PycRef<ASTNode> CodeBuilder::build()
         }
     }
     std::unordered_set<int> whileTrueOpened;
-    std::unordered_map<int, int> elifPendingElse;
 
     struct MCase { bool isFirst; int matchEnd; int failTarget; int bodyStart;
                    int popExtra; std::vector<PycRef<ASTNode>> caps; };
