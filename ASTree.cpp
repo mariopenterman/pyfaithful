@@ -12877,14 +12877,7 @@ PycRef<ASTNode> CodeBuilder::build()
             handleLoad(opcode, operand);
             break;
         case Pyc::LOAD_CLOSURE_A:
-            if (mod->verCompare(3, 6) >= 0) {
-                int sv = source.pos();
-                int nop, narg, npos;
-                bc_next(source, mod, nop, narg, npos);
-                source.setPos(sv);
-                if (nop == Pyc::BUILD_TUPLE_A || nop == Pyc::LOAD_CLOSURE_A)
-                    stack.push(new ASTName(code->getCellVar(mod, operand)));
-            }
+            handleLoad(opcode, operand);
             break;
         case Pyc::LOAD_CONST_A:
             {
@@ -16271,6 +16264,18 @@ void CodeBuilder::handleLoad(int opcode, int operand)
         break;
     case Pyc::LOAD_NAME_A:
         stack.push(new ASTName(code->getName(operand)));
+        break;
+    case Pyc::LOAD_CLOSURE_A:
+        /* Only meaningful when the cell is about to be gathered into a closure
+           tuple (or chained LOAD_CLOSUREs); otherwise it is bookkeeping. */
+        if (mod->verCompare(3, 6) >= 0) {
+            int sv = source.pos();
+            int nop, narg, npos;
+            bc_next(source, mod, nop, narg, npos);
+            source.setPos(sv);
+            if (nop == Pyc::BUILD_TUPLE_A || nop == Pyc::LOAD_CLOSURE_A)
+                stack.push(new ASTName(code->getCellVar(mod, operand)));
+        }
         break;
     }
 }
