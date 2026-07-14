@@ -473,6 +473,7 @@ public:
 private:
     /* Per-opcode-group handlers lifted out of build()'s dispatch switch. */
     void handleUnaryOp(int opcode);
+    void handleBinaryOp(int opcode, int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -481,6 +482,9 @@ private:
        build() local so extracted handlers reach it as a member (unqualified
        name lookup and `[&]` capture inside build() resolve to it unchanged). */
     FastStack stack;
+    /* Set to 1 by an in-place binary op so the STORE that follows renders as an
+       augmented assignment (`x += y`) rather than `x = x + y`. */
+    int inplaceStore = 0;
 };
 
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
@@ -524,7 +528,6 @@ PycRef<ASTNode> CodeBuilder::build()
     int unpack = 0;
     std::vector<int> unpackNest;
     int unpackStar = -1;
-    int inplaceStore = 0;
     /* Simultaneous tuple assignment `t1, ..., tN = v1, ..., vN` (equal arity,
        N >= 2). CPython drops the BUILD_TUPLE/UNPACK_SEQUENCE and instead pushes
        v1..vN then stores tN..t1 — a run of N consecutive simple STOREs. Without
@@ -10459,19 +10462,6 @@ PycRef<ASTNode> CodeBuilder::build()
          * blocks before the instruction itself is handled.) */
         switch (opcode) {
         case Pyc::BINARY_OP_A:
-            {
-                ASTBinary::BinOp op = ASTBinary::from_binary_op(operand);
-                if (op == ASTBinary::BIN_INVALID)
-                    fprintf(stderr, "Unsupported `BINARY_OP` operand value: %d\n", operand);
-                PycRef<ASTNode> right = stack.top();
-                stack.pop();
-                PycRef<ASTNode> left = stack.top();
-                stack.pop();
-                if (op >= ASTBinary::BIN_IP_ADD && op < ASTBinary::BIN_INVALID)
-                    inplaceStore = 1;
-                stack.push(new ASTBinary(left, right, op));
-            }
-            break;
         case Pyc::BINARY_ADD:
         case Pyc::BINARY_AND:
         case Pyc::BINARY_DIVIDE:
@@ -10500,18 +10490,7 @@ PycRef<ASTNode> CodeBuilder::build()
         case Pyc::INPLACE_TRUE_DIVIDE:
         case Pyc::INPLACE_XOR:
         case Pyc::INPLACE_MATRIX_MULTIPLY:
-            {
-                ASTBinary::BinOp op = ASTBinary::from_opcode(opcode);
-                if (op == ASTBinary::BIN_INVALID)
-                    throw std::runtime_error("Unhandled opcode from ASTBinary::from_opcode");
-                PycRef<ASTNode> right = stack.top();
-                stack.pop();
-                PycRef<ASTNode> left = stack.top();
-                stack.pop();
-                if (op >= ASTBinary::BIN_IP_ADD && op < ASTBinary::BIN_INVALID)
-                    inplaceStore = 1;
-                stack.push(new ASTBinary(left, right, op));
-            }
+            handleBinaryOp(opcode, operand);
             break;
         case Pyc::BINARY_SUBSCR:
             {
@@ -16369,6 +16348,36 @@ void CodeBuilder::handleUnaryOp(int opcode)
         stack.push(new ASTUnary(arg, ASTUnary::UN_POSITIVE));
         break;
     }
+}
+
+/* Arithmetic/bitwise binary operators and their in-place (`x @= y`) forms: pop
+ * the right operand then the left and push an ASTBinary. Two encodings feed in:
+ *   - 3.11's single BINARY_OP whose OPERAND selects the operator
+ *     (ASTBinary::from_binary_op); an unknown operand is reported but still
+ *     builds a node so the rest of the stream stays aligned.
+ *   - the older one-opcode-per-operator forms (BINARY_ADD, INPLACE_XOR, ...)
+ *     decoded from the OPCODE (ASTBinary::from_opcode); an unknown one is fatal.
+ * When the operator is an in-place variant, inplaceStore is armed so the STORE
+ * that consumes the result renders as an augmented assignment. */
+void CodeBuilder::handleBinaryOp(int opcode, int operand)
+{
+    ASTBinary::BinOp op;
+    if (opcode == Pyc::BINARY_OP_A) {
+        op = ASTBinary::from_binary_op(operand);
+        if (op == ASTBinary::BIN_INVALID)
+            fprintf(stderr, "Unsupported `BINARY_OP` operand value: %d\n", operand);
+    } else {
+        op = ASTBinary::from_opcode(opcode);
+        if (op == ASTBinary::BIN_INVALID)
+            throw std::runtime_error("Unhandled opcode from ASTBinary::from_opcode");
+    }
+    PycRef<ASTNode> right = stack.top();
+    stack.pop();
+    PycRef<ASTNode> left = stack.top();
+    stack.pop();
+    if (op >= ASTBinary::BIN_IP_ADD && op < ASTBinary::BIN_INVALID)
+        inplaceStore = 1;
+    stack.push(new ASTBinary(left, right, op));
 }
 
 static void append_to_chain_store(const PycRef<ASTNode> &chainStore,
