@@ -483,6 +483,7 @@ private:
     void handleStackManip(int opcode, int operand);
     void handleCollectionUpdate(int opcode);
     void handlePrint(int opcode);
+    void handleImport(int opcode, int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -11264,33 +11265,9 @@ PycRef<ASTNode> CodeBuilder::build()
             /* We just entirely ignore this */
             break;
         case Pyc::IMPORT_NAME_A:
-            if (mod->majorVer() == 1) {
-                stack.push(new ASTImport(new ASTName(code->getName(operand)), NULL));
-            } else {
-                PycRef<ASTNode> fromlist = stack.top();
-                stack.pop();
-                int level = 0;
-                if (mod->verCompare(2, 5) >= 0) {
-                    PycRef<ASTNode> levelnode = stack.top();
-                    stack.pop();
-                    if (levelnode.type() == ASTNode::NODE_OBJECT) {
-                        PycRef<PycObject> obj = levelnode.cast<ASTObject>()->object();
-                        if (obj->type() == PycObject::TYPE_INT)
-                            level = obj.cast<PycInt>()->value();
-                    }
-                }
-                stack.push(new ASTImport(new ASTName(code->getName(operand)), fromlist, level));
-            }
-            break;
         case Pyc::IMPORT_FROM_A:
-            stack.push(new ASTName(code->getName(operand)));
-            break;
         case Pyc::IMPORT_STAR:
-            {
-                PycRef<ASTNode> import = stack.top();
-                stack.pop();
-                curblock->append(new ASTStore(import, NULL));
-            }
+            handleImport(opcode, operand);
             break;
         case Pyc::IS_OP_A:
             handleIsContainsOp(opcode, operand);
@@ -16600,6 +16577,50 @@ void CodeBuilder::handlePrint(int opcode)
             stack.pop();
             if (stream)
                 stream->setProcessed();
+        }
+        break;
+    }
+}
+
+/* The import opcodes.
+ *   IMPORT_NAME  -> build an ASTImport for `import module`. In Python 1 the
+ *       name is the whole statement; from Python 2 on it pops the from-list
+ *       (the names in `from module import a, b`) and, from 2.5, a relative
+ *       import level, and carries both on the node.
+ *   IMPORT_FROM  -> push the named attribute being pulled out of the module
+ *       that IMPORT_NAME left on the stack (one per imported name).
+ *   IMPORT_STAR  -> `from module import *`: emit a store of the module with no
+ *       target, which renders as the star import. */
+void CodeBuilder::handleImport(int opcode, int operand)
+{
+    switch (opcode) {
+    case Pyc::IMPORT_NAME_A:
+        if (mod->majorVer() == 1) {
+            stack.push(new ASTImport(new ASTName(code->getName(operand)), NULL));
+        } else {
+            PycRef<ASTNode> fromlist = stack.top();
+            stack.pop();
+            int level = 0;
+            if (mod->verCompare(2, 5) >= 0) {
+                PycRef<ASTNode> levelnode = stack.top();
+                stack.pop();
+                if (levelnode.type() == ASTNode::NODE_OBJECT) {
+                    PycRef<PycObject> obj = levelnode.cast<ASTObject>()->object();
+                    if (obj->type() == PycObject::TYPE_INT)
+                        level = obj.cast<PycInt>()->value();
+                }
+            }
+            stack.push(new ASTImport(new ASTName(code->getName(operand)), fromlist, level));
+        }
+        break;
+    case Pyc::IMPORT_FROM_A:
+        stack.push(new ASTName(code->getName(operand)));
+        break;
+    case Pyc::IMPORT_STAR:
+        {
+            PycRef<ASTNode> import = stack.top();
+            stack.pop();
+            curblock->append(new ASTStore(import, NULL));
         }
         break;
     }
