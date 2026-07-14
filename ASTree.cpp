@@ -492,6 +492,7 @@ private:
     void tupleStoreStep(PycRef<ASTNode> tname);
     /* Returns false to signal a bail-out (the caller returns the partial tree). */
     bool handleStore(int opcode, int operand);
+    void handleUnpack(int opcode, int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -14664,43 +14665,8 @@ PycRef<ASTNode> CodeBuilder::build()
         case Pyc::UNPACK_LIST_A:
         case Pyc::UNPACK_TUPLE_A:
         case Pyc::UNPACK_SEQUENCE_A:
-            {
-                if (unpack > 0 && operand > 0)
-                    unpackNest.push_back(unpack);
-                unpack = operand;
-                unpackStar = -1;
-                if (unpack > 0) {
-                    ASTTuple::value_t vals;
-                    stack.push(new ASTTuple(vals));
-                } else {
-                    // Unpack zero values and assign it to top of stack or for loop variable.
-                    // E.g. [] = TOS / for [] in X
-                    ASTTuple::value_t vals;
-                    auto tup = new ASTTuple(vals);
-                    if (curblock->blktype() == ASTBlock::BLK_FOR
-                        && !curblock->inited()) {
-                        tup->setRequireParens(true);
-                        curblock.cast<ASTIterBlock>()->setIndex(tup);
-                    } else if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
-                        auto chainStore = stack.top();
-                        stack.pop();
-                        append_to_chain_store(chainStore, tup, stack, curblock);
-                    } else {
-                        curblock->append(new ASTStore(stack.top(), tup));
-                        stack.pop();
-                    }
-                }
-            }
-            break;
         case Pyc::UNPACK_EX_A:
-            {
-                int countBefore = operand & 0xFF;
-                int countAfter = (operand >> 8) & 0xFF;
-                unpack = countBefore + 1 + countAfter;
-                unpackStar = countAfter + 1;
-                ASTTuple::value_t vals;
-                stack.push(new ASTTuple(vals));
-            }
+            handleUnpack(opcode, operand);
             break;
         case Pyc::MATCH_CLASS_A:
             {
@@ -15632,6 +15598,61 @@ bool CodeBuilder::handleStore(int opcode, int operand)
             break;
     }
     return true;
+}
+
+/* Open a sequence-unpacking target (`a, b, *c = ...` or a for/with target).
+ * UNPACK_SEQUENCE/LIST/TUPLE set `unpack` to the element count and push an empty
+ * tuple that the following stores fill; a nested unpack first saves the outer
+ * count on unpackNest. Unpacking zero elements has no stores to follow, so the
+ * empty `()`/`[]` target is wired up immediately (for-target, chained store, or
+ * a plain store). UNPACK_EX (`a, *b, c = ...`) splits the operand into the
+ * before/after counts, records the starred position in unpackStar, and pushes
+ * the accumulator tuple. */
+void CodeBuilder::handleUnpack(int opcode, int operand)
+{
+    switch (opcode) {
+    case Pyc::UNPACK_LIST_A:
+    case Pyc::UNPACK_TUPLE_A:
+    case Pyc::UNPACK_SEQUENCE_A:
+        {
+            if (unpack > 0 && operand > 0)
+                unpackNest.push_back(unpack);
+            unpack = operand;
+            unpackStar = -1;
+            if (unpack > 0) {
+                ASTTuple::value_t vals;
+                stack.push(new ASTTuple(vals));
+            } else {
+                // Unpack zero values and assign it to top of stack or for loop variable.
+                // E.g. [] = TOS / for [] in X
+                ASTTuple::value_t vals;
+                auto tup = new ASTTuple(vals);
+                if (curblock->blktype() == ASTBlock::BLK_FOR
+                    && !curblock->inited()) {
+                    tup->setRequireParens(true);
+                    curblock.cast<ASTIterBlock>()->setIndex(tup);
+                } else if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
+                    auto chainStore = stack.top();
+                    stack.pop();
+                    append_to_chain_store(chainStore, tup, stack, curblock);
+                } else {
+                    curblock->append(new ASTStore(stack.top(), tup));
+                    stack.pop();
+                }
+            }
+        }
+        break;
+    case Pyc::UNPACK_EX_A:
+        {
+            int countBefore = operand & 0xFF;
+            int countAfter = (operand >> 8) & 0xFF;
+            unpack = countBefore + 1 + countAfter;
+            unpackStar = countAfter + 1;
+            ASTTuple::value_t vals;
+            stack.push(new ASTTuple(vals));
+        }
+        break;
+    }
 }
 
 /* The UNARY_* opcodes each pop one operand and push one result node.
