@@ -485,6 +485,7 @@ private:
     void handlePrint(int opcode);
     void handleImport(int opcode, int operand);
     void handleExprWrap(int opcode, int operand);
+    void handleRaiseVarargs(int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -493,6 +494,10 @@ private:
        build() local so extracted handlers reach it as a member (unqualified
        name lookup and `[&]` capture inside build() resolve to it unchanged). */
     FastStack stack;
+    /* Saved operand-stack snapshots: a copy of `stack` is pushed when a block
+       that may consume a fresh stack opens, and restored when a branch/handler
+       unwinds back out of it. */
+    stackhist_t stack_hist;
     /* Set to 1 by an in-place binary op so the STORE that follows renders as an
        augmented assignment (`x += y`) rather than `x = x + y`. */
     int inplaceStore = 0;
@@ -535,8 +540,6 @@ PycRef<ASTNode> CodeBuilder::build()
         }
         return p == to;
     };
-
-    stackhist_t stack_hist;
 
     defblock = new ASTBlock(ASTBlock::BLK_MAIN);
     defblock->init();
@@ -14088,28 +14091,7 @@ PycRef<ASTNode> CodeBuilder::build()
             handlePrint(opcode);
             break;
         case Pyc::RAISE_VARARGS_A:
-            {
-                ASTRaise::param_t paramList;
-                for (int i = 0; i < operand; i++) {
-                    paramList.push_front(stack.top());
-                    stack.pop();
-                }
-                curblock->append(new ASTRaise(paramList));
-
-                if ((curblock->blktype() == ASTBlock::BLK_IF
-                        || curblock->blktype() == ASTBlock::BLK_ELSE)
-                        && stack_hist.size()
-                        && blocks.size() > 1
-                        && (mod->verCompare(2, 6) >= 0)) {
-                    stack = stack_hist.top();
-                    stack_hist.pop();
-
-                    PycRef<ASTBlock> prev = curblock;
-                    blocks.pop();
-                    curblock = blocks.top();
-                    curblock->append(prev.cast<ASTNode>());
-                }
-            }
+            handleRaiseVarargs(operand);
             break;
         case Pyc::RERAISE:
         case Pyc::RERAISE_A:
@@ -16642,6 +16624,36 @@ void CodeBuilder::handleExprWrap(int opcode, int operand)
             stack.push(new ASTAwaitable(object, implicitAwait));
         }
         break;
+    }
+}
+
+/* RAISE_VARARGS -> a `raise` statement. Pop the (0..3) operands the compiler
+ * pushed (exception, cause) and append an ASTRaise. When the raise is the only
+ * thing in an if/else branch that was opened with a saved stack (Python >= 2.6),
+ * close that branch here: restore the saved stack and fold the finished block
+ * into its parent, so the branch does not stay open waiting for a merge that a
+ * raise never reaches. */
+void CodeBuilder::handleRaiseVarargs(int operand)
+{
+    ASTRaise::param_t paramList;
+    for (int i = 0; i < operand; i++) {
+        paramList.push_front(stack.top());
+        stack.pop();
+    }
+    curblock->append(new ASTRaise(paramList));
+
+    if ((curblock->blktype() == ASTBlock::BLK_IF
+            || curblock->blktype() == ASTBlock::BLK_ELSE)
+            && stack_hist.size()
+            && blocks.size() > 1
+            && (mod->verCompare(2, 6) >= 0)) {
+        stack = stack_hist.top();
+        stack_hist.pop();
+
+        PycRef<ASTBlock> prev = curblock;
+        blocks.pop();
+        curblock = blocks.top();
+        curblock->append(prev.cast<ASTNode>());
     }
 }
 
