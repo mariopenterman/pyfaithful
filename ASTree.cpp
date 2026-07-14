@@ -520,6 +520,7 @@ private:
     void handleBuildClassFunc(int opcode);
     void handleEndFinally();
     void handleSwap(int operand);
+    void handleCopy(int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -13527,37 +13528,7 @@ PycRef<ASTNode> CodeBuilder::build()
             }
             break;
         case Pyc::COPY_A:
-            {
-                if (operand == 1 && chainCopyOffsets.count(curpos)) {
-                    if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
-                        auto chainstore = stack.top();
-                        stack.pop();
-                        stack.push(stack.top());
-                        stack.push(chainstore);
-                    } else {
-                        /* Open a new chained-assignment target list. The
-                           duplicated value doubles as the completion sentinel:
-                           append_to_chain_store stops when the stack top is
-                           TYPE_NULL. A `None` value is pushed as a NULL ref (see
-                           LOAD_CONST), which would trip that sentinel and split
-                           `a = b = None` into separate statements. Since
-                           chainCopyOffsets has confirmed this is a chained
-                           assign, replace the NULL with an explicit None node
-                           (renders as `None`, sentinel-safe). */
-                        if (stack.top() == nullptr) {
-                            stack.pop();
-                            stack.push(new ASTObject(Pyc_None));
-                        }
-                        stack.push(stack.top());
-                        ASTNodeList::list_t targets;
-                        stack.push(new ASTChainStore(targets, stack.top()));
-                    }
-                } else if (operand == 1 && walrusCopies.count(curpos)) {
-                } else {
-                    PycRef<ASTNode> value = stack.top(operand);
-                    stack.push(value);
-                }
-            }
+            handleCopy(operand);
             break;
         default:
             fprintf(stderr, "Unsupported opcode: %s (%d)\n", Pyc::OpcodeName(opcode), opcode);
@@ -14994,6 +14965,44 @@ void CodeBuilder::handleSwap(int operand)
     next_tup->setRequireParens(false);
     stack.push(tup);
     stack.push(next_tup);
+}
+
+/* COPY duplicates the operand-th stack entry. At a recorded chained-assignment
+ * offset (COPY 1) it opens or continues an ASTChainStore target list (turning a
+ * duplicated None into an explicit None so it does not trip the chain-store
+ * completion sentinel); at a walrus copy offset it is a no-op the STORE
+ * consumes; otherwise it pushes a plain duplicate of the operand-th entry. */
+void CodeBuilder::handleCopy(int operand)
+{
+    if (operand == 1 && chainCopyOffsets.count(curpos)) {
+        if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
+            auto chainstore = stack.top();
+            stack.pop();
+            stack.push(stack.top());
+            stack.push(chainstore);
+        } else {
+            /* Open a new chained-assignment target list. The
+               duplicated value doubles as the completion sentinel:
+               append_to_chain_store stops when the stack top is
+               TYPE_NULL. A `None` value is pushed as a NULL ref (see
+               LOAD_CONST), which would trip that sentinel and split
+               `a = b = None` into separate statements. Since
+               chainCopyOffsets has confirmed this is a chained
+               assign, replace the NULL with an explicit None node
+               (renders as `None`, sentinel-safe). */
+            if (stack.top() == nullptr) {
+                stack.pop();
+                stack.push(new ASTObject(Pyc_None));
+            }
+            stack.push(stack.top());
+            ASTNodeList::list_t targets;
+            stack.push(new ASTChainStore(targets, stack.top()));
+        }
+    } else if (operand == 1 && walrusCopies.count(curpos)) {
+    } else {
+        PycRef<ASTNode> value = stack.top(operand);
+        stack.push(value);
+    }
 }
 
 /* The `with`-statement setup opcodes.
