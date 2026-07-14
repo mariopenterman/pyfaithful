@@ -475,6 +475,8 @@ private:
     /* A loop's [start, end) byte range and its exit offset (a continue records
        exit = the offset just past the loop). */
     struct LoopRange { int start; int end; int exit; };
+    /* An async-for's loop top, the store offset for its target, and its end. */
+    struct AsyncForRec { int loopTop, storeAt, loopEnd; };
 
     /* Per-opcode-group handlers lifted out of build()'s dispatch switch. */
     void handleUnaryOp(int opcode);
@@ -507,6 +509,7 @@ private:
     void handleForIter(int opcode, int operand);
     bool handleSend();
     void handleJumpAbsolute();
+    void handleGetAIter();
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -608,6 +611,8 @@ private:
     std::vector<std::pair<int,int>> fwdJumps;
     std::unordered_map<int, int> backedgeCount;
     bool recoverThisExcept = false;
+    /* Prescan info for `async for` loops, keyed by the GET_AITER offset. */
+    std::unordered_map<int, AsyncForRec> asyncForInfo;
     /* Prescan-collected [start,end,exit) ranges of every loop, and a map from a
        FOR_ITER offset to an early loop-close offset when the loop body ends
        before the recorded block end. */
@@ -4678,8 +4683,6 @@ PycRef<ASTNode> CodeBuilder::build()
     std::unordered_map<int, int> withExitSkip;
     std::unordered_set<int> withHandlerTargets;
     std::unordered_set<int> asyncWithBody;
-    struct AsyncForRec { int loopTop, storeAt, loopEnd; };
-    std::unordered_map<int, AsyncForRec> asyncForInfo;
     if (mod->verCompare(3, 11) >= 0) {
         const auto* buf = code->code()->value();
         int len = (int)code->code()->length();
@@ -11103,32 +11106,7 @@ PycRef<ASTNode> CodeBuilder::build()
             handleForIter(opcode, operand);
             break;
         case Pyc::GET_AITER:
-            {
-                // Logic similar to FOR_ITER_A
-                PycRef<ASTNode> iter = stack.top(); // Iterable
-                stack.pop();
-
-                PycRef<ASTBlock> top = blocks.top();
-                auto afi = asyncForInfo.find(curpos);
-                if (afi != asyncForInfo.end()) {
-                    const AsyncForRec& r = afi->second;
-                    PycRef<ASTIterBlock> forblk = new ASTIterBlock(
-                            ASTBlock::BLK_ASYNCFOR, r.loopTop, r.loopEnd, iter);
-                    blocks.push(forblk.cast<ASTBlock>());
-                    curblock = blocks.top();
-                    stack.push(nullptr);
-                    source.setPos(r.storeAt);
-                    pos = r.storeAt;
-                } else if (top->blktype() == ASTBlock::BLK_WHILE) {
-                    blocks.pop();
-                    PycRef<ASTIterBlock> forblk = new ASTIterBlock(ASTBlock::BLK_ASYNCFOR, curpos, top->end(), iter);
-                    blocks.push(forblk.cast<ASTBlock>());
-                    curblock = blocks.top();
-                    stack.push(nullptr);
-                } else {
-                     fprintf(stderr, "Unsupported use of GET_AITER outside of SETUP_LOOP\n");
-                }
-            }
+            handleGetAIter();
             break;
         case Pyc::GET_ANEXT:
             break;
@@ -15487,6 +15465,39 @@ bool CodeBuilder::handleSend()
             Pyc::OpcodeName(opcode), opcode);
     cleanBuild = false;
     return false;
+}
+
+/* GET_AITER opens an `async for` loop (the async analogue of FOR_ITER). Using
+ * the prescan async-for record for this offset it pushes a BLK_ASYNCFOR over
+ * the loop range and jumps to the target store; failing that it falls back to
+ * an enclosing SETUP_LOOP while block. The iterator is replaced with a NULL
+ * placeholder like FOR_ITER. */
+void CodeBuilder::handleGetAIter()
+{
+    // Logic similar to FOR_ITER_A
+    PycRef<ASTNode> iter = stack.top(); // Iterable
+    stack.pop();
+
+    PycRef<ASTBlock> top = blocks.top();
+    auto afi = asyncForInfo.find(curpos);
+    if (afi != asyncForInfo.end()) {
+        const AsyncForRec& r = afi->second;
+        PycRef<ASTIterBlock> forblk = new ASTIterBlock(
+                ASTBlock::BLK_ASYNCFOR, r.loopTop, r.loopEnd, iter);
+        blocks.push(forblk.cast<ASTBlock>());
+        curblock = blocks.top();
+        stack.push(nullptr);
+        source.setPos(r.storeAt);
+        pos = r.storeAt;
+    } else if (top->blktype() == ASTBlock::BLK_WHILE) {
+        blocks.pop();
+        PycRef<ASTIterBlock> forblk = new ASTIterBlock(ASTBlock::BLK_ASYNCFOR, curpos, top->end(), iter);
+        blocks.push(forblk.cast<ASTBlock>());
+        curblock = blocks.top();
+        stack.push(nullptr);
+    } else {
+         fprintf(stderr, "Unsupported use of GET_AITER outside of SETUP_LOOP\n");
+    }
 }
 
 /* The backward/absolute jumps -- loop back-edges and the compiler's branch
