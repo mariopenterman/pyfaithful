@@ -510,6 +510,7 @@ private:
     bool handleSend();
     void handleJumpAbsolute();
     void handleGetAIter();
+    void handleReturnConst(int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -13923,10 +13924,7 @@ PycRef<ASTNode> CodeBuilder::build()
             break;
         case Pyc::RETURN_CONST_A:
         case Pyc::INSTRUMENTED_RETURN_CONST_A:
-            {
-                PycRef<ASTObject> value = new ASTObject(code->getConst(operand));
-                curblock->append(new ASTReturn(value.cast<ASTNode>()));
-            }
+            handleReturnConst(operand);
             break;
         case Pyc::ROT_TWO:
         case Pyc::ROT_THREE:
@@ -15504,6 +15502,14 @@ void CodeBuilder::handleGetAIter()
     } else {
          fprintf(stderr, "Unsupported use of GET_AITER outside of SETUP_LOOP\n");
     }
+}
+
+/* RETURN_CONST (3.12+) returns a constant directly, without a preceding
+ * LOAD_CONST: append `return <const>`. */
+void CodeBuilder::handleReturnConst(int operand)
+{
+    PycRef<ASTObject> value = new ASTObject(code->getConst(operand));
+    curblock->append(new ASTReturn(value.cast<ASTNode>()));
 }
 
 /* The backward/absolute jumps -- loop back-edges and the compiler's branch
