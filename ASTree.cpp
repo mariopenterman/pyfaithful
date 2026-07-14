@@ -467,7 +467,8 @@ class CodeBuilder {
 public:
     CodeBuilder(PycRef<PycCode> code, PycModule* mod)
         : code(code), mod(mod),
-          stack((mod->majorVer() == 1) ? 20 : code->stackSize()) {}
+          stack((mod->majorVer() == 1) ? 20 : code->stackSize()),
+          source(code->code()->value(), code->code()->length()) {}
     PycRef<ASTNode> build();
 
 private:
@@ -501,6 +502,12 @@ private:
        build() local so extracted handlers reach it as a member (unqualified
        name lookup and `[&]` capture inside build() resolve to it unchanged). */
     FastStack stack;
+    /* The instruction stream being decoded, and the byte offset (pos) of the
+       NEXT instruction to read; bc_next advances both. curpos (above) is the
+       offset of the instruction currently being dispatched. Control-flow
+       reconstruction rewinds/advances `source`+`pos` to re-read or skip ahead. */
+    PycBuffer source;
+    int pos = 0;
     /* Saved operand-stack snapshots: a copy of `stack` is pushed when a block
        that may consume a fresh stack opens, and restored when a branch/handler
        unwinds back out of it. */
@@ -557,7 +564,6 @@ PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
 
 PycRef<ASTNode> CodeBuilder::build()
 {
-    PycBuffer source(code->code()->value(), code->code()->length());
 
     /* True when the byte range [from, to) contains nothing but NOP/CACHE
        padding — i.e. `to` is the same logical landing as `from` once the
@@ -583,7 +589,6 @@ PycRef<ASTNode> CodeBuilder::build()
     blocks.push(defblock);
 
     int opcode, operand;
-    int pos = 0;
     struct BoolShortCircuit { PycRef<ASTNode> left; bool isOr; int target; int off; };
     std::vector<BoolShortCircuit> boolPending;
     bool else_pop = false;
