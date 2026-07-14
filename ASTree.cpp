@@ -484,6 +484,7 @@ private:
     void handleCollectionUpdate(int opcode);
     void handlePrint(int opcode);
     void handleImport(int opcode, int operand);
+    void handleExprWrap(int opcode, int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -11194,27 +11195,9 @@ PycRef<ASTNode> CodeBuilder::build()
         case Pyc::END_ASYNC_FOR:
             break;
         case Pyc::FORMAT_VALUE_A:
-            {
-                auto conversion_flag = static_cast<ASTFormattedValue::ConversionFlag>(operand);
-                PycRef<ASTNode> format_spec = nullptr;
-                if (conversion_flag & ASTFormattedValue::HAVE_FMT_SPEC) {
-                    format_spec = stack.top();
-                    stack.pop();
-                }
-                auto val = stack.top();
-                stack.pop();
-                stack.push(new ASTFormattedValue(val, conversion_flag, format_spec));
-            }
-            break;
         case Pyc::GET_AWAITABLE:
         case Pyc::GET_AWAITABLE_A:
-            {
-                PycRef<ASTNode> object = stack.top();
-                stack.pop();
-                bool implicitAwait = (object != nullptr
-                        && object.type() == ASTNode::NODE_COMPREHENSION);
-                stack.push(new ASTAwaitable(object, implicitAwait));
-            }
+            handleExprWrap(opcode, operand);
             break;
         case Pyc::SEND_A:
             {
@@ -16621,6 +16604,42 @@ void CodeBuilder::handleImport(int opcode, int operand)
             PycRef<ASTNode> import = stack.top();
             stack.pop();
             curblock->append(new ASTStore(import, NULL));
+        }
+        break;
+    }
+}
+
+/* Single-operand expression wrappers that replace TOS with a specialised node.
+ *   FORMAT_VALUE  -> one `{value!conv:spec}` piece of an f-string. The operand
+ *       carries the conversion flag (str/repr/ascii) and whether a format spec
+ *       was pushed just below the value.
+ *   GET_AWAITABLE -> the target of an `await`. A comprehension operand marks an
+ *       implicit await (an async comprehension), which renders without the
+ *       explicit `await` keyword. */
+void CodeBuilder::handleExprWrap(int opcode, int operand)
+{
+    switch (opcode) {
+    case Pyc::FORMAT_VALUE_A:
+        {
+            auto conversion_flag = static_cast<ASTFormattedValue::ConversionFlag>(operand);
+            PycRef<ASTNode> format_spec = nullptr;
+            if (conversion_flag & ASTFormattedValue::HAVE_FMT_SPEC) {
+                format_spec = stack.top();
+                stack.pop();
+            }
+            auto val = stack.top();
+            stack.pop();
+            stack.push(new ASTFormattedValue(val, conversion_flag, format_spec));
+        }
+        break;
+    case Pyc::GET_AWAITABLE:
+    case Pyc::GET_AWAITABLE_A:
+        {
+            PycRef<ASTNode> object = stack.top();
+            stack.pop();
+            bool implicitAwait = (object != nullptr
+                    && object.type() == ASTNode::NODE_COMPREHENSION);
+            stack.push(new ASTAwaitable(object, implicitAwait));
         }
         break;
     }
