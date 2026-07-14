@@ -512,6 +512,22 @@ private:
     std::stack<PycRef<ASTBlock> > blocks;
     PycRef<ASTBlock> defblock;
     PycRef<ASTBlock> curblock;
+    /* Sequence unpacking (`a, b, *c = ...`): unpack counts the remaining targets
+       of the active UNPACK_SEQUENCE/EX; unpackNest holds the outer counts while a
+       nested tuple target is filled; unpackStar is the target index of a starred
+       element, or -1 when there is none. */
+    int unpack = 0;
+    std::vector<int> unpackNest;
+    int unpackStar = -1;
+    /* Simultaneous tuple assignment `t1, ..., tN = v1, ..., vN` (equal arity,
+       N >= 2). CPython drops the BUILD_TUPLE/UNPACK_SEQUENCE and instead pushes
+       v1..vN then stores tN..t1 — a run of N consecutive simple STOREs. Without
+       this, each store renders as its own statement, reordering the bytecode.
+       tupleStore counts the remaining stores of the active run; the
+       target/value nodes accumulate in reverse (bytecode/pop) order. */
+    int tupleStore = 0;
+    std::vector<PycRef<ASTNode> > tupleStoreTargets;
+    std::vector<PycRef<ASTNode> > tupleStoreValues;
 };
 
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
@@ -549,18 +565,6 @@ PycRef<ASTNode> CodeBuilder::build()
     int opcode, operand;
     int curpos = 0;
     int pos = 0;
-    int unpack = 0;
-    std::vector<int> unpackNest;
-    int unpackStar = -1;
-    /* Simultaneous tuple assignment `t1, ..., tN = v1, ..., vN` (equal arity,
-       N >= 2). CPython drops the BUILD_TUPLE/UNPACK_SEQUENCE and instead pushes
-       v1..vN then stores tN..t1 — a run of N consecutive simple STOREs. Without
-       this, each store renders as its own statement, reordering the bytecode.
-       tupleStore counts the remaining stores of the active run; the
-       target/value nodes accumulate in reverse (bytecode/pop) order. */
-    int tupleStore = 0;
-    std::vector<PycRef<ASTNode> > tupleStoreTargets;
-    std::vector<PycRef<ASTNode> > tupleStoreValues;
     struct BoolShortCircuit { PycRef<ASTNode> left; bool isOr; int target; int off; };
     std::vector<BoolShortCircuit> boolPending;
     bool else_pop = false;
