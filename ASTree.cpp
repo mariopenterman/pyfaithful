@@ -475,6 +475,7 @@ private:
     void handleUnaryOp(int opcode);
     void handleBinaryOp(int opcode, int operand);
     void handleIsContainsOp(int opcode, int operand);
+    void handleBuildCollection(int opcode, int operand);
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -10527,64 +10528,10 @@ PycRef<ASTNode> CodeBuilder::build()
             }
             break;
         case Pyc::BUILD_LIST_A:
-            {
-                ASTList::value_t values;
-                for (int i=0; i<operand; i++) {
-                    values.push_front(stack.top());
-                    stack.pop();
-                }
-                stack.push(new ASTList(values));
-            }
-            break;
         case Pyc::BUILD_SET_A:
-            {
-                ASTSet::value_t values;
-                for (int i=0; i<operand; i++) {
-                    values.push_front(stack.top());
-                    stack.pop();
-                }
-                stack.push(new ASTSet(values));
-            }
-            break;
         case Pyc::BUILD_MAP_A:
-            if (mod->verCompare(3, 5) >= 0) {
-                auto map = new ASTMap;
-                std::vector<std::pair<PycRef<ASTNode>, PycRef<ASTNode> > > pairs;
-                pairs.reserve(operand);
-                for (int i=0; i<operand; ++i) {
-                    PycRef<ASTNode> value = stack.top();
-                    stack.pop();
-                    PycRef<ASTNode> key = stack.top();
-                    stack.pop();
-                    pairs.push_back(std::make_pair(key, value));
-                }
-                for (auto it = pairs.rbegin(); it != pairs.rend(); ++it)
-                    map->add(it->first, it->second);
-                stack.push(map);
-            } else {
-                if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
-                    stack.pop();
-                }
-                stack.push(new ASTMap());
-            }
-            break;
         case Pyc::BUILD_CONST_KEY_MAP_A:
-            // Top of stack will be a tuple of keys.
-            // Values will start at TOS - 1.
-            {
-                PycRef<ASTNode> keys = stack.top();
-                stack.pop();
-
-                ASTConstMap::values_t values;
-                values.reserve(operand);
-                for (int i = 0; i < operand; ++i) {
-                    PycRef<ASTNode> value = stack.top();
-                    stack.pop();
-                    values.push_back(value);
-                }
-
-                stack.push(new ASTConstMap(keys, values));
-            }
+            handleBuildCollection(opcode, operand);
             break;
         case Pyc::STORE_MAP:
             {
@@ -10597,106 +10544,11 @@ PycRef<ASTNode> CodeBuilder::build()
             }
             break;
         case Pyc::BUILD_SLICE_A:
-            {
-                if (operand == 2) {
-                    PycRef<ASTNode> end = stack.top();
-                    stack.pop();
-                    PycRef<ASTNode> start = stack.top();
-                    stack.pop();
-
-                    if (start.type() == ASTNode::NODE_OBJECT
-                            && start.cast<ASTObject>()->object() == Pyc_None) {
-                        start = NULL;
-                    }
-
-                    if (end.type() == ASTNode::NODE_OBJECT
-                            && end.cast<ASTObject>()->object() == Pyc_None) {
-                        end = NULL;
-                    }
-
-                    if (start == NULL && end == NULL) {
-                        stack.push(new ASTSlice(ASTSlice::SLICE0));
-                    } else if (start == NULL) {
-                        stack.push(new ASTSlice(ASTSlice::SLICE2, start, end));
-                    } else if (end == NULL) {
-                        stack.push(new ASTSlice(ASTSlice::SLICE1, start, end));
-                    } else {
-                        stack.push(new ASTSlice(ASTSlice::SLICE3, start, end));
-                    }
-                } else if (operand == 3) {
-                    PycRef<ASTNode> step = stack.top();
-                    stack.pop();
-                    PycRef<ASTNode> end = stack.top();
-                    stack.pop();
-                    PycRef<ASTNode> start = stack.top();
-                    stack.pop();
-
-                    if (start.type() == ASTNode::NODE_OBJECT
-                            && start.cast<ASTObject>()->object() == Pyc_None) {
-                        start = NULL;
-                    }
-
-                    if (end.type() == ASTNode::NODE_OBJECT
-                            && end.cast<ASTObject>()->object() == Pyc_None) {
-                        end = NULL;
-                    }
-
-                    if (step.type() == ASTNode::NODE_OBJECT
-                            && step.cast<ASTObject>()->object() == Pyc_None) {
-                        step = NULL;
-                    }
-
-                    /* We have to do this as a slice where one side is another slice */
-                    /* [[a:b]:c] */
-
-                    if (start == NULL && end == NULL) {
-                        stack.push(new ASTSlice(ASTSlice::SLICE0));
-                    } else if (start == NULL) {
-                        stack.push(new ASTSlice(ASTSlice::SLICE2, start, end));
-                    } else if (end == NULL) {
-                        stack.push(new ASTSlice(ASTSlice::SLICE1, start, end));
-                    } else {
-                        stack.push(new ASTSlice(ASTSlice::SLICE3, start, end));
-                    }
-
-                    PycRef<ASTNode> lhs = stack.top();
-                    stack.pop();
-
-                    if (step == NULL) {
-                        stack.push(new ASTSlice(ASTSlice::SLICE1, lhs, step));
-                    } else {
-                        stack.push(new ASTSlice(ASTSlice::SLICE3, lhs, step));
-                    }
-                }
-            }
+            handleBuildCollection(opcode, operand);
             break;
         case Pyc::BUILD_STRING_A:
-            {
-                // Nearly identical logic to BUILD_LIST
-                ASTList::value_t values;
-                for (int i = 0; i < operand; i++) {
-                    values.push_front(stack.top());
-                    stack.pop();
-                }
-                stack.push(new ASTJoinedStr(values));
-            }
-            break;
         case Pyc::BUILD_TUPLE_A:
-            {
-                // if class is a closure code, ignore this tuple
-                PycRef<ASTNode> tos = stack.top();
-                if (tos && tos->type() == ASTNode::NODE_LOADBUILDCLASS) {
-                    break;
-                }
-
-                ASTTuple::value_t values;
-                values.resize(operand);
-                for (int i=0; i<operand; i++) {
-                    values[operand-i-1] = stack.top();
-                    stack.pop();
-                }
-                stack.push(new ASTTuple(values));
-            }
+            handleBuildCollection(opcode, operand);
             break;
         case Pyc::KW_NAMES_A:
             {
@@ -16376,6 +16228,188 @@ void CodeBuilder::handleIsContainsOp(int opcode, int operand)
         stack.push(new ASTCompare(left, right, cmpop));
     }
     chainCmp = 0;
+}
+
+/* The collection/display builders. Each pops the operand-count elements the
+ * compiler pushed (in reverse, so they are un-reversed here) and pushes one
+ * container node:
+ *   BUILD_LIST/SET/TUPLE  -> [..] / {..} / (..)  (BUILD_TUPLE ignores the
+ *                            __build_class__ helper tuple so a class definition
+ *                            renders as a class, not a tuple literal).
+ *   BUILD_STRING          -> an f-string (ASTJoinedStr), same shape as a list.
+ *   BUILD_MAP             -> a dict; pre-3.5 the pairs arrive later via
+ *                            STORE_MAP, so only an empty ASTMap is pushed here.
+ *   BUILD_CONST_KEY_MAP   -> a dict whose keys are a single constant tuple on
+ *                            top with the values beneath it.
+ *   BUILD_SLICE           -> a subscript slice (start:end[:step]); a None bound
+ *                            becomes an omitted slice field, and the 3-arg form
+ *                            nests a [a:b] slice inside a [..:step] slice. */
+void CodeBuilder::handleBuildCollection(int opcode, int operand)
+{
+    switch (opcode) {
+    case Pyc::BUILD_LIST_A:
+        {
+            ASTList::value_t values;
+            for (int i=0; i<operand; i++) {
+                values.push_front(stack.top());
+                stack.pop();
+            }
+            stack.push(new ASTList(values));
+        }
+        break;
+    case Pyc::BUILD_SET_A:
+        {
+            ASTSet::value_t values;
+            for (int i=0; i<operand; i++) {
+                values.push_front(stack.top());
+                stack.pop();
+            }
+            stack.push(new ASTSet(values));
+        }
+        break;
+    case Pyc::BUILD_MAP_A:
+        if (mod->verCompare(3, 5) >= 0) {
+            auto map = new ASTMap;
+            std::vector<std::pair<PycRef<ASTNode>, PycRef<ASTNode> > > pairs;
+            pairs.reserve(operand);
+            for (int i=0; i<operand; ++i) {
+                PycRef<ASTNode> value = stack.top();
+                stack.pop();
+                PycRef<ASTNode> key = stack.top();
+                stack.pop();
+                pairs.push_back(std::make_pair(key, value));
+            }
+            for (auto it = pairs.rbegin(); it != pairs.rend(); ++it)
+                map->add(it->first, it->second);
+            stack.push(map);
+        } else {
+            if (stack.top().type() == ASTNode::NODE_CHAINSTORE) {
+                stack.pop();
+            }
+            stack.push(new ASTMap());
+        }
+        break;
+    case Pyc::BUILD_CONST_KEY_MAP_A:
+        // Top of stack will be a tuple of keys.
+        // Values will start at TOS - 1.
+        {
+            PycRef<ASTNode> keys = stack.top();
+            stack.pop();
+
+            ASTConstMap::values_t values;
+            values.reserve(operand);
+            for (int i = 0; i < operand; ++i) {
+                PycRef<ASTNode> value = stack.top();
+                stack.pop();
+                values.push_back(value);
+            }
+
+            stack.push(new ASTConstMap(keys, values));
+        }
+        break;
+    case Pyc::BUILD_SLICE_A:
+        {
+            if (operand == 2) {
+                PycRef<ASTNode> end = stack.top();
+                stack.pop();
+                PycRef<ASTNode> start = stack.top();
+                stack.pop();
+
+                if (start.type() == ASTNode::NODE_OBJECT
+                        && start.cast<ASTObject>()->object() == Pyc_None) {
+                    start = NULL;
+                }
+
+                if (end.type() == ASTNode::NODE_OBJECT
+                        && end.cast<ASTObject>()->object() == Pyc_None) {
+                    end = NULL;
+                }
+
+                if (start == NULL && end == NULL) {
+                    stack.push(new ASTSlice(ASTSlice::SLICE0));
+                } else if (start == NULL) {
+                    stack.push(new ASTSlice(ASTSlice::SLICE2, start, end));
+                } else if (end == NULL) {
+                    stack.push(new ASTSlice(ASTSlice::SLICE1, start, end));
+                } else {
+                    stack.push(new ASTSlice(ASTSlice::SLICE3, start, end));
+                }
+            } else if (operand == 3) {
+                PycRef<ASTNode> step = stack.top();
+                stack.pop();
+                PycRef<ASTNode> end = stack.top();
+                stack.pop();
+                PycRef<ASTNode> start = stack.top();
+                stack.pop();
+
+                if (start.type() == ASTNode::NODE_OBJECT
+                        && start.cast<ASTObject>()->object() == Pyc_None) {
+                    start = NULL;
+                }
+
+                if (end.type() == ASTNode::NODE_OBJECT
+                        && end.cast<ASTObject>()->object() == Pyc_None) {
+                    end = NULL;
+                }
+
+                if (step.type() == ASTNode::NODE_OBJECT
+                        && step.cast<ASTObject>()->object() == Pyc_None) {
+                    step = NULL;
+                }
+
+                /* We have to do this as a slice where one side is another slice */
+                /* [[a:b]:c] */
+
+                if (start == NULL && end == NULL) {
+                    stack.push(new ASTSlice(ASTSlice::SLICE0));
+                } else if (start == NULL) {
+                    stack.push(new ASTSlice(ASTSlice::SLICE2, start, end));
+                } else if (end == NULL) {
+                    stack.push(new ASTSlice(ASTSlice::SLICE1, start, end));
+                } else {
+                    stack.push(new ASTSlice(ASTSlice::SLICE3, start, end));
+                }
+
+                PycRef<ASTNode> lhs = stack.top();
+                stack.pop();
+
+                if (step == NULL) {
+                    stack.push(new ASTSlice(ASTSlice::SLICE1, lhs, step));
+                } else {
+                    stack.push(new ASTSlice(ASTSlice::SLICE3, lhs, step));
+                }
+            }
+        }
+        break;
+    case Pyc::BUILD_STRING_A:
+        {
+            // Nearly identical logic to BUILD_LIST
+            ASTList::value_t values;
+            for (int i = 0; i < operand; i++) {
+                values.push_front(stack.top());
+                stack.pop();
+            }
+            stack.push(new ASTJoinedStr(values));
+        }
+        break;
+    case Pyc::BUILD_TUPLE_A:
+        {
+            // if class is a closure code, ignore this tuple
+            PycRef<ASTNode> tos = stack.top();
+            if (tos && tos->type() == ASTNode::NODE_LOADBUILDCLASS) {
+                break;
+            }
+
+            ASTTuple::value_t values;
+            values.resize(operand);
+            for (int i=0; i<operand; i++) {
+                values[operand-i-1] = stack.top();
+                stack.pop();
+            }
+            stack.push(new ASTTuple(values));
+        }
+        break;
+    }
 }
 
 static void append_to_chain_store(const PycRef<ASTNode> &chainStore,
