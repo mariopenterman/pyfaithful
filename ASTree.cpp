@@ -492,6 +492,13 @@ private:
        comparison (`a < b < c`), so the compare builds/extends an ASTChainCompare
        instead of a plain ASTCompare. Cleared after each comparison consumes it. */
     int chainCmp = 0;
+    /* The block stack: currently-open statements/suites. curblock is the
+       innermost (statements are appended to it); defblock is the outermost
+       module/function body returned when the stream ends. Promoted from build()
+       locals; default-constructed here and initialised at the top of build(). */
+    std::stack<PycRef<ASTBlock> > blocks;
+    PycRef<ASTBlock> defblock;
+    PycRef<ASTBlock> curblock;
 };
 
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
@@ -523,10 +530,9 @@ PycRef<ASTNode> CodeBuilder::build()
 
     stackhist_t stack_hist;
 
-    std::stack<PycRef<ASTBlock> > blocks;
-    PycRef<ASTBlock> defblock = new ASTBlock(ASTBlock::BLK_MAIN);
+    defblock = new ASTBlock(ASTBlock::BLK_MAIN);
     defblock->init();
-    PycRef<ASTBlock> curblock = defblock;
+    curblock = defblock;
     blocks.push(defblock);
 
     int opcode, operand;
