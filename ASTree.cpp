@@ -521,6 +521,7 @@ private:
     void handleEndFinally();
     void handleSwap(int operand);
     void handleCopy(int operand);
+    void handleReturnValue();
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -12965,392 +12966,7 @@ PycRef<ASTNode> CodeBuilder::build()
             break;
         case Pyc::RETURN_VALUE:
         case Pyc::INSTRUMENTED_RETURN_VALUE_A:
-            {
-                if (finallyReturnSkip.count(curpos)) {
-                    if (!stack.empty())
-                        stack.pop();
-                    break;
-                }
-                /* Suppress an implicit-epilogue `return None` copy that is the
-                   normal-exit of a try/except-with-else whose duplicate copies
-                   were folded at the except-merge (see dupReturnMerge). Both the
-                   else-body copy (spanA) and the except-handler copy (JUMP_FORWARD
-                   target) map to the single implicit function epilogue and must
-                   not render as explicit statements. */
-                if (dupRetNoneSkip.count(curpos)) {
-                    if (!stack.empty())
-                        stack.pop();
-                    break;
-                }
-                PycRef<ASTNode> value = stack.top();
-                stack.pop();
-                curblock->append(new ASTReturn(value));
-
-                /* The returning except-clause arm is the final `else:` of the
-                   if/elif/else chain that forms the except handler body, so curblock
-                   is that BLK_ELSE, not the BLK_EXCEPT — the coalesced-finally
-                   except-return resume below would not fire, the else would close at
-                   the shared POP_EXCEPT, and the outer finally would be dropped. Close
-                   the terminal else/elif into its enclosing BLK_EXCEPT first so the
-                   existing resume runs and jumps to the finally target. Gated to a
-                   return whose immediate parent block is the except handler, so
-                   ordinary else-arms are untouched. */
-                if (finallyExceptReturnExit.count(curpos)
-                        && (curblock->blktype() == ASTBlock::BLK_ELSE
-                            || (curblock->blktype() == ASTBlock::BLK_ELIF
-                                && !elifPendingElse.count(curblock->end())))
-                        && blocks.size() > 1) {
-                    std::stack<PycRef<ASTBlock> > pk = blocks;
-                    pk.pop();
-                    if (!pk.empty() && pk.top()->blktype() == ASTBlock::BLK_EXCEPT) {
-                        PycRef<ASTBlock> elseb = curblock;
-                        blocks.pop();
-                        if (!stack_hist.empty())
-                            stack_hist.pop();
-                        curblock = blocks.top();
-                        curblock->append(elseb.cast<ASTNode>());
-                    }
-                }
-
-                bool siblingExceptPending = false;
-                if (finallyExceptReturnExit.count(curpos)
-                        && curblock->blktype() == ASTBlock::BLK_EXCEPT) {
-                    int mergeT = finallyExceptReturnExit[curpos];
-                    PycBuffer sb(code->code()->value(), code->code()->length());
-                    sb.setPos(pos);
-                    int so, sa, sp = pos;
-                    while (sp < mergeT && !sb.atEof()) {
-                        int sip = sp;
-                        bc_next(sb, mod, so, sa, sp);
-                        if (so == Pyc::PUSH_EXC_INFO) break;
-                        if (so == Pyc::CHECK_EXC_MATCH) { siblingExceptPending = true; break; }
-                        if (sp <= sip) break;
-                    }
-                }
-                if (finallyExceptReturnExit.count(curpos)
-                        && curblock->blktype() == ASTBlock::BLK_EXCEPT
-                        && !siblingExceptPending) {
-                    int mergeT = finallyExceptReturnExit[curpos];
-                    /* The recorded exit is the outer finally target T, which is only
-                       the right resume point when this inner try/except is the LAST
-                       statement of the outer try body. When more outer-try-body code
-                       follows the inner try/except (e.g. `try: (try: B except E:
-                       return) ; if C: return  finally: F` wrapped in a loop), resuming
-                       at T skips that trailing code AND the finally render. The
-                       BLK_EXCEPT's own end is the inner try/except merge; resume there
-                       when it is a tighter, valid point so the rest of the try body
-                       renders and pos still reaches T for the finally. */
-                    if (curblock->end() > curpos && curblock->end() < mergeT)
-                        mergeT = curblock->end();
-                    PycRef<ASTBlock> exc = curblock;
-                    blocks.pop();
-                    if (!blocks.empty()) {
-                        if (exc->size() != 0)
-                            blocks.top()->append(exc.cast<ASTNode>());
-                        curblock = blocks.top();
-                    }
-                    if (!stack_hist.empty())
-                        stack_hist.pop();
-                    if (!blocks.empty()
-                            && curblock->blktype() == ASTBlock::BLK_CONTAINER
-                            && !curblock.cast<ASTContainerBlock>()->hasFinally()) {
-                        PycRef<ASTBlock> cont = curblock;
-                        blocks.pop();
-                        if (!blocks.empty()) {
-                            blocks.top()->append(cont.cast<ASTNode>());
-                            curblock = blocks.top();
-                        }
-                    }
-                    source.setPos(mergeT);
-                    pos = mergeT;
-                    while (next_exception_entry < exception_entries.size()
-                            && exception_entries[next_exception_entry].start_offset < mergeT)
-                        next_exception_entry++;
-                    break;
-                }
-
-                if (classCellRet.count(curpos)
-                        && curpos != classCellLastRet
-                        && classCellMerge > curpos
-                        && curblock->end() < classCellMerge
-                        && (curblock->blktype() == ASTBlock::BLK_IF
-                            || curblock->blktype() == ASTBlock::BLK_ELIF)
-                        && stack_hist.size()
-                        && blocks.size() > 1) {
-                    stack = stack_hist.top();
-                    stack_hist.pop();
-
-                    PycRef<ASTBlock> ifb = curblock;
-                    blocks.pop();
-                    curblock = blocks.top();
-                    curblock->append(ifb.cast<ASTNode>());
-
-                    stack_hist.push(stack);
-                    PycRef<ASTBlock> elseb =
-                            new ASTBlock(ASTBlock::BLK_ELSE, classCellMerge);
-                    blocks.push(elseb);
-                    curblock = elseb;
-                    break;
-                }
-
-                /* Terminal `if C: A else: B` at module/class scope: the if-true arm A
-                   just reached its threaded inline return-None (illegal as source at
-                   this scope, so it is the compiler's shared-exit thread — see the
-                   moduleElseAt pre-scan). Rather than close the BLK_IF into
-                   fall-through (which would drop the else and mis-render B as always
-                   executed), drop the synthetic return-None and open a real BLK_ELSE
-                   for the false-target region. */
-                if (moduleElseAt.count(curblock->end())
-                        && curblock->blktype() == ASTBlock::BLK_IF
-                        && (value == nullptr
-                            || (value.type() == ASTNode::NODE_OBJECT
-                                && value.cast<ASTObject>()->object() == Pyc_None))
-                        && stack_hist.size()
-                        && blocks.size() > 1) {
-                    int elseEnd = moduleElseAt[curblock->end()];
-                    curblock->removeLast();      // drop the threaded return-None
-                    stack = stack_hist.top();
-                    stack_hist.pop();
-                    PycRef<ASTBlock> ifb = curblock;
-                    blocks.pop();
-                    curblock = blocks.top();
-                    curblock->append(ifb.cast<ASTNode>());
-                    stack_hist.push(stack);
-                    PycRef<ASTBlock> elseb = new ASTBlock(ASTBlock::BLK_ELSE, elseEnd);
-                    elseb->init();
-                    blocks.push(elseb);
-                    curblock = elseb;
-                    break;
-                }
-
-                if ((curblock->blktype() == ASTBlock::BLK_IF
-                        || curblock->blktype() == ASTBlock::BLK_ELSE)
-                        && stack_hist.size()
-                        && blocks.size() > 1
-                        && (mod->verCompare(2, 6) >= 0)) {
-                    stack = stack_hist.top();
-                    stack_hist.pop();
-
-                    PycRef<ASTBlock> prev = curblock;
-                    blocks.pop();
-                    curblock = blocks.top();
-                    curblock->append(prev.cast<ASTNode>());
-
-                    bool padParentOk =
-                            curblock->blktype() == ASTBlock::BLK_MAIN
-                            || ((curblock->blktype() == ASTBlock::BLK_IF
-                                 || curblock->blktype() == ASTBlock::BLK_ELIF
-                                 || curblock->blktype() == ASTBlock::BLK_ELSE
-                                 || curblock->blktype() == ASTBlock::BLK_TRY)
-                                && (curblock->end() == 0
-                                    || curblock->end() > prev->end()));
-                    if (mod->verCompare(3, 11) >= 0 && prev->end() > pos
-                            && padParentOk) {
-                        PycBuffer pscan(code->code()->value(), code->code()->length());
-                        pscan.setPos(pos);
-                        int pop = -1, parg = -1, ppos = pos;
-                        bool allPads = true, sawPad = false;
-                        while (ppos < prev->end()) {
-                            bc_next(pscan, mod, pop, parg, ppos);
-                            if (pop == Pyc::LOAD_CONST_A && ppos < prev->end()
-                                    && code->getConst(parg).type()
-                                        == PycObject::TYPE_NONE) {
-                                bc_next(pscan, mod, pop, parg, ppos);
-                                if (pop == Pyc::RETURN_VALUE) {
-                                    sawPad = true;
-                                    continue;
-                                }
-                            }
-                            allPads = false;
-                            break;
-                        }
-                        if (allPads && sawPad && ppos == prev->end()) {
-                            source.setPos(prev->end());
-                            pos = prev->end();
-                            while (next_exception_entry < exception_entries.size()
-                                    && exception_entries[next_exception_entry]
-                                        .start_offset < pos)
-                                next_exception_entry++;
-                            break;
-                        }
-                    }
-
-                    bool retIntoForLoop = curblock->blktype() == ASTBlock::BLK_FOR;
-                    int forStart = retIntoForLoop
-                            ? curblock.cast<ASTIterBlock>()->start() : -1;
-                    int sv_bufpos = source.pos();
-                    int sv_pos = pos;
-                    if (source.atEof())
-                        break;
-                    bc_next(source, mod, opcode, operand, pos);
-                    if ((opcode == Pyc::JUMP_BACKWARD_A
-                            || opcode == Pyc::JUMP_BACKWARD_NO_INTERRUPT_A)
-                            && !retIntoForLoop
-                            && blocks.size() > 2
-                            && (curblock->blktype() == ASTBlock::BLK_IF
-                                || curblock->blktype() == ASTBlock::BLK_ELIF
-                                || curblock->blktype() == ASTBlock::BLK_ELSE)
-                            && curblock->end() == sv_pos) {
-                        int bo = operand;
-                        if (mod->verCompare(3, 10) >= 0)
-                            bo *= sizeof(uint16_t);
-                        int btgt = pos - bo;
-                        std::stack<PycRef<ASTBlock> > peek = blocks;
-                        bool found = false;
-                        while (peek.size() > 1
-                                && (peek.top()->blktype() == ASTBlock::BLK_IF
-                                    || peek.top()->blktype() == ASTBlock::BLK_ELIF
-                                    || peek.top()->blktype() == ASTBlock::BLK_ELSE)
-                                && peek.top()->end() == sv_pos) {
-                            peek.pop();
-                            if (peek.top()->blktype() == ASTBlock::BLK_FOR
-                                    && peek.top().cast<ASTIterBlock>()->start() == btgt) {
-                                found = true;
-                                break;
-                            }
-                        }
-                        if (found) {
-                            while (blocks.size() > 1
-                                    && (curblock->blktype() == ASTBlock::BLK_IF
-                                        || curblock->blktype() == ASTBlock::BLK_ELIF
-                                        || curblock->blktype() == ASTBlock::BLK_ELSE)
-                                    && curblock->end() == sv_pos) {
-                                PycRef<ASTBlock> ib = curblock;
-                                if (!stack_hist.empty())
-                                    stack_hist.pop();
-                                blocks.pop();
-                                curblock = blocks.top();
-                                curblock->append(ib.cast<ASTNode>());
-                            }
-                            if (curblock->blktype() == ASTBlock::BLK_FOR) {
-                                retIntoForLoop = true;
-                                forStart = curblock.cast<ASTIterBlock>()->start();
-                            }
-                        }
-                    }
-                    if ((opcode == Pyc::JUMP_BACKWARD_A
-                            || opcode == Pyc::JUMP_BACKWARD_NO_INTERRUPT_A)
-                            && retIntoForLoop) {
-                        int boffs = operand;
-                        if (mod->verCompare(3, 10) >= 0)
-                            boffs *= sizeof(uint16_t);
-                        if (pos - boffs == forStart
-                                && backedgeCount[forStart] >= 1
-                                && forBreakBeyondExit.count(forStart)) {
-                            auto fe = forStartToExit.find(forStart);
-                            if (fe != forStartToExit.end()
-                                    && forElseMerge.count(fe->second)) {
-                                loopCloseAtExit.insert(fe->second);
-                                forElseBreakLoop.insert(forStart);
-                            }
-                        }
-                        if (pos - boffs == forStart
-                                && backedgeCount[forStart] >= 1
-                                && !forBreakBeyondExit.count(forStart)) {
-                            auto fe = forStartToExit.find(forStart);
-                            if (fe != forStartToExit.end()) {
-                                int loopExit = fe->second;
-                                bool didNonConv = false;
-                                if (blocks.size() > 2
-                                        && curblock->blktype() == ASTBlock::BLK_FOR) {
-                                    PycRef<ASTBlock> loopb = curblock;
-                                    blocks.pop();
-                                    PycRef<ASTBlock> parent = blocks.top();
-                                    ASTBlock::BlkType pt = parent->blktype();
-                                    bool staleIfNC = (pt == ASTBlock::BLK_IF
-                                            || pt == ASTBlock::BLK_ELIF
-                                            || pt == ASTBlock::BLK_ELSE)
-                                            && parent->end() > 0
-                                            && parent->end() < loopExit;
-                                    if (staleIfNC) {
-                                        blocks.pop();
-                                        PycRef<ASTBlock> gp = blocks.top();
-                                        ASTBlock::BlkType gt = gp->blktype();
-                                        bool gpClean = (gt == ASTBlock::BLK_MAIN
-                                                || gt == ASTBlock::BLK_IF
-                                                || gt == ASTBlock::BLK_ELIF
-                                                || gt == ASTBlock::BLK_ELSE
-                                                || gt == ASTBlock::BLK_TRY)
-                                                && (gp->end() == 0 || gp->end() > pos);
-                                        if (gpClean) {
-                                            parent->append(loopb.cast<ASTNode>());
-                                            if (!stack_hist.empty())
-                                                stack_hist.pop();
-                                            gp->append(parent.cast<ASTNode>());
-                                            curblock = gp;
-                                            didNonConv = true;
-                                        } else {
-                                            blocks.push(parent);
-                                        }
-                                    }
-                                    if (!didNonConv)
-                                        blocks.push(loopb);
-                                }
-                                if (!didNonConv)
-                                    loopCloseAtExit.insert(loopExit);
-                            }
-                        }
-                    }
-                    if ((opcode == Pyc::JUMP_BACKWARD_A
-                                || opcode == Pyc::JUMP_BACKWARD_NO_INTERRUPT_A)
-                            && curblock->blktype() == ASTBlock::BLK_WHILE
-                            && curblock->end() == pos
-                            && blocks.size() > 1) {
-                        int beTarget = pos - operand * (int)sizeof(uint16_t);
-                        if (whileTrueHdr.count(beTarget)
-                                && whileTrueHdr[beTarget] == pos) {
-                            PycRef<ASTBlock> whb = curblock;
-                            blocks.pop();
-                            ASTBlock::BlkType ptt = blocks.top()->blktype();
-                            bool okParent = (blocks.top()->end() == pos
-                                    && (ptt == ASTBlock::BLK_TRY
-                                        || ptt == ASTBlock::BLK_IF
-                                        || ptt == ASTBlock::BLK_ELIF
-                                        || ptt == ASTBlock::BLK_ELSE))
-                                    || ptt == ASTBlock::BLK_MAIN;
-                            if (okParent) {
-                                curblock = blocks.top();
-                                curblock->append(whb.cast<ASTNode>());
-                            } else {
-                                blocks.push(whb);
-                            }
-                        }
-                    }
-                    bool swallow;
-                    if (mod->verCompare(3, 11) >= 0)
-                        swallow = (opcode == Pyc::JUMP_BACKWARD_A
-                                || opcode == Pyc::JUMP_BACKWARD_NO_INTERRUPT_A);
-                    else
-                        swallow = (opcode == Pyc::JUMP_FORWARD_A
-                                || opcode == Pyc::JUMP_ABSOLUTE_A
-                                || opcode == Pyc::JUMP_BACKWARD_A
-                                || opcode == Pyc::JUMP_BACKWARD_NO_INTERRUPT_A);
-                    if (swallow && mod->verCompare(3, 11) >= 0
-                            && (curblock->blktype() == ASTBlock::BLK_IF
-                                || curblock->blktype() == ASTBlock::BLK_ELIF)) {
-                        int beTarget = pos - operand * (int)sizeof(uint16_t);
-                        bool laterBackEdge = false;
-                        for (const auto& lr : loopRanges)
-                            if (lr.start == beTarget && lr.end > sv_pos) {
-                                laterBackEdge = true;
-                                break;
-                            }
-                        if (!laterBackEdge)
-                            for (const auto& lr : loopRanges)
-                                if (lr.start <= sv_pos && sv_pos < lr.end
-                                        && beTarget < lr.start) {
-                                    laterBackEdge = true;
-                                    break;
-                                }
-                        if (laterBackEdge)
-                            curblock->append(new ASTKeyword(ASTKeyword::KW_CONTINUE));
-                    }
-                    if (!swallow) {
-                        source.setPos(sv_bufpos);
-                        pos = sv_pos;
-                    }
-                }
-            }
+            handleReturnValue();
             break;
         case Pyc::RETURN_CONST_A:
         case Pyc::INSTRUMENTED_RETURN_CONST_A:
@@ -17052,6 +16668,401 @@ static void append_to_chain_store(const PycRef<ASTNode> &chainStore,
     } else {
         stack.push(chainStore);
     }
+}
+
+/* RETURN_VALUE / INSTRUMENTED_RETURN_VALUE — push TOS as the function's
+   return value. Beyond the plain `return X`, this handler untangles the
+   many control-flow shapes where CPython threads a return through folded
+   finally copies, shared implicit return-None epilogues, class-cell
+   returns, terminal if/else at module scope, and returns that sit at the
+   tail of a loop body (closing the enclosing if/elif/else chain into the
+   loop and, in <3.11, swallowing the following back-edge jump). */
+void CodeBuilder::handleReturnValue()
+{
+                if (finallyReturnSkip.count(curpos)) {
+                    if (!stack.empty())
+                        stack.pop();
+                    return;
+                }
+                /* Suppress an implicit-epilogue `return None` copy that is the
+                   normal-exit of a try/except-with-else whose duplicate copies
+                   were folded at the except-merge (see dupReturnMerge). Both the
+                   else-body copy (spanA) and the except-handler copy (JUMP_FORWARD
+                   target) map to the single implicit function epilogue and must
+                   not render as explicit statements. */
+                if (dupRetNoneSkip.count(curpos)) {
+                    if (!stack.empty())
+                        stack.pop();
+                    return;
+                }
+                PycRef<ASTNode> value = stack.top();
+                stack.pop();
+                curblock->append(new ASTReturn(value));
+
+                /* The returning except-clause arm is the final `else:` of the
+                   if/elif/else chain that forms the except handler body, so curblock
+                   is that BLK_ELSE, not the BLK_EXCEPT — the coalesced-finally
+                   except-return resume below would not fire, the else would close at
+                   the shared POP_EXCEPT, and the outer finally would be dropped. Close
+                   the terminal else/elif into its enclosing BLK_EXCEPT first so the
+                   existing resume runs and jumps to the finally target. Gated to a
+                   return whose immediate parent block is the except handler, so
+                   ordinary else-arms are untouched. */
+                if (finallyExceptReturnExit.count(curpos)
+                        && (curblock->blktype() == ASTBlock::BLK_ELSE
+                            || (curblock->blktype() == ASTBlock::BLK_ELIF
+                                && !elifPendingElse.count(curblock->end())))
+                        && blocks.size() > 1) {
+                    std::stack<PycRef<ASTBlock> > pk = blocks;
+                    pk.pop();
+                    if (!pk.empty() && pk.top()->blktype() == ASTBlock::BLK_EXCEPT) {
+                        PycRef<ASTBlock> elseb = curblock;
+                        blocks.pop();
+                        if (!stack_hist.empty())
+                            stack_hist.pop();
+                        curblock = blocks.top();
+                        curblock->append(elseb.cast<ASTNode>());
+                    }
+                }
+
+                bool siblingExceptPending = false;
+                if (finallyExceptReturnExit.count(curpos)
+                        && curblock->blktype() == ASTBlock::BLK_EXCEPT) {
+                    int mergeT = finallyExceptReturnExit[curpos];
+                    PycBuffer sb(code->code()->value(), code->code()->length());
+                    sb.setPos(pos);
+                    int so, sa, sp = pos;
+                    while (sp < mergeT && !sb.atEof()) {
+                        int sip = sp;
+                        bc_next(sb, mod, so, sa, sp);
+                        if (so == Pyc::PUSH_EXC_INFO) break;
+                        if (so == Pyc::CHECK_EXC_MATCH) { siblingExceptPending = true; break; }
+                        if (sp <= sip) break;
+                    }
+                }
+                if (finallyExceptReturnExit.count(curpos)
+                        && curblock->blktype() == ASTBlock::BLK_EXCEPT
+                        && !siblingExceptPending) {
+                    int mergeT = finallyExceptReturnExit[curpos];
+                    /* The recorded exit is the outer finally target T, which is only
+                       the right resume point when this inner try/except is the LAST
+                       statement of the outer try body. When more outer-try-body code
+                       follows the inner try/except (e.g. `try: (try: B except E:
+                       return) ; if C: return  finally: F` wrapped in a loop), resuming
+                       at T skips that trailing code AND the finally render. The
+                       BLK_EXCEPT's own end is the inner try/except merge; resume there
+                       when it is a tighter, valid point so the rest of the try body
+                       renders and pos still reaches T for the finally. */
+                    if (curblock->end() > curpos && curblock->end() < mergeT)
+                        mergeT = curblock->end();
+                    PycRef<ASTBlock> exc = curblock;
+                    blocks.pop();
+                    if (!blocks.empty()) {
+                        if (exc->size() != 0)
+                            blocks.top()->append(exc.cast<ASTNode>());
+                        curblock = blocks.top();
+                    }
+                    if (!stack_hist.empty())
+                        stack_hist.pop();
+                    if (!blocks.empty()
+                            && curblock->blktype() == ASTBlock::BLK_CONTAINER
+                            && !curblock.cast<ASTContainerBlock>()->hasFinally()) {
+                        PycRef<ASTBlock> cont = curblock;
+                        blocks.pop();
+                        if (!blocks.empty()) {
+                            blocks.top()->append(cont.cast<ASTNode>());
+                            curblock = blocks.top();
+                        }
+                    }
+                    source.setPos(mergeT);
+                    pos = mergeT;
+                    while (next_exception_entry < exception_entries.size()
+                            && exception_entries[next_exception_entry].start_offset < mergeT)
+                        next_exception_entry++;
+                    return;
+                }
+
+                if (classCellRet.count(curpos)
+                        && curpos != classCellLastRet
+                        && classCellMerge > curpos
+                        && curblock->end() < classCellMerge
+                        && (curblock->blktype() == ASTBlock::BLK_IF
+                            || curblock->blktype() == ASTBlock::BLK_ELIF)
+                        && stack_hist.size()
+                        && blocks.size() > 1) {
+                    stack = stack_hist.top();
+                    stack_hist.pop();
+
+                    PycRef<ASTBlock> ifb = curblock;
+                    blocks.pop();
+                    curblock = blocks.top();
+                    curblock->append(ifb.cast<ASTNode>());
+
+                    stack_hist.push(stack);
+                    PycRef<ASTBlock> elseb =
+                            new ASTBlock(ASTBlock::BLK_ELSE, classCellMerge);
+                    blocks.push(elseb);
+                    curblock = elseb;
+                    return;
+                }
+
+                /* Terminal `if C: A else: B` at module/class scope: the if-true arm A
+                   just reached its threaded inline return-None (illegal as source at
+                   this scope, so it is the compiler's shared-exit thread — see the
+                   moduleElseAt pre-scan). Rather than close the BLK_IF into
+                   fall-through (which would drop the else and mis-render B as always
+                   executed), drop the synthetic return-None and open a real BLK_ELSE
+                   for the false-target region. */
+                if (moduleElseAt.count(curblock->end())
+                        && curblock->blktype() == ASTBlock::BLK_IF
+                        && (value == nullptr
+                            || (value.type() == ASTNode::NODE_OBJECT
+                                && value.cast<ASTObject>()->object() == Pyc_None))
+                        && stack_hist.size()
+                        && blocks.size() > 1) {
+                    int elseEnd = moduleElseAt[curblock->end()];
+                    curblock->removeLast();      // drop the threaded return-None
+                    stack = stack_hist.top();
+                    stack_hist.pop();
+                    PycRef<ASTBlock> ifb = curblock;
+                    blocks.pop();
+                    curblock = blocks.top();
+                    curblock->append(ifb.cast<ASTNode>());
+                    stack_hist.push(stack);
+                    PycRef<ASTBlock> elseb = new ASTBlock(ASTBlock::BLK_ELSE, elseEnd);
+                    elseb->init();
+                    blocks.push(elseb);
+                    curblock = elseb;
+                    return;
+                }
+
+                if ((curblock->blktype() == ASTBlock::BLK_IF
+                        || curblock->blktype() == ASTBlock::BLK_ELSE)
+                        && stack_hist.size()
+                        && blocks.size() > 1
+                        && (mod->verCompare(2, 6) >= 0)) {
+                    stack = stack_hist.top();
+                    stack_hist.pop();
+
+                    PycRef<ASTBlock> prev = curblock;
+                    blocks.pop();
+                    curblock = blocks.top();
+                    curblock->append(prev.cast<ASTNode>());
+
+                    bool padParentOk =
+                            curblock->blktype() == ASTBlock::BLK_MAIN
+                            || ((curblock->blktype() == ASTBlock::BLK_IF
+                                 || curblock->blktype() == ASTBlock::BLK_ELIF
+                                 || curblock->blktype() == ASTBlock::BLK_ELSE
+                                 || curblock->blktype() == ASTBlock::BLK_TRY)
+                                && (curblock->end() == 0
+                                    || curblock->end() > prev->end()));
+                    if (mod->verCompare(3, 11) >= 0 && prev->end() > pos
+                            && padParentOk) {
+                        PycBuffer pscan(code->code()->value(), code->code()->length());
+                        pscan.setPos(pos);
+                        int pop = -1, parg = -1, ppos = pos;
+                        bool allPads = true, sawPad = false;
+                        while (ppos < prev->end()) {
+                            bc_next(pscan, mod, pop, parg, ppos);
+                            if (pop == Pyc::LOAD_CONST_A && ppos < prev->end()
+                                    && code->getConst(parg).type()
+                                        == PycObject::TYPE_NONE) {
+                                bc_next(pscan, mod, pop, parg, ppos);
+                                if (pop == Pyc::RETURN_VALUE) {
+                                    sawPad = true;
+                                    continue;
+                                }
+                            }
+                            allPads = false;
+                            break;
+                        }
+                        if (allPads && sawPad && ppos == prev->end()) {
+                            source.setPos(prev->end());
+                            pos = prev->end();
+                            while (next_exception_entry < exception_entries.size()
+                                    && exception_entries[next_exception_entry]
+                                        .start_offset < pos)
+                                next_exception_entry++;
+                            return;
+                        }
+                    }
+
+                    bool retIntoForLoop = curblock->blktype() == ASTBlock::BLK_FOR;
+                    int forStart = retIntoForLoop
+                            ? curblock.cast<ASTIterBlock>()->start() : -1;
+                    int sv_bufpos = source.pos();
+                    int sv_pos = pos;
+                    if (source.atEof())
+                        return;
+                    bc_next(source, mod, opcode, operand, pos);
+                    if ((opcode == Pyc::JUMP_BACKWARD_A
+                            || opcode == Pyc::JUMP_BACKWARD_NO_INTERRUPT_A)
+                            && !retIntoForLoop
+                            && blocks.size() > 2
+                            && (curblock->blktype() == ASTBlock::BLK_IF
+                                || curblock->blktype() == ASTBlock::BLK_ELIF
+                                || curblock->blktype() == ASTBlock::BLK_ELSE)
+                            && curblock->end() == sv_pos) {
+                        int bo = operand;
+                        if (mod->verCompare(3, 10) >= 0)
+                            bo *= sizeof(uint16_t);
+                        int btgt = pos - bo;
+                        std::stack<PycRef<ASTBlock> > peek = blocks;
+                        bool found = false;
+                        while (peek.size() > 1
+                                && (peek.top()->blktype() == ASTBlock::BLK_IF
+                                    || peek.top()->blktype() == ASTBlock::BLK_ELIF
+                                    || peek.top()->blktype() == ASTBlock::BLK_ELSE)
+                                && peek.top()->end() == sv_pos) {
+                            peek.pop();
+                            if (peek.top()->blktype() == ASTBlock::BLK_FOR
+                                    && peek.top().cast<ASTIterBlock>()->start() == btgt) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        if (found) {
+                            while (blocks.size() > 1
+                                    && (curblock->blktype() == ASTBlock::BLK_IF
+                                        || curblock->blktype() == ASTBlock::BLK_ELIF
+                                        || curblock->blktype() == ASTBlock::BLK_ELSE)
+                                    && curblock->end() == sv_pos) {
+                                PycRef<ASTBlock> ib = curblock;
+                                if (!stack_hist.empty())
+                                    stack_hist.pop();
+                                blocks.pop();
+                                curblock = blocks.top();
+                                curblock->append(ib.cast<ASTNode>());
+                            }
+                            if (curblock->blktype() == ASTBlock::BLK_FOR) {
+                                retIntoForLoop = true;
+                                forStart = curblock.cast<ASTIterBlock>()->start();
+                            }
+                        }
+                    }
+                    if ((opcode == Pyc::JUMP_BACKWARD_A
+                            || opcode == Pyc::JUMP_BACKWARD_NO_INTERRUPT_A)
+                            && retIntoForLoop) {
+                        int boffs = operand;
+                        if (mod->verCompare(3, 10) >= 0)
+                            boffs *= sizeof(uint16_t);
+                        if (pos - boffs == forStart
+                                && backedgeCount[forStart] >= 1
+                                && forBreakBeyondExit.count(forStart)) {
+                            auto fe = forStartToExit.find(forStart);
+                            if (fe != forStartToExit.end()
+                                    && forElseMerge.count(fe->second)) {
+                                loopCloseAtExit.insert(fe->second);
+                                forElseBreakLoop.insert(forStart);
+                            }
+                        }
+                        if (pos - boffs == forStart
+                                && backedgeCount[forStart] >= 1
+                                && !forBreakBeyondExit.count(forStart)) {
+                            auto fe = forStartToExit.find(forStart);
+                            if (fe != forStartToExit.end()) {
+                                int loopExit = fe->second;
+                                bool didNonConv = false;
+                                if (blocks.size() > 2
+                                        && curblock->blktype() == ASTBlock::BLK_FOR) {
+                                    PycRef<ASTBlock> loopb = curblock;
+                                    blocks.pop();
+                                    PycRef<ASTBlock> parent = blocks.top();
+                                    ASTBlock::BlkType pt = parent->blktype();
+                                    bool staleIfNC = (pt == ASTBlock::BLK_IF
+                                            || pt == ASTBlock::BLK_ELIF
+                                            || pt == ASTBlock::BLK_ELSE)
+                                            && parent->end() > 0
+                                            && parent->end() < loopExit;
+                                    if (staleIfNC) {
+                                        blocks.pop();
+                                        PycRef<ASTBlock> gp = blocks.top();
+                                        ASTBlock::BlkType gt = gp->blktype();
+                                        bool gpClean = (gt == ASTBlock::BLK_MAIN
+                                                || gt == ASTBlock::BLK_IF
+                                                || gt == ASTBlock::BLK_ELIF
+                                                || gt == ASTBlock::BLK_ELSE
+                                                || gt == ASTBlock::BLK_TRY)
+                                                && (gp->end() == 0 || gp->end() > pos);
+                                        if (gpClean) {
+                                            parent->append(loopb.cast<ASTNode>());
+                                            if (!stack_hist.empty())
+                                                stack_hist.pop();
+                                            gp->append(parent.cast<ASTNode>());
+                                            curblock = gp;
+                                            didNonConv = true;
+                                        } else {
+                                            blocks.push(parent);
+                                        }
+                                    }
+                                    if (!didNonConv)
+                                        blocks.push(loopb);
+                                }
+                                if (!didNonConv)
+                                    loopCloseAtExit.insert(loopExit);
+                            }
+                        }
+                    }
+                    if ((opcode == Pyc::JUMP_BACKWARD_A
+                                || opcode == Pyc::JUMP_BACKWARD_NO_INTERRUPT_A)
+                            && curblock->blktype() == ASTBlock::BLK_WHILE
+                            && curblock->end() == pos
+                            && blocks.size() > 1) {
+                        int beTarget = pos - operand * (int)sizeof(uint16_t);
+                        if (whileTrueHdr.count(beTarget)
+                                && whileTrueHdr[beTarget] == pos) {
+                            PycRef<ASTBlock> whb = curblock;
+                            blocks.pop();
+                            ASTBlock::BlkType ptt = blocks.top()->blktype();
+                            bool okParent = (blocks.top()->end() == pos
+                                    && (ptt == ASTBlock::BLK_TRY
+                                        || ptt == ASTBlock::BLK_IF
+                                        || ptt == ASTBlock::BLK_ELIF
+                                        || ptt == ASTBlock::BLK_ELSE))
+                                    || ptt == ASTBlock::BLK_MAIN;
+                            if (okParent) {
+                                curblock = blocks.top();
+                                curblock->append(whb.cast<ASTNode>());
+                            } else {
+                                blocks.push(whb);
+                            }
+                        }
+                    }
+                    bool swallow;
+                    if (mod->verCompare(3, 11) >= 0)
+                        swallow = (opcode == Pyc::JUMP_BACKWARD_A
+                                || opcode == Pyc::JUMP_BACKWARD_NO_INTERRUPT_A);
+                    else
+                        swallow = (opcode == Pyc::JUMP_FORWARD_A
+                                || opcode == Pyc::JUMP_ABSOLUTE_A
+                                || opcode == Pyc::JUMP_BACKWARD_A
+                                || opcode == Pyc::JUMP_BACKWARD_NO_INTERRUPT_A);
+                    if (swallow && mod->verCompare(3, 11) >= 0
+                            && (curblock->blktype() == ASTBlock::BLK_IF
+                                || curblock->blktype() == ASTBlock::BLK_ELIF)) {
+                        int beTarget = pos - operand * (int)sizeof(uint16_t);
+                        bool laterBackEdge = false;
+                        for (const auto& lr : loopRanges)
+                            if (lr.start == beTarget && lr.end > sv_pos) {
+                                laterBackEdge = true;
+                                break;
+                            }
+                        if (!laterBackEdge)
+                            for (const auto& lr : loopRanges)
+                                if (lr.start <= sv_pos && sv_pos < lr.end
+                                        && beTarget < lr.start) {
+                                    laterBackEdge = true;
+                                    break;
+                                }
+                        if (laterBackEdge)
+                            curblock->append(new ASTKeyword(ASTKeyword::KW_CONTINUE));
+                    }
+                    if (!swallow) {
+                        source.setPos(sv_bufpos);
+                        pos = sv_pos;
+                    }
+                }
 }
 
 /* Arithmetic/bitwise precedence LEVEL of a binary op (higher binds tighter).
