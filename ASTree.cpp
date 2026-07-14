@@ -512,6 +512,7 @@ private:
     void handleGetAIter();
     void handleReturnConst(int operand);
     bool handleSetupWith(int opcode, int operand);
+    void handleWithCleanup();
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -13946,27 +13947,7 @@ PycRef<ASTNode> CodeBuilder::build()
             break;
         case Pyc::WITH_CLEANUP:
         case Pyc::WITH_CLEANUP_START:
-            {
-                // Stack top should be a None. Ignore it.
-                PycRef<ASTNode> none = stack.top();
-                stack.pop();
-
-                if (none != NULL) {
-                    fprintf(stderr, "Something TERRIBLE happened!\n");
-                    break;
-                }
-
-                if (curblock->blktype() == ASTBlock::BLK_WITH
-                        && curblock->end() == curpos) {
-                    PycRef<ASTBlock> with = curblock;
-                    blocks.pop();
-                    curblock = blocks.top();
-                    curblock->append(with.cast<ASTNode>());
-                }
-                else {
-                    fprintf(stderr, "Something TERRIBLE happened! No matching with block found for WITH_CLEANUP at %d\n", curpos);
-                }
-            }
+            handleWithCleanup();
             break;
         case Pyc::WITH_CLEANUP_FINISH:
             /* Ignore this */
@@ -15528,6 +15509,32 @@ bool CodeBuilder::handleSetupWith(int opcode, int operand)
         return false;
     }
     return true;
+}
+
+/* WITH_CLEANUP / WITH_CLEANUP_START (pre-3.11) close a `with` block. The None
+ * left on the stack (a no-exception exit) is discarded, and when curblock is the
+ * matching with block ending here it is popped and appended to its parent. */
+void CodeBuilder::handleWithCleanup()
+{
+    // Stack top should be a None. Ignore it.
+    PycRef<ASTNode> none = stack.top();
+    stack.pop();
+
+    if (none != NULL) {
+        fprintf(stderr, "Something TERRIBLE happened!\n");
+        return;
+    }
+
+    if (curblock->blktype() == ASTBlock::BLK_WITH
+            && curblock->end() == curpos) {
+        PycRef<ASTBlock> with = curblock;
+        blocks.pop();
+        curblock = blocks.top();
+        curblock->append(with.cast<ASTNode>());
+    }
+    else {
+        fprintf(stderr, "Something TERRIBLE happened! No matching with block found for WITH_CLEANUP at %d\n", curpos);
+    }
 }
 
 /* The backward/absolute jumps -- loop back-edges and the compiler's branch
