@@ -495,6 +495,7 @@ private:
     bool handleStore(int opcode, int operand);
     void handleUnpack(int opcode, int operand);
     void handleYield(int opcode);
+    void handlePopBlock();
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -13879,101 +13880,7 @@ PycRef<ASTNode> CodeBuilder::build()
         case Pyc::NOP:
             break;
         case Pyc::POP_BLOCK:
-            {
-                if (curblock->blktype() == ASTBlock::BLK_CONTAINER ||
-                        curblock->blktype() == ASTBlock::BLK_FINALLY) {
-                    /* These should only be popped by an END_FINALLY */
-                    break;
-                }
-
-                if (curblock->blktype() == ASTBlock::BLK_WITH) {
-                    // This should only be popped by a WITH_CLEANUP
-                    break;
-                }
-
-                if (curblock->nodes().size() &&
-                        curblock->nodes().back().type() == ASTNode::NODE_KEYWORD) {
-                    curblock->removeLast();
-                }
-
-                if (curblock->blktype() == ASTBlock::BLK_IF
-                        || curblock->blktype() == ASTBlock::BLK_ELIF
-                        || curblock->blktype() == ASTBlock::BLK_ELSE
-                        || curblock->blktype() == ASTBlock::BLK_TRY
-                        || curblock->blktype() == ASTBlock::BLK_EXCEPT
-                        || curblock->blktype() == ASTBlock::BLK_FINALLY) {
-                    if (!stack_hist.empty()) {
-                        stack = stack_hist.top();
-                        stack_hist.pop();
-                    } else {
-                        fprintf(stderr, "Warning: Stack history is empty, something wrong might have happened\n");
-                    }
-                }
-                PycRef<ASTBlock> tmp = curblock;
-                blocks.pop();
-
-                if (!blocks.empty())
-                    curblock = blocks.top();
-
-                if (!(tmp->blktype() == ASTBlock::BLK_ELSE
-                        && tmp->nodes().size() == 0)) {
-                    curblock->append(tmp.cast<ASTNode>());
-                }
-
-                if (tmp->blktype() == ASTBlock::BLK_FOR && tmp->end() > pos) {
-                    stack_hist.push(stack);
-
-                    PycRef<ASTBlock> blkelse = new ASTBlock(ASTBlock::BLK_ELSE, tmp->end());
-                    blocks.push(blkelse);
-                    curblock = blocks.top();
-                }
-
-                if (curblock->blktype() == ASTBlock::BLK_TRY
-                        && tmp->blktype() != ASTBlock::BLK_FOR
-                        && tmp->blktype() != ASTBlock::BLK_ASYNCFOR
-                        && tmp->blktype() != ASTBlock::BLK_WHILE) {
-                    stack = stack_hist.top();
-                    stack_hist.pop();
-
-                    tmp = curblock;
-                    blocks.pop();
-                    curblock = blocks.top();
-
-                    if (!(tmp->blktype() == ASTBlock::BLK_ELSE
-                            && tmp->nodes().size() == 0)) {
-                        curblock->append(tmp.cast<ASTNode>());
-                    }
-                }
-
-                if (curblock->blktype() == ASTBlock::BLK_CONTAINER) {
-                    PycRef<ASTContainerBlock> cont = curblock.cast<ASTContainerBlock>();
-
-                    if (tmp->blktype() == ASTBlock::BLK_ELSE && !cont->hasFinally()) {
-
-                        /* Pop the container */
-                        blocks.pop();
-                        curblock = blocks.top();
-                        curblock->append(cont.cast<ASTNode>());
-
-                    } else if ((tmp->blktype() == ASTBlock::BLK_ELSE && cont->hasFinally())
-                            || (tmp->blktype() == ASTBlock::BLK_TRY && !cont->hasExcept())) {
-
-                        /* Add the finally block */
-                        stack_hist.push(stack);
-
-                        PycRef<ASTBlock> final = new ASTBlock(ASTBlock::BLK_FINALLY, 0, true);
-                        blocks.push(final);
-                        curblock = blocks.top();
-                    }
-                }
-
-                if ((curblock->blktype() == ASTBlock::BLK_FOR || curblock->blktype() == ASTBlock::BLK_ASYNCFOR)
-                        && curblock->end() == pos) {
-                    blocks.pop();
-                    blocks.top()->append(curblock.cast<ASTNode>());
-                    curblock = blocks.top();
-                }
-            }
+            handlePopBlock();
             break;
         case Pyc::POP_EXCEPT:
             /* Do nothing. */
@@ -15684,6 +15591,110 @@ void CodeBuilder::handleYield(int opcode)
             }
         }
         break;
+    }
+}
+
+/* POP_BLOCK closes the innermost open block when its runtime block ends. It is
+ * ignored for blocks torn down by other opcodes (a container/finally waits for
+ * END_FINALLY, a with for WITH_CLEANUP). Otherwise it restores the saved stack
+ * for a suite that opened one, pops the block and appends it to its parent
+ * (dropping an empty else), and then handles the follow-on structure the same
+ * pop implies: opening a for/while `else:` suite, unwinding a try whose body
+ * just ended, and advancing a container into its finally suite or closing it. */
+void CodeBuilder::handlePopBlock()
+{
+    if (curblock->blktype() == ASTBlock::BLK_CONTAINER ||
+            curblock->blktype() == ASTBlock::BLK_FINALLY) {
+        /* These should only be popped by an END_FINALLY */
+        return;
+    }
+
+    if (curblock->blktype() == ASTBlock::BLK_WITH) {
+        // This should only be popped by a WITH_CLEANUP
+        return;
+    }
+
+    if (curblock->nodes().size() &&
+            curblock->nodes().back().type() == ASTNode::NODE_KEYWORD) {
+        curblock->removeLast();
+    }
+
+    if (curblock->blktype() == ASTBlock::BLK_IF
+            || curblock->blktype() == ASTBlock::BLK_ELIF
+            || curblock->blktype() == ASTBlock::BLK_ELSE
+            || curblock->blktype() == ASTBlock::BLK_TRY
+            || curblock->blktype() == ASTBlock::BLK_EXCEPT
+            || curblock->blktype() == ASTBlock::BLK_FINALLY) {
+        if (!stack_hist.empty()) {
+            stack = stack_hist.top();
+            stack_hist.pop();
+        } else {
+            fprintf(stderr, "Warning: Stack history is empty, something wrong might have happened\n");
+        }
+    }
+    PycRef<ASTBlock> tmp = curblock;
+    blocks.pop();
+
+    if (!blocks.empty())
+        curblock = blocks.top();
+
+    if (!(tmp->blktype() == ASTBlock::BLK_ELSE
+            && tmp->nodes().size() == 0)) {
+        curblock->append(tmp.cast<ASTNode>());
+    }
+
+    if (tmp->blktype() == ASTBlock::BLK_FOR && tmp->end() > pos) {
+        stack_hist.push(stack);
+
+        PycRef<ASTBlock> blkelse = new ASTBlock(ASTBlock::BLK_ELSE, tmp->end());
+        blocks.push(blkelse);
+        curblock = blocks.top();
+    }
+
+    if (curblock->blktype() == ASTBlock::BLK_TRY
+            && tmp->blktype() != ASTBlock::BLK_FOR
+            && tmp->blktype() != ASTBlock::BLK_ASYNCFOR
+            && tmp->blktype() != ASTBlock::BLK_WHILE) {
+        stack = stack_hist.top();
+        stack_hist.pop();
+
+        tmp = curblock;
+        blocks.pop();
+        curblock = blocks.top();
+
+        if (!(tmp->blktype() == ASTBlock::BLK_ELSE
+                && tmp->nodes().size() == 0)) {
+            curblock->append(tmp.cast<ASTNode>());
+        }
+    }
+
+    if (curblock->blktype() == ASTBlock::BLK_CONTAINER) {
+        PycRef<ASTContainerBlock> cont = curblock.cast<ASTContainerBlock>();
+
+        if (tmp->blktype() == ASTBlock::BLK_ELSE && !cont->hasFinally()) {
+
+            /* Pop the container */
+            blocks.pop();
+            curblock = blocks.top();
+            curblock->append(cont.cast<ASTNode>());
+
+        } else if ((tmp->blktype() == ASTBlock::BLK_ELSE && cont->hasFinally())
+                || (tmp->blktype() == ASTBlock::BLK_TRY && !cont->hasExcept())) {
+
+            /* Add the finally block */
+            stack_hist.push(stack);
+
+            PycRef<ASTBlock> final = new ASTBlock(ASTBlock::BLK_FINALLY, 0, true);
+            blocks.push(final);
+            curblock = blocks.top();
+        }
+    }
+
+    if ((curblock->blktype() == ASTBlock::BLK_FOR || curblock->blktype() == ASTBlock::BLK_ASYNCFOR)
+            && curblock->end() == pos) {
+        blocks.pop();
+        blocks.top()->append(curblock.cast<ASTNode>());
+        curblock = blocks.top();
     }
 }
 
