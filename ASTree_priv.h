@@ -14,6 +14,7 @@
 #include <ostream>
 #include "ASTNode.h"
 #include "pyc_module.h"
+#include "pyc_code.h"
 
 /* --- owned by ASTRender.cpp, used by the builder/orchestrator --- */
 extern int cur_indent;            // current output indentation depth
@@ -41,5 +42,30 @@ extern bool printClassDocstring;
 extern std::vector<std::string> g_classNameStack;
 
 std::string demangleName(const std::string& name);
+
+/* --- PHASE 2: faithfulness passes (ASTFaithful.cpp), invoked by decompyle() ---
+ * Declared without default arguments; the defaults live on the definitions and
+ * decompyle() passes every argument explicitly. */
+extern std::set<int> g_sigAnchorNopOffs;   // sig anchor NOP offsets (owned by ASTree.cpp)
+
+bool is_infinite_while(const PycRef<ASTBlock>& blk);
+void strip_module_trailing_return(PycRef<ASTBlock> blk, bool inInfWhile);
+std::vector<int> collectStrippedNops(PycRef<PycCode> code, PycModule* mod,
+                                     const std::set<int>& exclude);
+void insertGeneralPlaceholders(ASTBlock::list_t& nodes, std::set<int>& remaining, int depth);
+int leadingStrippedNops(PycRef<PycCode> code, PycModule* mod,
+                        std::vector<int>* offsets, const std::set<int>* exclude);
+void recoverOrphanTableEntries(PycRef<ASTNodeList> clean, PycRef<PycCode> code, PycModule* mod);
+void setPlaceholderWidths(const PycRef<ASTNode>& node, PycRef<PycCode> code,
+                          bool isFirst, int depth);
+void coalesceElifChains(ASTBlock::list_t& nodes, bool listTail, int depth);
+void markEpilogueSuppress(ASTBlock::list_t& nodes, bool listTail, bool inExcept, int depth);
+bool leadingNopAlreadyHandled(const PycRef<ASTNode>& front);
+bool insertPlaceholderAfterIfEndingAt(ASTBlock::list_t& nodes, int prevOff, int phOff, int depth);
+bool insertPlaceholderAfterBlockEndingAt(ASTBlock::list_t& nodes, int endOff, int phOff, int depth);
+bool insertPlaceholderAtIfBodyStart(ASTBlock::list_t& nodes, int headerOff, int phOff, int depth);
+bool insertPlaceholderAtForBodyStart(ASTBlock::list_t& nodes, int phOff, int depth);
+bool insertPlaceholderAfterOff(ASTBlock::list_t& nodes, int targetOff, int phOff, int depth);
+bool stmtEmitsScopeCode(const PycRef<ASTNode>& n);
 
 #endif
