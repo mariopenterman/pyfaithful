@@ -717,6 +717,10 @@ private:
     std::unordered_map<int, VCase> matchValue;
     void handleCompareOp(int operand);
     bool handleMatchClass();
+    bool handleBackwardConditionalJump();
+    // --- state promoted for handleBackwardConditionalJump ---
+    std::unordered_set<int> compoundAndLeadGuard;
+    std::unordered_set<int> chainWhileBwdEnd;
 };
 
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
@@ -5320,7 +5324,6 @@ PycRef<ASTNode> CodeBuilder::build()
     std::unordered_set<int> chainCleanupPop;
     std::unordered_map<int, int> chainIfTrue;
     std::unordered_set<int> chainAndLeadGuard;
-    std::unordered_set<int> chainWhileBwdEnd;
     if (mod->verCompare(3, 11) >= 0) {
         struct Ins { int op; int arg; int off; int next; };
         std::vector<Ins> v;
@@ -5805,7 +5808,6 @@ PycRef<ASTNode> CodeBuilder::build()
         }
     }
 
-    std::unordered_set<int> compoundAndLeadGuard;
     if (mod->verCompare(3, 11) >= 0) {
         struct CJump { int off; int nextoff; int target; bool backward; };
         std::vector<CJump> cj;
@@ -10673,114 +10675,8 @@ PycRef<ASTNode> CodeBuilder::build()
         case Pyc::POP_JUMP_BACKWARD_IF_TRUE_A:
         case Pyc::POP_JUMP_BACKWARD_IF_NONE_A:
         case Pyc::POP_JUMP_BACKWARD_IF_NOT_NONE_A:
-            if (whileBottomSkip.count(curpos)) {
-                if (!stack.empty())
-                    stack.pop();
-                break;
-            }
-            while (blocks.size() > 1
-                    && curblock->end() > 0 && curblock->end() <= curpos
-                    && curblock->blktype() != ASTBlock::BLK_MAIN
-                    && !(curblock->blktype() == ASTBlock::BLK_FOR
-                         && curblock.cast<ASTIterBlock>()->isComprehension())) {
-                bool isLoop = curblock->blktype() == ASTBlock::BLK_WHILE
-                        || curblock->blktype() == ASTBlock::BLK_FOR;
-                PycRef<ASTBlock> b = curblock;
-                if (!isLoop && !stack_hist.empty())
-                    stack_hist.pop();
-                blocks.pop();
-                curblock = blocks.top();
-                curblock->append(b.cast<ASTNode>());
-            }
-            if (curblock->blktype() == ASTBlock::BLK_FOR
-                    && curblock.cast<ASTIterBlock>()->isComprehension()) {
-                PycRef<ASTNode> cond = stack.top();
-                stack.pop();
-                if (opcode == Pyc::POP_JUMP_BACKWARD_IF_TRUE_A)
-                    cond = new ASTUnary(cond, ASTUnary::UN_NOT);
-                else if (opcode == Pyc::POP_JUMP_BACKWARD_IF_NONE_A)
-                    cond = new ASTCompare(cond, new ASTObject(Pyc_None), ASTCompare::CMP_IS_NOT);
-                else if (opcode == Pyc::POP_JUMP_BACKWARD_IF_NOT_NONE_A)
-                    cond = new ASTCompare(cond, new ASTObject(Pyc_None), ASTCompare::CMP_IS);
-                PycRef<ASTNode> existing = curblock.cast<ASTIterBlock>()->condition();
-                if (existing != nullptr) {
-                    if (compPureOr) {
-                        cond = new ASTBinary(existing, cond, ASTBinary::BIN_LOG_OR);
-                    } else if (compFilterFwd) {
-                        cleanBuild = false;
-                        return new ASTNodeList(defblock->nodes());
-                    } else {
-                        cond = new ASTBinary(existing, cond, ASTBinary::BIN_LOG_AND);
-                    }
-                }
-                curblock.cast<ASTIterBlock>()->setCondition(cond);
-            } else if (curblock->blktype() == ASTBlock::BLK_IF
-                    || curblock->blktype() == ASTBlock::BLK_ELIF) {
-                bool wasElif = curblock->blktype() == ASTBlock::BLK_ELIF;
-                if (stack.empty() || blocks.size() < 2)
-                    throw std::runtime_error("while-conversion stack/block underflow");
-                stack.pop();
-                PycRef<ASTCondBlock> ifb = curblock.cast<ASTCondBlock>();
-                PycRef<ASTCondBlock> whb = new ASTCondBlock(
-                        ASTBlock::BLK_WHILE, ifb->end(), ifb->cond(), ifb->negative());
-                for (const auto& n : ifb->nodes())
-                    whb->append(n);
-                blocks.pop();
-                if (stack_hist.size())
-                    stack_hist.pop();
-                curblock = blocks.top();
-                if (compoundAndLeadGuard.count(whb->end())
-                        && whb->cond() != nullptr
-                        && curblock->blktype() == ASTBlock::BLK_IF
-                        && curblock->size() == 0
-                        && curblock.cast<ASTCondBlock>()->cond() != nullptr
-                        && curblock->end() >= whb->end()
-                        && blocks.size() >= 2) {
-                    PycRef<ASTCondBlock> outerIf = curblock.cast<ASTCondBlock>();
-                    PycRef<ASTNode> aCond = outerIf->negative()
-                            ? NegateCond(outerIf->cond()) : outerIf->cond();
-                    PycRef<ASTNode> merged = new ASTBinary(
-                            aCond, whb->cond(), ASTBinary::BIN_LOG_AND);
-                    PycRef<ASTCondBlock> whb2 = new ASTCondBlock(
-                            ASTBlock::BLK_WHILE, whb->end(), merged, false);
-                    for (const auto& n : whb->nodes())
-                        whb2->append(n);
-                    whb = whb2;
-                    blocks.pop();
-                    if (stack_hist.size())
-                        stack_hist.pop();
-                    curblock = blocks.top();
-                }
-                if (wasElif) {
-                    PycRef<ASTBlock> elsew = new ASTBlock(ASTBlock::BLK_ELSE, whb->end());
-                    elsew->init();
-                    elsew->append(whb.cast<ASTNode>());
-                    curblock->append(elsew.cast<ASTNode>());
-                } else {
-                    curblock->append(whb.cast<ASTNode>());
-                }
-                if (forElseMerge.count(whb->end())) {
-                    stack_hist.push(stack);
-                    PycRef<ASTBlock> elseblk = new ASTBlock(
-                            ASTBlock::BLK_ELSE, forElseMerge[whb->end()]);
-                    elseblk->init();
-                    loopElseBlocks.insert((ASTBlock *)elseblk);
-                    blocks.push(elseblk);
-                    curblock = blocks.top();
-                }
-                if (chainWhileBottomExit.count(curpos)) {
-                    int e = chainWhileBottomExit[curpos];
-                    if (chainWhileBwdEnd.count(curpos))
-                        e = whb->end();
-                    source.setPos(e);
-                    pos = e;
-                }
-            } else {
-                fprintf(stderr, "Unsupported opcode: %s (%d)\n",
-                        Pyc::OpcodeName(opcode), opcode);
-                cleanBuild = false;
+            if (!handleBackwardConditionalJump())
                 return new ASTNodeList(defblock->nodes());
-            }
             break;
         case Pyc::JUMP_IF_FALSE_A:
         case Pyc::JUMP_IF_TRUE_A:
@@ -17051,6 +16947,123 @@ bool CodeBuilder::handleMatchClass()
                 curblock->init();
                 source.setPos(mc.bodyStart);
                 pos = mc.bodyStart;
+    return true;
+}
+
+/* Backward conditional jumps: POP_JUMP_BACKWARD_IF_FALSE/TRUE/NONE/NOT_NONE.
+   These close the bottom test of a while loop, handling the whileBottomSkip
+   and chainWhileBottomExit cases; unrecognized shapes bail (returning false
+   clears cleanBuild). */
+bool CodeBuilder::handleBackwardConditionalJump()
+{
+            if (whileBottomSkip.count(curpos)) {
+                if (!stack.empty())
+                    stack.pop();
+                return true;
+            }
+            while (blocks.size() > 1
+                    && curblock->end() > 0 && curblock->end() <= curpos
+                    && curblock->blktype() != ASTBlock::BLK_MAIN
+                    && !(curblock->blktype() == ASTBlock::BLK_FOR
+                         && curblock.cast<ASTIterBlock>()->isComprehension())) {
+                bool isLoop = curblock->blktype() == ASTBlock::BLK_WHILE
+                        || curblock->blktype() == ASTBlock::BLK_FOR;
+                PycRef<ASTBlock> b = curblock;
+                if (!isLoop && !stack_hist.empty())
+                    stack_hist.pop();
+                blocks.pop();
+                curblock = blocks.top();
+                curblock->append(b.cast<ASTNode>());
+            }
+            if (curblock->blktype() == ASTBlock::BLK_FOR
+                    && curblock.cast<ASTIterBlock>()->isComprehension()) {
+                PycRef<ASTNode> cond = stack.top();
+                stack.pop();
+                if (opcode == Pyc::POP_JUMP_BACKWARD_IF_TRUE_A)
+                    cond = new ASTUnary(cond, ASTUnary::UN_NOT);
+                else if (opcode == Pyc::POP_JUMP_BACKWARD_IF_NONE_A)
+                    cond = new ASTCompare(cond, new ASTObject(Pyc_None), ASTCompare::CMP_IS_NOT);
+                else if (opcode == Pyc::POP_JUMP_BACKWARD_IF_NOT_NONE_A)
+                    cond = new ASTCompare(cond, new ASTObject(Pyc_None), ASTCompare::CMP_IS);
+                PycRef<ASTNode> existing = curblock.cast<ASTIterBlock>()->condition();
+                if (existing != nullptr) {
+                    if (compPureOr) {
+                        cond = new ASTBinary(existing, cond, ASTBinary::BIN_LOG_OR);
+                    } else if (compFilterFwd) {
+                        cleanBuild = false;
+                        return false;
+                    } else {
+                        cond = new ASTBinary(existing, cond, ASTBinary::BIN_LOG_AND);
+                    }
+                }
+                curblock.cast<ASTIterBlock>()->setCondition(cond);
+            } else if (curblock->blktype() == ASTBlock::BLK_IF
+                    || curblock->blktype() == ASTBlock::BLK_ELIF) {
+                bool wasElif = curblock->blktype() == ASTBlock::BLK_ELIF;
+                if (stack.empty() || blocks.size() < 2)
+                    throw std::runtime_error("while-conversion stack/block underflow");
+                stack.pop();
+                PycRef<ASTCondBlock> ifb = curblock.cast<ASTCondBlock>();
+                PycRef<ASTCondBlock> whb = new ASTCondBlock(
+                        ASTBlock::BLK_WHILE, ifb->end(), ifb->cond(), ifb->negative());
+                for (const auto& n : ifb->nodes())
+                    whb->append(n);
+                blocks.pop();
+                if (stack_hist.size())
+                    stack_hist.pop();
+                curblock = blocks.top();
+                if (compoundAndLeadGuard.count(whb->end())
+                        && whb->cond() != nullptr
+                        && curblock->blktype() == ASTBlock::BLK_IF
+                        && curblock->size() == 0
+                        && curblock.cast<ASTCondBlock>()->cond() != nullptr
+                        && curblock->end() >= whb->end()
+                        && blocks.size() >= 2) {
+                    PycRef<ASTCondBlock> outerIf = curblock.cast<ASTCondBlock>();
+                    PycRef<ASTNode> aCond = outerIf->negative()
+                            ? NegateCond(outerIf->cond()) : outerIf->cond();
+                    PycRef<ASTNode> merged = new ASTBinary(
+                            aCond, whb->cond(), ASTBinary::BIN_LOG_AND);
+                    PycRef<ASTCondBlock> whb2 = new ASTCondBlock(
+                            ASTBlock::BLK_WHILE, whb->end(), merged, false);
+                    for (const auto& n : whb->nodes())
+                        whb2->append(n);
+                    whb = whb2;
+                    blocks.pop();
+                    if (stack_hist.size())
+                        stack_hist.pop();
+                    curblock = blocks.top();
+                }
+                if (wasElif) {
+                    PycRef<ASTBlock> elsew = new ASTBlock(ASTBlock::BLK_ELSE, whb->end());
+                    elsew->init();
+                    elsew->append(whb.cast<ASTNode>());
+                    curblock->append(elsew.cast<ASTNode>());
+                } else {
+                    curblock->append(whb.cast<ASTNode>());
+                }
+                if (forElseMerge.count(whb->end())) {
+                    stack_hist.push(stack);
+                    PycRef<ASTBlock> elseblk = new ASTBlock(
+                            ASTBlock::BLK_ELSE, forElseMerge[whb->end()]);
+                    elseblk->init();
+                    loopElseBlocks.insert((ASTBlock *)elseblk);
+                    blocks.push(elseblk);
+                    curblock = blocks.top();
+                }
+                if (chainWhileBottomExit.count(curpos)) {
+                    int e = chainWhileBottomExit[curpos];
+                    if (chainWhileBwdEnd.count(curpos))
+                        e = whb->end();
+                    source.setPos(e);
+                    pos = e;
+                }
+            } else {
+                fprintf(stderr, "Unsupported opcode: %s (%d)\n",
+                        Pyc::OpcodeName(opcode), opcode);
+                cleanBuild = false;
+                return false;
+            }
     return true;
 }
 
