@@ -465,12 +465,22 @@ static PycRef<ASTNode> recoverFoldedAndOperand(PycRef<ASTNode> left, bool isOr,
  * ------------------------------------------------------------------------- */
 class CodeBuilder {
 public:
-    CodeBuilder(PycRef<PycCode> code, PycModule* mod) : code(code), mod(mod) {}
+    CodeBuilder(PycRef<PycCode> code, PycModule* mod)
+        : code(code), mod(mod),
+          stack((mod->majorVer() == 1) ? 20 : code->stackSize()) {}
     PycRef<ASTNode> build();
 
 private:
+    /* Per-opcode-group handlers lifted out of build()'s dispatch switch. */
+    void handleUnaryOp(int opcode);
+
+    /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
     PycModule* mod;
+    /* The operand stack: partial EXPRESSIONS being assembled. Promoted from a
+       build() local so extracted handlers reach it as a member (unqualified
+       name lookup and `[&]` capture inside build() resolve to it unchanged). */
+    FastStack stack;
 };
 
 PycRef<ASTNode> BuildFromCode(PycRef<PycCode> code, PycModule* mod)
@@ -500,7 +510,6 @@ PycRef<ASTNode> CodeBuilder::build()
         return p == to;
     };
 
-    FastStack stack((mod->majorVer() == 1) ? 20 : code->stackSize());
     stackhist_t stack_hist;
 
     std::stack<PycRef<ASTBlock> > blocks;
@@ -15906,46 +15915,12 @@ PycRef<ASTNode> CodeBuilder::build()
             }
             break;
         case Pyc::UNARY_CALL:
-            {
-                PycRef<ASTNode> func = stack.top();
-                stack.pop();
-                stack.push(new ASTCall(func, ASTCall::pparam_t(), ASTCall::kwparam_t()));
-            }
-            break;
         case Pyc::UNARY_CONVERT:
-            {
-                PycRef<ASTNode> name = stack.top();
-                stack.pop();
-                stack.push(new ASTConvert(name));
-            }
-            break;
         case Pyc::UNARY_INVERT:
-            {
-                PycRef<ASTNode> arg = stack.top();
-                stack.pop();
-                stack.push(new ASTUnary(arg, ASTUnary::UN_INVERT));
-            }
-            break;
         case Pyc::UNARY_NEGATIVE:
-            {
-                PycRef<ASTNode> arg = stack.top();
-                stack.pop();
-                stack.push(new ASTUnary(arg, ASTUnary::UN_NEGATIVE));
-            }
-            break;
         case Pyc::UNARY_NOT:
-            {
-                PycRef<ASTNode> arg = stack.top();
-                stack.pop();
-                stack.push(new ASTUnary(arg, ASTUnary::UN_NOT));
-            }
-            break;
         case Pyc::UNARY_POSITIVE:
-            {
-                PycRef<ASTNode> arg = stack.top();
-                stack.pop();
-                stack.push(new ASTUnary(arg, ASTUnary::UN_POSITIVE));
-            }
+            handleUnaryOp(opcode);
             break;
         case Pyc::UNPACK_LIST_A:
         case Pyc::UNPACK_TUPLE_A:
@@ -16362,6 +16337,38 @@ PycRef<ASTNode> CodeBuilder::build()
      * that decompilation reached the end without bailing. */
     cleanBuild = true;
     return new ASTNodeList(defblock->nodes());
+}
+
+/* The UNARY_* opcodes each pop one operand and push one result node.
+ *   INVERT / NEGATIVE / NOT / POSITIVE  -> the ~x, -x, `not x`, +x operators
+ *                                          (ASTUnary with the matching UN_*).
+ *   CALL  (Python 1/2) -> call the top-of-stack callable with no arguments.
+ *   CONVERT (Python 1/2) -> backtick `repr` conversion (ASTConvert).
+ * Output is unchanged from the six inline cases this replaced. */
+void CodeBuilder::handleUnaryOp(int opcode)
+{
+    PycRef<ASTNode> arg = stack.top();
+    stack.pop();
+    switch (opcode) {
+    case Pyc::UNARY_CALL:
+        stack.push(new ASTCall(arg, ASTCall::pparam_t(), ASTCall::kwparam_t()));
+        break;
+    case Pyc::UNARY_CONVERT:
+        stack.push(new ASTConvert(arg));
+        break;
+    case Pyc::UNARY_INVERT:
+        stack.push(new ASTUnary(arg, ASTUnary::UN_INVERT));
+        break;
+    case Pyc::UNARY_NEGATIVE:
+        stack.push(new ASTUnary(arg, ASTUnary::UN_NEGATIVE));
+        break;
+    case Pyc::UNARY_NOT:
+        stack.push(new ASTUnary(arg, ASTUnary::UN_NOT));
+        break;
+    case Pyc::UNARY_POSITIVE:
+        stack.push(new ASTUnary(arg, ASTUnary::UN_POSITIVE));
+        break;
+    }
 }
 
 static void append_to_chain_store(const PycRef<ASTNode> &chainStore,
