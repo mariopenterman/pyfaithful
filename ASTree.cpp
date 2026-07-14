@@ -496,6 +496,8 @@ private:
     void handleUnpack(int opcode, int operand);
     void handleYield(int opcode);
     void handlePopBlock();
+    /* Returns false to signal a bail-out (the caller returns the partial tree). */
+    bool handlePopTop();
 
     /* --- pass state (migrating from build() locals onto the class) --- */
     PycRef<PycCode> code;
@@ -13925,63 +13927,8 @@ PycRef<ASTNode> CodeBuilder::build()
             }
             break;
         case Pyc::POP_TOP:
-            {
-                PycRef<ASTNode> value = stack.top();
-                stack.pop();
-
-                if (value != nullptr) {
-                    std::stack<PycRef<ASTBlock> > ms = blocks;
-                    while (!ms.empty()) {
-                        if (ms.top()->blktype() == ASTBlock::BLK_MATCH) {
-                            if (ms.top().cast<ASTMatchBlock>()->subject() == value)
-                                value = nullptr;
-                            break;
-                        }
-                        ms.pop();
-                    }
-                    if (value == nullptr)
-                        break;
-                }
-
-                if (value != nullptr && value.type() == ASTNode::NODE_COMPREHENSION
-                        && curblock->blktype() == ASTBlock::BLK_FOR
-                        && curblock.cast<ASTIterBlock>()->isComprehension()) {
-                    stack.push(value);
-                    break;
-                }
-
-                if (!curblock->inited()) {
-                    if (curblock->blktype() == ASTBlock::BLK_WITH) {
-                        if (value != nullptr && value.type() == ASTNode::NODE_COMPREHENSION) {
-                            cleanBuild = false;
-                            return new ASTNodeList(defblock->nodes());
-                        }
-                        curblock.cast<ASTWithBlock>()->setExpr(value);
-                    } else {
-                        curblock->init();
-                    }
-                    break;
-                } else if (value == nullptr || value->processed()) {
-                    break;
-                }
-
-                curblock->append(value);
-
-                if (curblock->blktype() == ASTBlock::BLK_FOR
-                        && curblock.cast<ASTIterBlock>()->isComprehension()) {
-                    /* This relies on some really uncertain logic...
-                     * If it's a comprehension, the only POP_TOP should be
-                     * a call to append the iter to the list.
-                     */
-                    if (value.type() == ASTNode::NODE_CALL) {
-                        auto& pparams = value.cast<ASTCall>()->pparams();
-                        if (!pparams.empty()) {
-                            PycRef<ASTNode> res = pparams.front();
-                            stack.push(new ASTComprehension(res));
-                        }
-                    }
-                }
-            }
+            if (!handlePopTop())
+                return new ASTNodeList(defblock->nodes());
             break;
         case Pyc::PRINT_ITEM:
         case Pyc::PRINT_ITEM_TO:
@@ -15696,6 +15643,76 @@ void CodeBuilder::handlePopBlock()
         blocks.top()->append(curblock.cast<ASTNode>());
         curblock = blocks.top();
     }
+}
+
+/* POP_TOP discards TOS, but with side meanings depending on what it discards:
+ *   - a match subject being torn down is simply dropped;
+ *   - a comprehension result inside a comprehension loop is kept on the stack;
+ *   - the first POP_TOP of an uninitialised suite initialises it (or sets the
+ *     with-manager expression) rather than emitting a statement;
+ *   - an already-processed value is dropped;
+ *   - otherwise the value is a bare expression statement and is appended, with a
+ *     comprehension-append call turned back into an ASTComprehension.
+ * Returns false (after cleanBuild=false) if a comprehension turns up as a
+ * with-manager, which cannot be reconstructed. */
+bool CodeBuilder::handlePopTop()
+{
+    PycRef<ASTNode> value = stack.top();
+    stack.pop();
+
+    if (value != nullptr) {
+        std::stack<PycRef<ASTBlock> > ms = blocks;
+        while (!ms.empty()) {
+            if (ms.top()->blktype() == ASTBlock::BLK_MATCH) {
+                if (ms.top().cast<ASTMatchBlock>()->subject() == value)
+                    value = nullptr;
+                break;
+            }
+            ms.pop();
+        }
+        if (value == nullptr)
+            return true;
+    }
+
+    if (value != nullptr && value.type() == ASTNode::NODE_COMPREHENSION
+            && curblock->blktype() == ASTBlock::BLK_FOR
+            && curblock.cast<ASTIterBlock>()->isComprehension()) {
+        stack.push(value);
+        return true;
+    }
+
+    if (!curblock->inited()) {
+        if (curblock->blktype() == ASTBlock::BLK_WITH) {
+            if (value != nullptr && value.type() == ASTNode::NODE_COMPREHENSION) {
+                cleanBuild = false;
+                return false;
+            }
+            curblock.cast<ASTWithBlock>()->setExpr(value);
+        } else {
+            curblock->init();
+        }
+        return true;
+    } else if (value == nullptr || value->processed()) {
+        return true;
+    }
+
+    curblock->append(value);
+
+    if (curblock->blktype() == ASTBlock::BLK_FOR
+            && curblock.cast<ASTIterBlock>()->isComprehension()) {
+        /* This relies on some really uncertain logic...
+         * If it's a comprehension, the only POP_TOP should be
+         * a call to append the iter to the list.
+         */
+        if (value.type() == ASTNode::NODE_CALL) {
+            auto& pparams = value.cast<ASTCall>()->pparams();
+            if (!pparams.empty()) {
+                PycRef<ASTNode> res = pparams.front();
+                stack.push(new ASTComprehension(res));
+            }
+        }
+    }
+    return true;
 }
 
 /* The UNARY_* opcodes each pop one operand and push one result node.
